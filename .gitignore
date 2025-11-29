@@ -4,6 +4,7 @@
 !/reference/*.md
 /models/*
 .conda-env
+.agent/
 
 # MacOS
 .DS_Store
