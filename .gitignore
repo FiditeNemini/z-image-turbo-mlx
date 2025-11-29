@@ -2,7 +2,7 @@
 /.vscode
 /reference
 !/reference/*.md
-/models
+/models/*
 .conda-env
 
 # MacOS
