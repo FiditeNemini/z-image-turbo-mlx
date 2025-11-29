@@ -130,6 +130,6 @@ This project is for research and personal use. Please refer to the original Z-Im
 
 ## Acknowledgments
 
-- Original Z-Image-Turbo model from Zhipu AI
+- Original Z-Image-Turbo model from Tongyi-MAI
 - MLX framework by Apple
 - Diffusers library by Hugging Face
