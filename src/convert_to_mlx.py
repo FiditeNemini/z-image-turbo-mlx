@@ -8,6 +8,39 @@ import mlx.nn as nn
 from pathlib import Path
 import shutil
 from huggingface_hub import snapshot_download
+from tqdm import tqdm
+
+# Hugging Face model ID
+HF_MODEL_ID = "Tongyi-MAI/Z-Image-Turbo"
+
+
+def ensure_model_downloaded(model_dir="../models/Z-Image-Turbo"):
+    """Check if model exists, download from Hugging Face if not."""
+    model_path = Path(model_dir)
+    
+    # Check if model already exists (look for key files)
+    transformer_path = model_path / "transformer"
+    if transformer_path.exists() and len(list(transformer_path.glob("*.safetensors"))) > 0:
+        print(f"Model found at {model_path}")
+        return str(model_path)
+    
+    print(f"Model not found at {model_path}")
+    print(f"Downloading {HF_MODEL_ID} from Hugging Face...")
+    print("This may take a while (~20GB)...")
+    
+    # Create parent directory if needed
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Download from Hugging Face with progress bar
+    downloaded_path = snapshot_download(
+        repo_id=HF_MODEL_ID,
+        local_dir=str(model_path),
+        local_dir_use_symlinks=False,
+    )
+    
+    print(f"Model downloaded to {downloaded_path}")
+    return downloaded_path
+
 
 def convert_weights(model_path, output_path):
     print(f"Loading weights from {model_path}")
@@ -20,8 +53,7 @@ def convert_weights(model_path, output_path):
     elif model_path.is_dir():
         # Load all .safetensors files
         files = sorted(list(model_path.glob("*.safetensors")))
-        for f in files:
-            print(f"Loading {f.name}...")
+        for f in tqdm(files, desc="Loading weight files"):
             part = load_file(str(f))
             state_dict.update(part)
     else:
@@ -29,7 +61,8 @@ def convert_weights(model_path, output_path):
     
     new_state_dict = {}
     
-    for key, value in state_dict.items():
+    print("Converting transformer weights...")
+    for key, value in tqdm(state_dict.items(), desc="Converting weights"):
         # Ignore unused tokens
         if "pad_token" in key:
             continue
@@ -141,7 +174,7 @@ def convert_weights(model_path, output_path):
             vae_config = json.load(f)
             
         mlx_vae_weights = {}
-        for key, value in vae_weights.items():
+        for key, value in tqdm(vae_weights.items(), desc="Converting VAE weights"):
             # Map VAE keys
             # encoder.conv_in.weight -> encoder.conv_in.weight
             # encoder.down_blocks.0.resnets.0.norm1.weight -> encoder.down_blocks.0.0.norm1.weight
@@ -295,7 +328,7 @@ def convert_weights(model_path, output_path):
             te_config = json.load(f)
             
         mlx_te_weights = {}
-        for key, value in te_weights.items():
+        for key, value in tqdm(te_weights.items(), desc="Converting text encoder weights"):
             new_key = key
             
             # Map Qwen keys
@@ -347,9 +380,20 @@ def convert_weights(model_path, output_path):
         print(f"Failed to copy tokenizer/scheduler: {e}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="models/diffusers/Z-Image-Turbo-fp16.safetensors")
-    parser.add_argument("--output_path", type=str, default="models/mlx_model")
+    parser = argparse.ArgumentParser(description="Convert Z-Image-Turbo weights to MLX format")
+    parser.add_argument("--model_path", type=str, default="../models/Z-Image-Turbo/transformer",
+                        help="Path to transformer weights (will auto-download if not found)")
+    parser.add_argument("--output_path", type=str, default="../models/mlx_model",
+                        help="Output path for MLX weights")
+    parser.add_argument("--model_dir", type=str, default="../models/Z-Image-Turbo",
+                        help="Directory for the full model (for auto-download)")
     args = parser.parse_args()
+    
+    # Ensure model is downloaded
+    model_dir = ensure_model_downloaded(args.model_dir)
+    
+    # Update model_path if using default
+    if args.model_path == "../models/Z-Image-Turbo/transformer":
+        args.model_path = os.path.join(model_dir, "transformer")
     
     convert_weights(args.model_path, args.output_path)

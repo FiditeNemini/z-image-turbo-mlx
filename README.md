@@ -30,11 +30,12 @@ conda activate z-image-mlx
 # Install dependencies
 pip install -r requirements.txt
 
-# Download and convert model weights
-# (Requires downloading Z-Image-Turbo to models/Z-Image-Turbo first)
+# Convert model weights (auto-downloads from Hugging Face if not found)
 cd src
 python convert_to_mlx.py
 ```
+
+The conversion script will automatically download the Z-Image-Turbo model from Hugging Face (~20GB) if it's not already present in `models/Z-Image-Turbo/`.
 
 ## Usage
 

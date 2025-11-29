@@ -282,8 +282,9 @@ class ZImageTransformer2DModel(nn.Module):
         self.t_embedder = TimestepEmbedder(min(self.dim, ADALN_EMBED_DIM), mid_size=1024)
         
         # cap_embedder: RMSNorm -> Linear
+        norm_eps = config.get("norm_eps", 1e-6)
         self.cap_embedder = nn.Sequential(
-            nn.RMSNorm(config["text_embed_dim"], eps=config["norm_eps"]),
+            nn.RMSNorm(config["text_embed_dim"], eps=norm_eps),
             nn.Linear(config["text_embed_dim"], self.dim, bias=True)
         )
         
