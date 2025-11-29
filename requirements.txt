@@ -1,0 +1,11 @@
+mlx
+mlx-lm
+safetensors
+huggingface_hub
+transformers
+diffusers
+torch
+numpy
+gguf
+gradio
+pillow
