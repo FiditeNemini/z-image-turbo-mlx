@@ -15,6 +15,7 @@ import os
 import tempfile
 from pathlib import Path
 from datetime import datetime
+import shutil
 
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -36,15 +37,17 @@ DIMENSION_PRESETS = {
         # Square
         "1:1 — 1024×1024": (1024, 1024),
         # Landscape (width is larger)
-        "5:4 — 1280×1024": (1280, 1024),
+        "── Landscape ──": None,  # Section header
         "4:3 — 1368×1024": (1368, 1024),
         "3:2 — 1536×1024": (1536, 1024),
+        "5:4 — 1280×1024": (1280, 1024),
         "16:9 — 1824×1024": (1824, 1024),
         "21:9 — 2392×1024": (2392, 1024),
         # Portrait (height is larger)
-        "4:5 — 1024×1280": (1024, 1280),
+        "── Portrait ──": None,  # Section header
         "3:4 — 1024×1368": (1024, 1368),
         "2:3 — 1024×1536": (1024, 1536),
+        "4:5 — 1024×1280": (1024, 1280),
         "9:16 — 1024×1824": (1024, 1824),
         "9:21 — 1024×2392": (1024, 2392),
     },
@@ -52,15 +55,17 @@ DIMENSION_PRESETS = {
         # Square
         "1:1 — 1280×1280": (1280, 1280),
         # Landscape (width is larger)
-        "5:4 — 1600×1280": (1600, 1280),
+        "── Landscape ──": None,  # Section header
         "4:3 — 1712×1280": (1712, 1280),
         "3:2 — 1920×1280": (1920, 1280),
+        "5:4 — 1600×1280": (1600, 1280),
         "16:9 — 2280×1280": (2280, 1280),
         "21:9 — 2992×1280": (2992, 1280),
         # Portrait (height is larger)
-        "4:5 — 1280×1600": (1280, 1600),
+        "── Portrait ──": None,  # Section header
         "3:4 — 1280×1712": (1280, 1712),
         "2:3 — 1280×1920": (1280, 1920),
+        "4:5 — 1280×1600": (1280, 1600),
         "9:16 — 1280×2280": (1280, 2280),
         "9:21 — 1280×2992": (1280, 2992),
     },
@@ -462,11 +467,44 @@ def update_aspect_ratios(base_resolution):
     return gr.update(choices=choices, value=choices[0])
 
 
+def save_to_dataset(image_path, prompt, dataset_location, format="png"):
+    """Save image and prompt text file to dataset location"""
+    if not dataset_location or not dataset_location.strip():
+        raise gr.Error("Please specify a dataset save location")
+    
+    # Expand user path (handles ~)
+    dataset_path = Path(dataset_location).expanduser()
+    
+    # Create directory if it doesn't exist
+    dataset_path.mkdir(parents=True, exist_ok=True)
+    
+    # Generate timestamp-based filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Determine extension
+    ext = ".png" if format == "png" else ".jpg"
+    
+    # Copy image to dataset location
+    image_dest = dataset_path / f"{timestamp}{ext}"
+    shutil.copy2(image_path, image_dest)
+    
+    # Save prompt to text file
+    prompt_dest = dataset_path / f"{timestamp}.txt"
+    with open(prompt_dest, "w", encoding="utf-8") as f:
+        f.write(prompt)
+    
+    return f"Saved to {dataset_path}:\n  - {timestamp}{ext}\n  - {timestamp}.txt"
+
+
 def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, progress=gr.Progress()):
     """Generate an image using selected backend"""
     
     if not prompt.strip():
         raise gr.Error("Please enter a prompt")
+    
+    # Skip section headers
+    if aspect_ratio.startswith("──"):
+        raise gr.Error("Please select an aspect ratio, not a section header")
     
     # Get dimensions from preset
     width, height = DIMENSION_PRESETS[base_resolution][aspect_ratio]
@@ -483,7 +521,7 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     else:
         pil_image = generate_pytorch(prompt, width, height, steps, time_shift, seed, progress)
     
-    progress(0.95, desc="Preparing downloads...")
+    progress(0.95, desc="Saving temporary files...")
     
     # Generate timestamp-based filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -497,7 +535,7 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     
     progress(1.0, desc="Done!")
     
-    return pil_image, f"Seed: {seed} | Backend: {backend}", png_path, jpg_path
+    return pil_image, f"Seed: {seed} | Backend: {backend}", png_path, jpg_path, prompt
 
 
 # Create Gradio interface
@@ -578,15 +616,31 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             
             seed_info = gr.Textbox(label="Generation Info", interactive=False)
             
-            with gr.Row():
-                png_download = gr.File(label="Download PNG")
-                jpg_download = gr.File(label="Download JPEG")
+            with gr.Column(visible=False) as dataset_section:
+                gr.Markdown("---\n### 💾 Save to Dataset")
+                
+                dataset_location = gr.Textbox(
+                    label="Dataset Save Location",
+                    placeholder="e.g., ~/Documents/datasets/z-image or /Users/you/datasets/z-image",
+                    info="Images and prompts will be saved here for training datasets (you can drag a folder here)",
+                )
+                
+                with gr.Row():
+                    save_png_btn = gr.Button("💾 Save PNG to Dataset", variant="secondary")
+                    save_jpg_btn = gr.Button("💾 Save JPG to Dataset", variant="secondary")
+                
+                save_status = gr.Textbox(label="Save Status", interactive=False)
         
         with gr.Column(scale=1):
             output_image = gr.Image(
                 label="Generated Image",
                 type="pil",
             )
+    
+    # Hidden state to store temporary paths and prompt
+    temp_png_path = gr.State()
+    temp_jpg_path = gr.State()
+    stored_prompt = gr.State()
     
     # Example prompts
     gr.Examples(
@@ -627,7 +681,25 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     generate_btn.click(
         fn=generate_image,
         inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend],
-        outputs=[output_image, seed_info, png_download, jpg_download],
+        outputs=[output_image, seed_info, temp_png_path, temp_jpg_path, stored_prompt],
+    ).then(
+        fn=lambda: gr.update(visible=True),
+        inputs=None,
+        outputs=[dataset_section],
+    )
+    
+    # Save PNG to dataset
+    save_png_btn.click(
+        fn=lambda path, prompt, loc: save_to_dataset(path, prompt, loc, "png"),
+        inputs=[temp_png_path, stored_prompt, dataset_location],
+        outputs=[save_status],
+    )
+    
+    # Save JPG to dataset
+    save_jpg_btn.click(
+        fn=lambda path, prompt, loc: save_to_dataset(path, prompt, loc, "jpg"),
+        inputs=[temp_jpg_path, stored_prompt, dataset_location],
+        outputs=[save_status],
     )
 
 
