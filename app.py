@@ -24,6 +24,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 _mlx_models = None
 _pytorch_pipe = None
 
+# Session image gallery storage
+_image_gallery = []  # List of dicts: {"image": PIL.Image, "prompt": str, "seed": int, "png_path": str, "jpg_path": str}
+
 # Model paths
 PYTORCH_MODEL_PATH = "./models/Z-Image-Turbo"
 MLX_MODEL_PATH = "./models/mlx_model"
@@ -37,43 +40,46 @@ DIMENSION_PRESETS = {
         # Square
         "1:1 — 1024×1024": (1024, 1024),
         # Landscape (width is larger)
-        "── Landscape ──": None,  # Section header
-        "4:3 — 1368×1024": (1368, 1024),
-        "3:2 — 1536×1024": (1536, 1024),
-        "5:4 — 1280×1024": (1280, 1024),
-        "16:9 — 1824×1024": (1824, 1024),
-        "21:9 — 2392×1024": (2392, 1024),
+        "3:2 — 1536×1024 (Landscape)": (1536, 1024),
+        "4:3 — 1368×1024 (Landscape)": (1368, 1024),
+        "5:4 — 1280×1024 (Landscape)": (1280, 1024),
+        "16:9 — 1824×1024 (Landscape)": (1824, 1024),
+        "21:9 — 2392×1024 (Landscape)": (2392, 1024),
         # Portrait (height is larger)
-        "── Portrait ──": None,  # Section header
-        "3:4 — 1024×1368": (1024, 1368),
-        "2:3 — 1024×1536": (1024, 1536),
-        "4:5 — 1024×1280": (1024, 1280),
-        "9:16 — 1024×1824": (1024, 1824),
-        "9:21 — 1024×2392": (1024, 2392),
+        "2:3 — 1024×1536 (Portrait)": (1024, 1536),
+        "3:4 — 1024×1368 (Portrait)": (1024, 1368),
+        "4:5 — 1024×1280 (Portrait)": (1024, 1280),
+        "9:16 — 1024×1824 (Portrait)": (1024, 1824),
+        "9:21 — 1024×2392 (Portrait)": (1024, 2392),
     },
     "1280": {
         # Square
         "1:1 — 1280×1280": (1280, 1280),
         # Landscape (width is larger)
-        "── Landscape ──": None,  # Section header
-        "4:3 — 1712×1280": (1712, 1280),
-        "3:2 — 1920×1280": (1920, 1280),
-        "5:4 — 1600×1280": (1600, 1280),
-        "16:9 — 2280×1280": (2280, 1280),
-        "21:9 — 2992×1280": (2992, 1280),
+        "3:2 — 1920×1280 (Landscape)": (1920, 1280),
+        "4:3 — 1712×1280 (Landscape)": (1712, 1280),
+        "5:4 — 1600×1280 (Landscape)": (1600, 1280),
+        "16:9 — 2280×1280 (Landscape)": (2280, 1280),
+        "21:9 — 2992×1280 (Landscape)": (2992, 1280),
         # Portrait (height is larger)
-        "── Portrait ──": None,  # Section header
-        "3:4 — 1280×1712": (1280, 1712),
-        "2:3 — 1280×1920": (1280, 1920),
-        "4:5 — 1280×1600": (1280, 1600),
-        "9:16 — 1280×2280": (1280, 2280),
-        "9:21 — 1280×2992": (1280, 2992),
+        "2:3 — 1280×1920 (Portrait)": (1280, 1920),
+        "3:4 — 1280×1712 (Portrait)": (1280, 1712),
+        "4:5 — 1280×1600 (Portrait)": (1280, 1600),
+        "9:16 — 1280×2280 (Portrait)": (1280, 2280),
+        "9:21 — 1280×2992 (Portrait)": (1280, 2992),
     },
 }
 
 # Default values
 DEFAULT_BASE_RESOLUTION = "1024"
 DEFAULT_ASPECT_RATIO = "1:1 — 1024×1024"
+
+
+def get_aspect_ratio_choices(base_resolution):
+    """Get aspect ratio choices, filtering out section headers"""
+    all_items = list(DIMENSION_PRESETS[base_resolution].keys())
+    # Filter out None values (section headers) but keep them for display
+    return all_items
 
 
 def check_and_setup_models():
@@ -463,11 +469,67 @@ def generate_pytorch(prompt, width, height, steps, time_shift, seed, progress):
 
 def update_aspect_ratios(base_resolution):
     """Update aspect ratio choices based on selected base resolution"""
-    choices = list(DIMENSION_PRESETS[base_resolution].keys())
+    choices = get_aspect_ratio_choices(base_resolution)
+    # Set value to first non-header choice (the 1:1 square)
     return gr.update(choices=choices, value=choices[0])
 
 
-def save_to_dataset(image_path, prompt, dataset_location, format="png"):
+def add_to_gallery(image, prompt, seed, png_path, jpg_path):
+    """Add a generated image to the gallery"""
+    global _image_gallery
+    _image_gallery.append({
+        "image": image,
+        "prompt": prompt,
+        "seed": seed,
+        "png_path": png_path,
+        "jpg_path": jpg_path,
+    })
+    return [item["image"] for item in _image_gallery]
+
+
+def get_gallery_images():
+    """Get all images in the gallery"""
+    return [item["image"] for item in _image_gallery]
+
+
+def get_selected_image_info(evt: gr.SelectData):
+    """Get info for the selected image from gallery"""
+    if evt.index < len(_image_gallery):
+        item = _image_gallery[evt.index]
+        details = f"Seed: {item['seed']}\nIndex: {evt.index + 1} of {len(_image_gallery)}"
+        return (
+            details,
+            item["prompt"],
+            evt.index,
+            item["png_path"],
+            item["jpg_path"],
+            item["seed"],
+            item["prompt"],
+        )
+    return "", "", None, "", "", 0, ""
+
+
+def clear_selection():
+    """Clear the selected image info"""
+    return None, "", "", "", "", 0, ""
+
+
+def delete_from_gallery(selected_index):
+    """Delete selected image from gallery"""
+    global _image_gallery
+    if selected_index is not None and 0 <= selected_index < len(_image_gallery):
+        _image_gallery.pop(selected_index)
+    return [item["image"] for item in _image_gallery], None, "", "", "", "", 0, ""
+
+
+def clear_gallery():
+    """Clear all images from gallery"""
+    global _image_gallery
+    _image_gallery = []
+    return [], None, "", "", "", "", 0, ""
+
+
+def save_to_dataset(image_path, prompt, seed, dataset_location, format="png"):
     """Save image and prompt text file to dataset location"""
     if not dataset_location or not dataset_location.strip():
         raise gr.Error("Please specify a dataset save location")
@@ -478,22 +540,60 @@ def save_to_dataset(image_path, prompt, dataset_location, format="png"):
     # Create directory if it doesn't exist
     dataset_path.mkdir(parents=True, exist_ok=True)
     
-    # Generate timestamp-based filename
+    # Generate timestamp-based filename with seed
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename_base = f"{timestamp}_{seed}"
     
     # Determine extension
     ext = ".png" if format == "png" else ".jpg"
     
     # Copy image to dataset location
-    image_dest = dataset_path / f"{timestamp}{ext}"
+    image_dest = dataset_path / f"{filename_base}{ext}"
     shutil.copy2(image_path, image_dest)
     
     # Save prompt to text file
-    prompt_dest = dataset_path / f"{timestamp}.txt"
+    prompt_dest = dataset_path / f"{filename_base}.txt"
     with open(prompt_dest, "w", encoding="utf-8") as f:
         f.write(prompt)
     
-    return f"Saved to {dataset_path}:\n  - {timestamp}{ext}\n  - {timestamp}.txt"
+    return f"Saved to {dataset_path}:\n  - {filename_base}{ext}\n  - {filename_base}.txt"
+
+
+def save_all_to_dataset(dataset_location, format="png"):
+    """Save all images in gallery to dataset location"""
+    global _image_gallery
+    
+    if not _image_gallery:
+        raise gr.Error("No images in gallery to save")
+    
+    if not dataset_location or not dataset_location.strip():
+        raise gr.Error("Please specify a dataset save location")
+    
+    saved_count = 0
+    for item in _image_gallery:
+        image_path = item["png_path"] if format == "png" else item["jpg_path"]
+        try:
+            save_to_dataset(image_path, item["prompt"], item["seed"], dataset_location, format)
+            saved_count += 1
+        except Exception as e:
+            print(f"Error saving image: {e}")
+            continue
+    
+    dataset_path = Path(dataset_location).expanduser()
+    return f"Saved {saved_count} image(s) to {dataset_path}"
+
+
+def save_selected_or_all(selected_index, png_path, jpg_path, prompt, seed, dataset_location, format="png"):
+    """Save selected image or all images if none selected"""
+    if selected_index is not None:
+        # Save single selected image
+        image_path = png_path if format == "png" else jpg_path
+        result = save_to_dataset(image_path, prompt, seed, dataset_location, format)
+        return f"SINGLE IMAGE SAVED:\n{result}"
+    else:
+        # Save all images
+        result = save_all_to_dataset(dataset_location, format)
+        return f"BATCH SAVE COMPLETE:\n{result}"
 
 
 def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, progress=gr.Progress()):
@@ -501,10 +601,6 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     
     if not prompt.strip():
         raise gr.Error("Please enter a prompt")
-    
-    # Skip section headers
-    if aspect_ratio.startswith("──"):
-        raise gr.Error("Please select an aspect ratio, not a section header")
     
     # Get dimensions from preset
     width, height = DIMENSION_PRESETS[base_resolution][aspect_ratio]
@@ -535,7 +631,10 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     
     progress(1.0, desc="Done!")
     
-    return pil_image, f"Seed: {seed} | Backend: {backend}", png_path, jpg_path, prompt
+    # Add to gallery
+    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path)
+    
+    return gallery_images, png_path, jpg_path, prompt, seed
 
 
 # Create Gradio interface
@@ -567,9 +666,10 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                 )
                 
                 aspect_ratio = gr.Dropdown(
-                    choices=list(DIMENSION_PRESETS[DEFAULT_BASE_RESOLUTION].keys()),
+                    choices=get_aspect_ratio_choices(DEFAULT_BASE_RESOLUTION),
                     value=DEFAULT_ASPECT_RATIO,
                     label="Width × Height (Ratio)",
+                    interactive=True,
                 )
             
             with gr.Row():
@@ -614,8 +714,6 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             
             generate_btn = gr.Button("🚀 Generate", variant="primary", size="lg")
             
-            seed_info = gr.Textbox(label="Generation Info", interactive=False)
-            
             with gr.Column(visible=False) as dataset_section:
                 gr.Markdown("---\n### 💾 Save to Dataset")
                 
@@ -626,21 +724,39 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                 )
                 
                 with gr.Row():
-                    save_png_btn = gr.Button("💾 Save PNG to Dataset", variant="secondary")
-                    save_jpg_btn = gr.Button("💾 Save JPG to Dataset", variant="secondary")
+                    save_png_btn = gr.Button("💾 Save to Dataset (PNG)", variant="secondary")
+                    save_jpg_btn = gr.Button("💾 Save to Dataset (JPG)", variant="secondary")
                 
-                save_status = gr.Textbox(label="Save Status", interactive=False)
+                gr.Markdown("*Tip: Select an image to save just that one, or save all if none selected*")
+                
+                save_status = gr.Textbox(label="Save Status", interactive=False, lines=3, max_lines=10)
         
         with gr.Column(scale=1):
-            output_image = gr.Image(
-                label="Generated Image",
-                type="pil",
+            output_gallery = gr.Gallery(
+                label="Generated Images",
+                show_label=True,
+                elem_id="gallery",
+                columns=2,
+                rows=2,
+                height="auto",
+                object_fit="contain",
             )
+            
+            with gr.Row():
+                clear_selection_btn = gr.Button("↩️ Deselect (for Batch Save)", variant="secondary", size="sm")
+                delete_selected_btn = gr.Button("❌ Delete Selected", variant="stop", size="sm")
+                clear_gallery_btn = gr.Button("🗑️ Clear All", variant="stop", size="sm")
+            
+            with gr.Accordion("Selected Image Info", open=True):
+                selected_info_display = gr.Textbox(label="Generation Details", interactive=False, lines=2)
+                selected_prompt_display = gr.Textbox(label="Prompt", interactive=False, lines=4)
     
-    # Hidden state to store temporary paths and prompt
+    # Hidden state to store temporary paths, prompt, seed, and selected index
     temp_png_path = gr.State()
     temp_jpg_path = gr.State()
     stored_prompt = gr.State()
+    stored_seed = gr.State()
+    selected_index = gr.State(value=None)
     
     # Example prompts
     gr.Examples(
@@ -681,24 +797,52 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     generate_btn.click(
         fn=generate_image,
         inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend],
-        outputs=[output_image, seed_info, temp_png_path, temp_jpg_path, stored_prompt],
+        outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed],
     ).then(
-        fn=lambda: gr.update(visible=True),
+        fn=lambda: (gr.update(visible=True), None, "", "", "", "", 0, ""),
         inputs=None,
-        outputs=[dataset_section],
+        outputs=[dataset_section, selected_index, selected_info_display, selected_prompt_display, temp_png_path, temp_jpg_path, stored_seed, stored_prompt],
     )
     
-    # Save PNG to dataset
+    # Handle gallery selection
+    output_gallery.select(
+        fn=get_selected_image_info,
+        inputs=None,
+        outputs=[selected_info_display, selected_prompt_display, selected_index, temp_png_path, temp_jpg_path, stored_seed, stored_prompt],
+    )
+    
+    # Clear selection
+    clear_selection_btn.click(
+        fn=clear_selection,
+        inputs=None,
+        outputs=[selected_index, selected_info_display, selected_prompt_display, temp_png_path, temp_jpg_path, stored_seed, stored_prompt],
+    )
+    
+    # Clear entire gallery
+    clear_gallery_btn.click(
+        fn=clear_gallery,
+        inputs=None,
+        outputs=[output_gallery, selected_index, selected_info_display, selected_prompt_display, temp_png_path, temp_jpg_path, stored_seed, stored_prompt],
+    )
+    
+    # Delete selected image
+    delete_selected_btn.click(
+        fn=delete_from_gallery,
+        inputs=[selected_index],
+        outputs=[output_gallery, selected_index, selected_info_display, selected_prompt_display, temp_png_path, temp_jpg_path, stored_seed, stored_prompt],
+    )
+    
+    # Save PNG to dataset (selected or all)
     save_png_btn.click(
-        fn=lambda path, prompt, loc: save_to_dataset(path, prompt, loc, "png"),
-        inputs=[temp_png_path, stored_prompt, dataset_location],
+        fn=save_selected_or_all,
+        inputs=[selected_index, temp_png_path, temp_jpg_path, stored_prompt, stored_seed, dataset_location],
         outputs=[save_status],
     )
     
-    # Save JPG to dataset
+    # Save JPG to dataset (selected or all)
     save_jpg_btn.click(
-        fn=lambda path, prompt, loc: save_to_dataset(path, prompt, loc, "jpg"),
-        inputs=[temp_jpg_path, stored_prompt, dataset_location],
+        fn=lambda idx, png, jpg, p, s, loc: save_selected_or_all(idx, png, jpg, p, s, loc, "jpg"),
+        inputs=[selected_index, temp_png_path, temp_jpg_path, stored_prompt, stored_seed, dataset_location],
         outputs=[save_status],
     )
 
