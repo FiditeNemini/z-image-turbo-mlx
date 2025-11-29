@@ -272,7 +272,7 @@ def enhance_prompt(prompt, progress=gr.Progress()):
     
     # System prompt for enhancement
     system_prompt = """You are an expert at writing detailed image generation prompts. 
-When given a simple description, expand it into a rich, detailed prompt that includes:
+When given a simple description, expand it into a detailed prompt that includes:
 - Specific visual details (colors, textures, lighting)
 - Composition and framing
 - Artistic style or mood
