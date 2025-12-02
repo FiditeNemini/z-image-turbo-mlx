@@ -9,4 +9,5 @@ numpy
 gguf
 gradio
 pillow
+piexif
 tqdm

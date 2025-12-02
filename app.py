@@ -6,6 +6,7 @@ import gradio as gr
 import torch
 import numpy as np
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 from transformers import AutoTokenizer
 from diffusers import FlowMatchEulerDiscreteScheduler, ZImagePipeline
 import json
@@ -474,7 +475,7 @@ def update_aspect_ratios(base_resolution):
     return gr.update(choices=choices, value=choices[0])
 
 
-def add_to_gallery(image, prompt, seed, png_path, jpg_path):
+def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height):
     """Add a generated image to the gallery"""
     global _image_gallery
     _image_gallery.append({
@@ -483,6 +484,11 @@ def add_to_gallery(image, prompt, seed, png_path, jpg_path):
         "seed": seed,
         "png_path": png_path,
         "jpg_path": jpg_path,
+        "steps": steps,
+        "time_shift": time_shift,
+        "backend": backend,
+        "width": width,
+        "height": height,
     })
     return [item["image"] for item in _image_gallery]
 
@@ -496,7 +502,7 @@ def get_selected_image_info(evt: gr.SelectData):
     """Get info for the selected image from gallery"""
     if evt.index < len(_image_gallery):
         item = _image_gallery[evt.index]
-        details = f"Seed: {item['seed']}\nIndex: {evt.index + 1} of {len(_image_gallery)}"
+        details = f"Seed: {item['seed']}\nSize: {item['width']}×{item['height']}\nSteps: {item['steps']} | Time Shift: {item['time_shift']}\nBackend: {item['backend']}\nIndex: {evt.index + 1} of {len(_image_gallery)}"
         return (
             details,
             item["prompt"],
@@ -527,6 +533,59 @@ def clear_gallery():
     global _image_gallery
     _image_gallery = []
     return [], None, "", "", "", "", 0, ""
+
+
+def create_metadata_string(prompt, seed, steps, time_shift, backend, width, height):
+    """Create a metadata string for embedding in images"""
+    return f"""{prompt}
+
+---
+Model: Z-Image-Turbo
+Size: {width}×{height}
+Seed: {seed}
+Steps: {steps}
+Time Shift: {time_shift}
+Backend: {backend}"""
+
+
+def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shift, backend, width, height):
+    """Save image with embedded metadata"""
+    metadata_str = create_metadata_string(prompt, seed, steps, time_shift, backend, width, height)
+    
+    if filepath.lower().endswith('.png'):
+        # PNG metadata using PngInfo
+        png_info = PngInfo()
+        png_info.add_text("parameters", metadata_str)
+        png_info.add_text("prompt", prompt)
+        png_info.add_text("seed", str(seed))
+        png_info.add_text("steps", str(steps))
+        png_info.add_text("time_shift", str(time_shift))
+        png_info.add_text("backend", backend)
+        png_info.add_text("width", str(width))
+        png_info.add_text("height", str(height))
+        png_info.add_text("model", "Z-Image-Turbo")
+        pil_image.save(filepath, "PNG", pnginfo=png_info)
+    else:
+        # JPEG metadata using EXIF UserComment
+        from PIL.ExifTags import TAGS
+        import piexif
+        
+        # Save image first
+        pil_image.save(filepath, "JPEG", quality=95)
+        
+        # Add EXIF metadata
+        try:
+            exif_dict = piexif.load(filepath)
+            # UserComment field (tag 0x9286)
+            user_comment = piexif.helper.UserComment.dump(metadata_str, encoding="unicode")
+            exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
+            # ImageDescription
+            exif_dict["0th"][piexif.ImageIFD.ImageDescription] = metadata_str.encode('utf-8')
+            exif_bytes = piexif.dump(exif_dict)
+            piexif.insert(exif_bytes, filepath)
+        except Exception as e:
+            print(f"Warning: Could not add EXIF metadata to JPEG: {e}")
+            # Fallback: just save without EXIF if piexif not available
 
 
 def save_to_dataset(image_path, prompt, seed, dataset_location, format="png"):
@@ -626,13 +685,14 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     png_path = os.path.join(temp_dir, f"{timestamp}.png")
     jpg_path = os.path.join(temp_dir, f"{timestamp}.jpg")
     
-    pil_image.save(png_path, "PNG")
-    pil_image.save(jpg_path, "JPEG", quality=95)
+    # Save images with embedded metadata
+    save_image_with_metadata(pil_image, png_path, prompt, seed, steps, time_shift, backend, width, height)
+    save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, width, height)
     
     progress(1.0, desc="Done!")
     
-    # Add to gallery
-    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path)
+    # Add to gallery with all generation parameters
+    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height)
     
     return gallery_images, png_path, jpg_path, prompt, seed
 
@@ -748,7 +808,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                 clear_gallery_btn = gr.Button("🗑️ Clear All", variant="stop", size="sm")
             
             with gr.Accordion("Selected Image Info", open=True):
-                selected_info_display = gr.Textbox(label="Generation Details", interactive=False, lines=2)
+                selected_info_display = gr.Textbox(label="Generation Details", interactive=False, lines=5)
                 selected_prompt_display = gr.Textbox(label="Prompt", interactive=False, lines=4)
     
     # Hidden state to store temporary paths, prompt, seed, and selected index
