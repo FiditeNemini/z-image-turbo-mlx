@@ -31,6 +31,47 @@ _image_gallery = []  # List of dicts: {"image": PIL.Image, "prompt": str, "seed"
 # Model paths
 PYTORCH_MODEL_PATH = "./models/Z-Image-Turbo"
 MLX_MODEL_PATH = "./models/mlx_model"
+SINGLE_FILE_MODEL_PATH = "./models/single_file"  # For single-file .safetensors models
+
+# Default configs for single-file models (when config is not embedded)
+DEFAULT_TRANSFORMER_CONFIG = {
+    "hidden_size": 3840,
+    "num_attention_heads": 30,
+    "intermediate_size": 10240,
+    "num_hidden_layers": 30,
+    "n_refiner_layers": 2,
+    "in_channels": 16,
+    "text_embed_dim": 2560,
+    "patch_size": 2,
+    "rope_theta": 256.0,
+    "axes_dims": [32, 48, 48],
+    "axes_lens": [1536, 512, 512],
+}
+
+DEFAULT_VAE_CONFIG = {
+    "in_channels": 3,
+    "out_channels": 3,
+    "latent_channels": 16,
+    "block_out_channels": [128, 256, 512, 512],
+    "layers_per_block": 2,
+    "scaling_factor": 0.3611,
+    "shift_factor": 0.1159,
+}
+
+DEFAULT_TEXT_ENCODER_CONFIG = {
+    "hidden_size": 2560,
+    "intermediate_size": 13696,
+    "max_position_embeddings": 32768,
+    "num_attention_heads": 20,
+    "num_hidden_layers": 28,
+    "num_key_value_heads": 4,
+    "vocab_size": 152064,
+    "rms_norm_eps": 1e-5,
+    "rope_theta": 1000000.0,
+    "use_sliding_window": False,
+    "sliding_window": 32768,
+    "tie_word_embeddings": True,
+}
 
 # Image dimension presets organized by base resolution
 # Using traditional photographic/video aspect ratios
@@ -81,6 +122,215 @@ def get_aspect_ratio_choices(base_resolution):
     all_items = list(DIMENSION_PRESETS[base_resolution].keys())
     # Filter out None values (section headers) but keep them for display
     return all_items
+
+
+def convert_single_file_to_mlx(single_file_path, output_path="./models/mlx_model", progress=None):
+    """
+    Convert a single-file .safetensors model to MLX multi-file format.
+    
+    Single-file models should have weights with prefixes like:
+    - transformer.* or model.* for the main transformer
+    - vae.* for the VAE
+    - text_encoder.* for the text encoder
+    """
+    import mlx.core as mx
+    from safetensors.torch import load_file
+    from tqdm import tqdm
+    
+    if progress:
+        progress(0.1, desc="Loading single-file model...")
+    
+    print(f"Loading single-file model from {single_file_path}...")
+    all_weights = load_file(single_file_path)
+    
+    # Separate weights by component
+    transformer_weights = {}
+    vae_weights = {}
+    text_encoder_weights = {}
+    
+    if progress:
+        progress(0.2, desc="Separating model components...")
+    
+    for key, value in all_weights.items():
+        if key.startswith("transformer.") or key.startswith("model."):
+            # Remove prefix
+            new_key = key.replace("transformer.", "").replace("model.", "")
+            transformer_weights[new_key] = value
+        elif key.startswith("vae."):
+            new_key = key.replace("vae.", "")
+            vae_weights[new_key] = value
+        elif key.startswith("text_encoder."):
+            new_key = key.replace("text_encoder.", "")
+            text_encoder_weights[new_key] = value
+        else:
+            # Try to infer from key structure
+            if "x_embedder" in key or "t_embedder" in key or "final_layer" in key or "transformer_blocks" in key:
+                transformer_weights[key] = value
+            elif "encoder." in key or "decoder." in key or "quant_conv" in key or "post_quant_conv" in key:
+                vae_weights[key] = value
+            elif "embed_tokens" in key or "self_attn" in key or "mlp." in key:
+                text_encoder_weights[key] = value
+            else:
+                # Default to transformer
+                transformer_weights[key] = value
+    
+    output_dir = Path(output_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Convert transformer weights
+    if progress:
+        progress(0.3, desc="Converting transformer weights...")
+    
+    if transformer_weights:
+        print(f"Converting {len(transformer_weights)} transformer tensors...")
+        mlx_transformer = {}
+        for key, value in tqdm(transformer_weights.items(), desc="Transformer"):
+            new_key = key
+            # Apply key mappings (same as convert_to_mlx.py)
+            if key.startswith("all_final_layer.2-1."):
+                new_key = key.replace("all_final_layer.2-1.", "final_layer.")
+            elif key.startswith("all_x_embedder.2-1."):
+                new_key = key.replace("all_x_embedder.2-1.", "x_embedder.")
+            elif "t_embedder.mlp." in key:
+                new_key = key.replace("t_embedder.mlp.", "t_embedder.mlp.layers.")
+            if "adaLN_modulation.0." in new_key:
+                new_key = new_key.replace("adaLN_modulation.0.", "adaLN_modulation.")
+            if "adaLN_modulation.1." in new_key:
+                new_key = new_key.replace("adaLN_modulation.1.", "adaLN_modulation.")
+            if "to_out.0." in new_key:
+                new_key = new_key.replace("to_out.0.", "to_out.")
+            if "cap_embedder.0." in new_key:
+                new_key = new_key.replace("cap_embedder.0.", "cap_embedder.layers.0.")
+            if "cap_embedder.1." in new_key:
+                new_key = new_key.replace("cap_embedder.1.", "cap_embedder.layers.1.")
+            
+            mlx_transformer[new_key] = mx.array(value.numpy().astype("float16"))
+        
+        mx.save_safetensors(str(output_dir / "weights.safetensors"), mlx_transformer)
+        print(f"Saved transformer weights to {output_dir / 'weights.safetensors'}")
+        
+        # Save config
+        with open(output_dir / "config.json", "w") as f:
+            json.dump(DEFAULT_TRANSFORMER_CONFIG, f, indent=2)
+    
+    # Convert VAE weights
+    if progress:
+        progress(0.5, desc="Converting VAE weights...")
+    
+    if vae_weights:
+        print(f"Converting {len(vae_weights)} VAE tensors...")
+        mlx_vae = {}
+        layers_per_block = DEFAULT_VAE_CONFIG["layers_per_block"]
+        
+        for key, value in tqdm(vae_weights.items(), desc="VAE"):
+            new_key = key
+            
+            # Map down_blocks/up_blocks structure
+            if "down_blocks" in new_key:
+                if "resnets" in new_key:
+                    parts = new_key.split(".")
+                    block_idx = parts.index("down_blocks") + 1
+                    resnet_pos = parts.index("resnets")
+                    parts[resnet_pos] = "layers"
+                    new_key = ".".join(parts)
+                elif "downsamplers" in new_key:
+                    parts = new_key.split(".")
+                    ds_pos = parts.index("downsamplers")
+                    parts[ds_pos] = "layers"
+                    parts[ds_pos + 1] = str(layers_per_block)
+                    new_key = ".".join(parts)
+            
+            if "up_blocks" in new_key:
+                if "resnets" in new_key:
+                    parts = new_key.split(".")
+                    resnet_pos = parts.index("resnets")
+                    parts[resnet_pos] = "layers"
+                    new_key = ".".join(parts)
+                elif "upsamplers" in new_key:
+                    parts = new_key.split(".")
+                    us_pos = parts.index("upsamplers")
+                    parts[us_pos] = "layers"
+                    parts[us_pos + 1] = str(layers_per_block + 1)
+                    new_key = ".".join(parts)
+            
+            if "mid_block" in new_key:
+                if "resnets.0" in new_key:
+                    new_key = new_key.replace("resnets.0", "layers.0")
+                elif "attentions.0" in new_key:
+                    new_key = new_key.replace("attentions.0", "layers.1")
+                elif "resnets.1" in new_key:
+                    new_key = new_key.replace("resnets.1", "layers.2")
+            
+            if "to_out.0" in new_key:
+                new_key = new_key.replace("to_out.0", "to_out")
+            
+            # Transpose conv weights
+            if "conv" in new_key and "weight" in new_key and len(value.shape) == 4:
+                value = value.permute(0, 2, 3, 1)
+            
+            mlx_vae[new_key] = mx.array(value.float().numpy())
+        
+        mx.save_safetensors(str(output_dir / "vae.safetensors"), mlx_vae)
+        with open(output_dir / "vae_config.json", "w") as f:
+            json.dump(DEFAULT_VAE_CONFIG, f, indent=2)
+        print(f"Saved VAE weights to {output_dir / 'vae.safetensors'}")
+    
+    # Convert text encoder weights
+    if progress:
+        progress(0.7, desc="Converting text encoder weights...")
+    
+    if text_encoder_weights:
+        print(f"Converting {len(text_encoder_weights)} text encoder tensors...")
+        mlx_te = {}
+        for key, value in tqdm(text_encoder_weights.items(), desc="Text Encoder"):
+            mlx_te[key] = mx.array(value.float().numpy())
+        
+        mx.save_safetensors(str(output_dir / "text_encoder.safetensors"), mlx_te)
+        with open(output_dir / "text_encoder_config.json", "w") as f:
+            json.dump(DEFAULT_TEXT_ENCODER_CONFIG, f, indent=2)
+        print(f"Saved text encoder weights to {output_dir / 'text_encoder.safetensors'}")
+    
+    # Create default tokenizer and scheduler configs if they don't exist
+    if progress:
+        progress(0.9, desc="Setting up tokenizer and scheduler...")
+    
+    tokenizer_dir = output_dir / "tokenizer"
+    scheduler_dir = output_dir / "scheduler"
+    
+    # Check if we need to copy from HF model or create defaults
+    hf_tokenizer = Path(PYTORCH_MODEL_PATH) / "tokenizer"
+    hf_scheduler = Path(PYTORCH_MODEL_PATH) / "scheduler"
+    
+    if hf_tokenizer.exists() and not tokenizer_dir.exists():
+        shutil.copytree(hf_tokenizer, tokenizer_dir)
+        print(f"Copied tokenizer from {hf_tokenizer}")
+    elif not tokenizer_dir.exists():
+        print("Warning: Tokenizer not found. You may need to download it separately.")
+    
+    if hf_scheduler.exists() and not scheduler_dir.exists():
+        shutil.copytree(hf_scheduler, scheduler_dir)
+        print(f"Copied scheduler from {hf_scheduler}")
+    elif not scheduler_dir.exists():
+        # Create default scheduler config
+        scheduler_dir.mkdir(parents=True, exist_ok=True)
+        scheduler_config = {
+            "_class_name": "FlowMatchEulerDiscreteScheduler",
+            "base_image_seq_len": 256,
+            "base_shift": 0.5,
+            "max_image_seq_len": 4096,
+            "max_shift": 1.15,
+            "num_train_timesteps": 1000,
+            "shift": 3.0,
+        }
+        with open(scheduler_dir / "scheduler_config.json", "w") as f:
+            json.dump(scheduler_config, f, indent=2)
+        print("Created default scheduler config")
+    
+    if progress:
+        progress(1.0, desc="Conversion complete!")
+    
+    print(f"\n✓ Single-file model converted to {output_dir}")
+    return True
 
 
 def check_and_setup_models():
@@ -707,109 +957,163 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         """
     )
     
-    with gr.Row():
-        with gr.Column(scale=1):
-            prompt = gr.Textbox(
-                label="Prompt",
-                placeholder="Describe the image you want to generate...",
-                lines=5,
-                max_lines=10,
+    with gr.Tabs():
+        with gr.Tab("🖼️ Generate"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    prompt = gr.Textbox(
+                        label="Prompt",
+                        placeholder="Describe the image you want to generate...",
+                        lines=5,
+                        max_lines=10,
+                    )
+                    
+                    enhance_btn = gr.Button("✨ Enhance Prompt", variant="secondary", size="sm")
+                    
+                    with gr.Row():
+                        base_resolution = gr.Dropdown(
+                            choices=list(DIMENSION_PRESETS.keys()),
+                            value=DEFAULT_BASE_RESOLUTION,
+                            label="Resolution Category",
+                        )
+                        
+                        aspect_ratio = gr.Dropdown(
+                            choices=get_aspect_ratio_choices(DEFAULT_BASE_RESOLUTION),
+                            value=DEFAULT_ASPECT_RATIO,
+                            label="Width × Height (Ratio)",
+                            interactive=True,
+                        )
+                    
+                    with gr.Row():
+                        backend = gr.Dropdown(
+                            choices=["MLX (Apple Silicon)", "PyTorch"],
+                            value="MLX (Apple Silicon)",
+                            label="Backend",
+                        )
+                    
+                    with gr.Row():
+                        steps = gr.Slider(
+                            minimum=1,
+                            maximum=20,
+                            value=9,
+                            step=1,
+                            label="Inference Steps",
+                            info="More steps = better quality but slower (9 recommended)",
+                        )
+                        
+                        time_shift = gr.Slider(
+                            minimum=1.0,
+                            maximum=10.0,
+                            value=3.0,
+                            step=0.1,
+                            label="Time Shift",
+                            info="Scheduler shift parameter (default: 3.0)",
+                        )
+                    
+                    with gr.Row():
+                        seed = gr.Slider(
+                            minimum=-1,
+                            maximum=2147483647,
+                            value=-1,
+                            step=1,
+                            label="Seed",
+                            info="-1 for random seed",
+                        )
+                        random_seed_checkbox = gr.Checkbox(
+                            label="Random Seed",
+                            value=True,
+                        )
+                    
+                    generate_btn = gr.Button("🚀 Generate", variant="primary", size="lg")
+                    
+                    with gr.Column(visible=False) as dataset_section:
+                        gr.Markdown("---\n### 💾 Save to Dataset")
+                        
+                        dataset_location = gr.Textbox(
+                            label="Dataset Save Location",
+                            placeholder="e.g., ~/Documents/datasets/z-image or /Users/you/datasets/z-image",
+                            info="Images and prompts will be saved here for training datasets (you can drag a folder here)",
+                        )
+                        
+                        with gr.Row():
+                            save_png_btn = gr.Button("💾 Save to Dataset (PNG)", variant="secondary")
+                            save_jpg_btn = gr.Button("💾 Save to Dataset (JPG)", variant="secondary")
+                        
+                        gr.Markdown("*Tip: Select an image to save just that one, or save all if none selected*")
+                        
+                        save_status = gr.Textbox(label="Save Status", interactive=False, lines=3, max_lines=10)
+                
+                with gr.Column(scale=1):
+                    output_gallery = gr.Gallery(
+                        label="Generated Images",
+                        show_label=True,
+                        elem_id="gallery",
+                        columns=2,
+                        rows=2,
+                        height="auto",
+                        object_fit="contain",
+                    )
+                    
+                    with gr.Row():
+                        clear_selection_btn = gr.Button("↩️ Deselect (for Batch Save)", variant="secondary", size="sm")
+                        delete_selected_btn = gr.Button("❌ Delete Selected", variant="stop", size="sm")
+                        clear_gallery_btn = gr.Button("🗑️ Clear All", variant="stop", size="sm")
+                    
+                    with gr.Accordion("Selected Image Info", open=True):
+                        selected_info_display = gr.Textbox(label="Generation Details", interactive=False, lines=5)
+                        selected_prompt_display = gr.Textbox(label="Prompt", interactive=False, lines=4)
+            
+            # Example prompts
+            gr.Examples(
+                examples=[
+                    ["A majestic lion with a flowing golden mane, photorealistic, dramatic lighting"],
+                    ["A cozy coffee shop interior with warm lighting, watercolor style"],
+                    ["A futuristic cityscape at sunset, cyberpunk aesthetic, neon lights"],
+                    ["A serene Japanese garden with cherry blossoms, traditional ink painting style"],
+                    ["An astronaut floating in space with Earth in the background, cinematic"],
+                ],
+                inputs=[prompt],
+                label="Example Prompts",
             )
-            
-            enhance_btn = gr.Button("✨ Enhance Prompt", variant="secondary", size="sm")
-            
-            with gr.Row():
-                base_resolution = gr.Dropdown(
-                    choices=list(DIMENSION_PRESETS.keys()),
-                    value=DEFAULT_BASE_RESOLUTION,
-                    label="Resolution Category",
-                )
-                
-                aspect_ratio = gr.Dropdown(
-                    choices=get_aspect_ratio_choices(DEFAULT_BASE_RESOLUTION),
-                    value=DEFAULT_ASPECT_RATIO,
-                    label="Width × Height (Ratio)",
-                    interactive=True,
-                )
-            
-            with gr.Row():
-                backend = gr.Dropdown(
-                    choices=["MLX (Apple Silicon)", "PyTorch"],
-                    value="MLX (Apple Silicon)",
-                    label="Backend",
-                )
-            
-            with gr.Row():
-                steps = gr.Slider(
-                    minimum=1,
-                    maximum=20,
-                    value=9,
-                    step=1,
-                    label="Inference Steps",
-                    info="More steps = better quality but slower (9 recommended)",
-                )
-                
-                time_shift = gr.Slider(
-                    minimum=1.0,
-                    maximum=10.0,
-                    value=3.0,
-                    step=0.1,
-                    label="Time Shift",
-                    info="Scheduler shift parameter (default: 3.0)",
-                )
-            
-            with gr.Row():
-                seed = gr.Slider(
-                    minimum=-1,
-                    maximum=2147483647,
-                    value=-1,
-                    step=1,
-                    label="Seed",
-                    info="-1 for random seed",
-                )
-                random_seed_checkbox = gr.Checkbox(
-                    label="Random Seed",
-                    value=True,
-                )
-            
-            generate_btn = gr.Button("🚀 Generate", variant="primary", size="lg")
-            
-            with gr.Column(visible=False) as dataset_section:
-                gr.Markdown("---\n### 💾 Save to Dataset")
-                
-                dataset_location = gr.Textbox(
-                    label="Dataset Save Location",
-                    placeholder="e.g., ~/Documents/datasets/z-image or /Users/you/datasets/z-image",
-                    info="Images and prompts will be saved here for training datasets (you can drag a folder here)",
-                )
-                
-                with gr.Row():
-                    save_png_btn = gr.Button("💾 Save to Dataset (PNG)", variant="secondary")
-                    save_jpg_btn = gr.Button("💾 Save to Dataset (JPG)", variant="secondary")
-                
-                gr.Markdown("*Tip: Select an image to save just that one, or save all if none selected*")
-                
-                save_status = gr.Textbox(label="Save Status", interactive=False, lines=3, max_lines=10)
         
-        with gr.Column(scale=1):
-            output_gallery = gr.Gallery(
-                label="Generated Images",
-                show_label=True,
-                elem_id="gallery",
-                columns=2,
-                rows=2,
-                height="auto",
-                object_fit="contain",
+        with gr.Tab("⚙️ Model Settings"):
+            gr.Markdown(
+                """
+                ### Model Management
+                
+                Load models from Hugging Face or convert a single-file `.safetensors` model to MLX format.
+                """
             )
             
             with gr.Row():
-                clear_selection_btn = gr.Button("↩️ Deselect (for Batch Save)", variant="secondary", size="sm")
-                delete_selected_btn = gr.Button("❌ Delete Selected", variant="stop", size="sm")
-                clear_gallery_btn = gr.Button("🗑️ Clear All", variant="stop", size="sm")
+                with gr.Column():
+                    gr.Markdown("#### 📥 Load from Hugging Face")
+                    hf_model_id = gr.Textbox(
+                        label="Hugging Face Model ID",
+                        value="Tongyi-MAI/Z-Image-Turbo",
+                        info="Enter the model ID from Hugging Face Hub",
+                    )
+                    download_hf_btn = gr.Button("⬇️ Download from Hugging Face", variant="primary")
+                    hf_status = gr.Textbox(label="Status", interactive=False, lines=3)
+                
+                with gr.Column():
+                    gr.Markdown("#### 📁 Convert Single-File Model")
+                    single_file_path = gr.Textbox(
+                        label="Single-File .safetensors Path",
+                        placeholder="e.g., /path/to/model.safetensors",
+                        info="Path to a single .safetensors file containing all model components",
+                    )
+                    convert_single_btn = gr.Button("🔄 Convert to MLX", variant="primary")
+                    convert_status = gr.Textbox(label="Status", interactive=False, lines=3)
             
-            with gr.Accordion("Selected Image Info", open=True):
-                selected_info_display = gr.Textbox(label="Generation Details", interactive=False, lines=5)
-                selected_prompt_display = gr.Textbox(label="Prompt", interactive=False, lines=4)
+            gr.Markdown(
+                """
+                ---
+                #### Current Model Status
+                """
+            )
+            model_status = gr.Textbox(label="Model Status", interactive=False, lines=4, value="Checking...")
+            refresh_status_btn = gr.Button("🔄 Refresh Status", variant="secondary")
     
     # Hidden state to store temporary paths, prompt, seed, and selected index
     temp_png_path = gr.State()
@@ -818,18 +1122,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     stored_seed = gr.State()
     selected_index = gr.State(value=None)
     
-    # Example prompts
-    gr.Examples(
-        examples=[
-            ["A majestic lion with a flowing golden mane, photorealistic, dramatic lighting"],
-            ["A cozy coffee shop interior with warm lighting, watercolor style"],
-            ["A futuristic cityscape at sunset, cyberpunk aesthetic, neon lights"],
-            ["A serene Japanese garden with cherry blossoms, traditional ink painting style"],
-            ["An astronaut floating in space with Earth in the background, cinematic"],
-        ],
-        inputs=[prompt],
-        label="Example Prompts",
-    )
+    # --- Event Handlers ---
     
     # Update aspect ratio choices when base resolution changes
     base_resolution.change(
@@ -904,6 +1197,104 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         fn=lambda idx, png, jpg, p, s, loc: save_selected_or_all(idx, png, jpg, p, s, loc, "jpg"),
         inputs=[selected_index, temp_png_path, temp_jpg_path, stored_prompt, stored_seed, dataset_location],
         outputs=[save_status],
+    )
+    
+    # --- Model Settings Event Handlers ---
+    
+    def check_model_status():
+        """Check the status of installed models"""
+        status_lines = []
+        
+        mlx_path = Path(MLX_MODEL_PATH)
+        pytorch_path = Path(PYTORCH_MODEL_PATH)
+        
+        # Check MLX model
+        if (mlx_path / "weights.safetensors").exists():
+            status_lines.append("✅ MLX Model: Installed")
+            if (mlx_path / "vae.safetensors").exists():
+                status_lines.append("  ├─ VAE: ✓")
+            if (mlx_path / "text_encoder.safetensors").exists():
+                status_lines.append("  ├─ Text Encoder: ✓")
+            if (mlx_path / "tokenizer").exists():
+                status_lines.append("  └─ Tokenizer: ✓")
+        else:
+            status_lines.append("❌ MLX Model: Not installed")
+        
+        # Check PyTorch model
+        if (pytorch_path / "transformer").exists():
+            status_lines.append("✅ PyTorch Model: Installed")
+        else:
+            status_lines.append("⚠️ PyTorch Model: Not installed (will download on first use)")
+        
+        return "\n".join(status_lines)
+    
+    def download_from_hf(model_id, progress=gr.Progress()):
+        """Download model from Hugging Face and convert to MLX"""
+        try:
+            from convert_to_mlx import ensure_model_downloaded, convert_weights
+            import convert_to_mlx
+            
+            progress(0.1, desc="Downloading from Hugging Face...")
+            
+            # Download
+            model_path = ensure_model_downloaded(PYTORCH_MODEL_PATH)
+            
+            progress(0.5, desc="Converting to MLX format...")
+            
+            # Convert
+            class Args:
+                model_path = str(Path(PYTORCH_MODEL_PATH) / "transformer")
+                output_path = MLX_MODEL_PATH
+            
+            convert_to_mlx.args = Args()
+            convert_weights(Args.model_path, Args.output_path)
+            
+            progress(1.0, desc="Complete!")
+            return f"✅ Successfully downloaded and converted {model_id}"
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def convert_single_file(file_path, progress=gr.Progress()):
+        """Convert single-file safetensors to MLX format"""
+        if not file_path or not file_path.strip():
+            return "❌ Please provide a path to the .safetensors file"
+        
+        file_path = Path(file_path.strip()).expanduser()
+        if not file_path.exists():
+            return f"❌ File not found: {file_path}"
+        
+        if not str(file_path).endswith(".safetensors"):
+            return "❌ File must be a .safetensors file"
+        
+        try:
+            convert_single_file_to_mlx(str(file_path), MLX_MODEL_PATH, progress)
+            return f"✅ Successfully converted {file_path.name} to MLX format"
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    download_hf_btn.click(
+        fn=download_from_hf,
+        inputs=[hf_model_id],
+        outputs=[hf_status],
+    )
+    
+    convert_single_btn.click(
+        fn=convert_single_file,
+        inputs=[single_file_path],
+        outputs=[convert_status],
+    )
+    
+    refresh_status_btn.click(
+        fn=check_model_status,
+        inputs=None,
+        outputs=[model_status],
+    )
+    
+    # Initialize model status on load
+    demo.load(
+        fn=check_model_status,
+        inputs=None,
+        outputs=[model_status],
     )
 
 
