@@ -8,12 +8,19 @@ import numpy as np
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 from transformers import AutoTokenizer
-from diffusers import FlowMatchEulerDiscreteScheduler, ZImagePipeline
+from diffusers import FlowMatchEulerDiscreteScheduler
+try:
+    from diffusers import ZImagePipeline
+    PYTORCH_AVAILABLE = True
+except ImportError:
+    ZImagePipeline = None
+    PYTORCH_AVAILABLE = False
+    print("Warning: ZImagePipeline not available. PyTorch backend disabled.")
+    print("To enable PyTorch, install diffusers >= 0.36.0 or the dev version.")
 import json
 import random
 import sys
 import os
-import tempfile
 from pathlib import Path
 from datetime import datetime
 import shutil
@@ -24,17 +31,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 # Global model cache
 _mlx_models = None
 _pytorch_pipe = None
-_current_mlx_model_path = None  # Track which model is currently loaded
+_current_mlx_model_path = None  # Track which MLX model is currently loaded
+_current_pytorch_model_path = None  # Track which PyTorch model is currently loaded
 
 # Session image gallery storage
 _image_gallery = []  # List of dicts: {"image": PIL.Image, "prompt": str, "seed": int, "png_path": str, "jpg_path": str}
+
+# Temp directory for session images
+TEMP_DIR = "./temp"
 
 # Model paths - organized by platform
 MODELS_DIR = "./models"  # Base directory for all models
 MLX_MODELS_DIR = "./models/mlx"  # MLX models directory
 PYTORCH_MODELS_DIR = "./models/pytorch"  # PyTorch models directory
 PYTORCH_MODEL_PATH = "./models/pytorch/Z-Image-Turbo"  # Default PyTorch model
-MLX_MODEL_PATH = "./models/mlx/mlx_model"  # Default MLX model
+MLX_MODEL_PATH = "./models/mlx/Z-Image-Turbo-MLX"  # Default MLX model
 SINGLE_FILE_MODEL_PATH = "./models/single_file"  # For single-file .safetensors models
 
 # Z-Image-Turbo architecture signature keys
@@ -263,6 +274,36 @@ def get_available_mlx_models():
     return sorted(available_models)
 
 
+def get_available_pytorch_models():
+    """Scan the PyTorch models directory for available models"""
+    models_path = Path(PYTORCH_MODELS_DIR)
+    available_models = []
+    
+    if not models_path.exists():
+        models_path.mkdir(parents=True, exist_ok=True)
+        return available_models
+    
+    # Check each subdirectory for PyTorch/Diffusers model files
+    for item in models_path.iterdir():
+        if item.is_dir():
+            # Check for diffusers format (has transformer/, vae/, etc.)
+            transformer_dir = item / "transformer"
+            if transformer_dir.exists():
+                # Check for safetensors files in transformer dir
+                if list(transformer_dir.glob("*.safetensors")):
+                    available_models.append(item.name)
+    
+    return sorted(available_models)
+
+
+def get_available_models_for_backend(backend):
+    """Get available models for the specified backend"""
+    if backend == "MLX (Apple Silicon)":
+        return get_available_mlx_models()
+    else:
+        return get_available_pytorch_models()
+
+
 def select_mlx_model(model_name):
     """Select and load a specific MLX model"""
     global _mlx_models, _current_mlx_model_path
@@ -292,16 +333,45 @@ def select_mlx_model(model_name):
     return True
 
 
-def get_current_model_name():
-    """Get the name of the currently selected model"""
-    global _current_mlx_model_path
+def select_pytorch_model(model_name):
+    """Select a specific PyTorch model"""
+    global _pytorch_pipe, _current_pytorch_model_path
     
-    if _current_mlx_model_path:
-        return Path(_current_mlx_model_path).name
+    if not model_name:
+        return False
     
-    # Default to mlx_model if it exists
-    if Path(MLX_MODEL_PATH).exists():
-        return "mlx_model"
+    model_path = Path(PYTORCH_MODELS_DIR) / model_name
+    
+    if not model_path.exists():
+        return False
+    
+    transformer_dir = model_path / "transformer"
+    if not transformer_dir.exists():
+        return False
+    
+    # Clear cached pipeline to force reload with new model
+    _pytorch_pipe = None
+    _current_pytorch_model_path = str(model_path)
+    
+    return True
+
+
+def get_current_model_name(backend="MLX (Apple Silicon)"):
+    """Get the name of the currently selected model for a backend"""
+    global _current_mlx_model_path, _current_pytorch_model_path
+    
+    if backend == "MLX (Apple Silicon)":
+        if _current_mlx_model_path:
+            return Path(_current_mlx_model_path).name
+        # Default to MLX_MODEL_PATH if it exists
+        if Path(MLX_MODEL_PATH).exists():
+            return Path(MLX_MODEL_PATH).name
+    else:
+        if _current_pytorch_model_path:
+            return Path(_current_pytorch_model_path).name
+        # Default to PYTORCH_MODEL_PATH if it exists
+        if Path(PYTORCH_MODEL_PATH).exists():
+            return Path(PYTORCH_MODEL_PATH).name
     
     return None
 
@@ -326,12 +396,10 @@ def convert_single_file_to_mlx(single_file_path, output_path=None, progress=None
         output_path = str(Path(MLX_MODELS_DIR) / model_name)
     import mlx.core as mx
     from safetensors.torch import load_file
-    from tqdm import tqdm
     
     if progress:
-        progress(0.1, desc="Loading single-file model...")
+        progress(0.05, desc="Loading single-file model...")
     
-    print(f"Loading single-file model from {single_file_path}...")
     all_weights = load_file(single_file_path)
     
     # Separate weights by component
@@ -370,12 +438,14 @@ def convert_single_file_to_mlx(single_file_path, output_path=None, progress=None
     
     # Convert transformer weights
     if progress:
-        progress(0.3, desc="Converting transformer weights...")
+        progress(0.2, desc=f"Converting {len(transformer_weights)} transformer weights...")
     
     if transformer_weights:
-        print(f"Converting {len(transformer_weights)} transformer tensors...")
         mlx_transformer = {}
-        for key, value in tqdm(transformer_weights.items(), desc="Transformer"):
+        total = len(transformer_weights)
+        for i, (key, value) in enumerate(transformer_weights.items()):
+            if progress and i % 50 == 0:
+                progress(0.2 + 0.25 * (i / total), desc=f"Converting transformer weights ({i}/{total})...")
             new_key = key
             # Apply key mappings (same as convert_to_mlx.py)
             if key.startswith("all_final_layer.2-1."):
@@ -399,7 +469,6 @@ def convert_single_file_to_mlx(single_file_path, output_path=None, progress=None
             mlx_transformer[new_key] = mx.array(value.float().numpy().astype("float16"))
         
         mx.save_safetensors(str(output_dir / "weights.safetensors"), mlx_transformer)
-        print(f"Saved transformer weights to {output_dir / 'weights.safetensors'}")
         
         # Save config
         with open(output_dir / "config.json", "w") as f:
@@ -407,14 +476,16 @@ def convert_single_file_to_mlx(single_file_path, output_path=None, progress=None
     
     # Convert VAE weights
     if progress:
-        progress(0.5, desc="Converting VAE weights...")
+        progress(0.45, desc=f"Converting {len(vae_weights)} VAE weights...")
     
     if vae_weights:
-        print(f"Converting {len(vae_weights)} VAE tensors...")
         mlx_vae = {}
         layers_per_block = DEFAULT_VAE_CONFIG["layers_per_block"]
+        total = len(vae_weights)
         
-        for key, value in tqdm(vae_weights.items(), desc="VAE"):
+        for i, (key, value) in enumerate(vae_weights.items()):
+            if progress and i % 30 == 0:
+                progress(0.45 + 0.2 * (i / total), desc=f"Converting VAE weights ({i}/{total})...")
             new_key = key
             
             # Map down_blocks/up_blocks structure
@@ -466,23 +537,23 @@ def convert_single_file_to_mlx(single_file_path, output_path=None, progress=None
         mx.save_safetensors(str(output_dir / "vae.safetensors"), mlx_vae)
         with open(output_dir / "vae_config.json", "w") as f:
             json.dump(DEFAULT_VAE_CONFIG, f, indent=2)
-        print(f"Saved VAE weights to {output_dir / 'vae.safetensors'}")
     
     # Convert text encoder weights
     if progress:
-        progress(0.7, desc="Converting text encoder weights...")
+        progress(0.65, desc=f"Converting {len(text_encoder_weights)} text encoder weights...")
     
     if text_encoder_weights:
-        print(f"Converting {len(text_encoder_weights)} text encoder tensors...")
         mlx_te = {}
-        for key, value in tqdm(text_encoder_weights.items(), desc="Text Encoder"):
+        total = len(text_encoder_weights)
+        for i, (key, value) in enumerate(text_encoder_weights.items()):
+            if progress and i % 50 == 0:
+                progress(0.65 + 0.2 * (i / total), desc=f"Converting text encoder weights ({i}/{total})...")
             # Convert to float32 first (handles bfloat16)
             mlx_te[key] = mx.array(value.float().numpy())
         
         mx.save_safetensors(str(output_dir / "text_encoder.safetensors"), mlx_te)
         with open(output_dir / "text_encoder_config.json", "w") as f:
             json.dump(DEFAULT_TEXT_ENCODER_CONFIG, f, indent=2)
-        print(f"Saved text encoder weights to {output_dir / 'text_encoder.safetensors'}")
     
     # Create default tokenizer and scheduler configs if they don't exist
     if progress:
@@ -497,13 +568,9 @@ def convert_single_file_to_mlx(single_file_path, output_path=None, progress=None
     
     if hf_tokenizer.exists() and not tokenizer_dir.exists():
         shutil.copytree(hf_tokenizer, tokenizer_dir)
-        print(f"Copied tokenizer from {hf_tokenizer}")
-    elif not tokenizer_dir.exists():
-        print("Warning: Tokenizer not found. You may need to download it separately.")
     
     if hf_scheduler.exists() and not scheduler_dir.exists():
         shutil.copytree(hf_scheduler, scheduler_dir)
-        print(f"Copied scheduler from {hf_scheduler}")
     elif not scheduler_dir.exists():
         # Create default scheduler config
         scheduler_dir.mkdir(parents=True, exist_ok=True)
@@ -518,12 +585,10 @@ def convert_single_file_to_mlx(single_file_path, output_path=None, progress=None
         }
         with open(scheduler_dir / "scheduler_config.json", "w") as f:
             json.dump(scheduler_config, f, indent=2)
-        print("Created default scheduler config")
     
     if progress:
         progress(1.0, desc="Conversion complete!")
     
-    print(f"\n✓ Single-file model converted to {output_dir}")
     return True
 
 
@@ -604,25 +669,55 @@ def load_mlx_models(model_path=None):
     from vae import AutoencoderKL
     from text_encoder import TextEncoder
     
-    print(f"Loading MLX Models from {model_path}...")
-    
     # Load Transformer
     with open(f"{model_path}/config.json", "r") as f:
         config = json.load(f)
     model = ZImageTransformer2DModel(config)
     weights = mx.load(f"{model_path}/weights.safetensors")
     
-    # Handle weights that may have prefixes (e.g., "diffusion_" from all-in-one safetensors)
-    # Strip the prefix to match model parameter names
-    processed_weights = []
+    # Process weights: handle prefixes and key mappings
+    # The weights may have:
+    # - "diffusion_" prefix (from all-in-one format)
+    # - Fused QKV weights (qkv.weight instead of to_q/to_k/to_v)
+    # - Different norm names (q_norm vs norm_q)
+    # - Different output names (out vs to_out)
+    processed_weights = {}
+    dim = config.get("hidden_size", 3840)
+    
     for key, value in weights.items():
         new_key = key
-        # Strip common prefixes from all-in-one format
-        if key.startswith("diffusion_"):
-            new_key = key[len("diffusion_"):]
-        processed_weights.append((new_key, value))
+        
+        # Strip common prefixes
+        if new_key.startswith("diffusion_"):
+            new_key = new_key[len("diffusion_"):]
+        
+        # Skip pad tokens
+        if "pad_token" in new_key:
+            continue
+        
+        # Handle fused QKV weights - split into separate Q, K, V
+        if ".attention.qkv.weight" in new_key:
+            base_key = new_key.replace(".qkv.weight", "")
+            # QKV is [3*dim, dim], split along first axis
+            q, k, v = mx.split(value, 3, axis=0)
+            processed_weights[f"{base_key}.to_q.weight"] = q
+            processed_weights[f"{base_key}.to_k.weight"] = k
+            processed_weights[f"{base_key}.to_v.weight"] = v
+            continue
+        
+        # Map out -> to_out
+        if ".attention.out.weight" in new_key:
+            new_key = new_key.replace(".attention.out.weight", ".attention.to_out.weight")
+        
+        # Map q_norm -> norm_q, k_norm -> norm_k
+        if ".attention.q_norm.weight" in new_key:
+            new_key = new_key.replace(".attention.q_norm.weight", ".attention.norm_q.weight")
+        if ".attention.k_norm.weight" in new_key:
+            new_key = new_key.replace(".attention.k_norm.weight", ".attention.norm_k.weight")
+        
+        processed_weights[new_key] = value
     
-    model.load_weights(processed_weights)
+    model.load_weights(list(processed_weights.items()))
     model.eval()
     
     # Load VAE
@@ -666,21 +761,34 @@ def load_mlx_models(model_path=None):
         "scheduler": scheduler,
     }
     
-    print("MLX Models loaded successfully!")
     return _mlx_models
 
 
 def load_pytorch_pipeline(model_path=None):
     """Load PyTorch pipeline (cached globally)"""
-    global _pytorch_pipe
+    global _pytorch_pipe, _current_pytorch_model_path
     
+    if not PYTORCH_AVAILABLE:
+        raise ImportError(
+            "PyTorch backend not available. ZImagePipeline requires diffusers >= 0.36.0.\\n\"\n            \"Install with: pip install git+https://github.com/huggingface/diffusers.git"
+        )
+    
+    # Use selected model path, or default
     if model_path is None:
-        model_path = PYTORCH_MODEL_PATH
+        if _current_pytorch_model_path:
+            model_path = _current_pytorch_model_path
+        else:
+            model_path = PYTORCH_MODEL_PATH
     
+    # Check if we need to reload (different model selected)
     if _pytorch_pipe is not None:
-        return _pytorch_pipe
+        # If same model, return cached
+        if _current_pytorch_model_path == model_path:
+            return _pytorch_pipe
+        # Different model, clear cache
+        _pytorch_pipe = None
     
-    print("Loading PyTorch Pipeline...")
+    _current_pytorch_model_path = model_path
     
     # Determine device
     if torch.backends.mps.is_available():
@@ -690,8 +798,6 @@ def load_pytorch_pipeline(model_path=None):
     else:
         device = "cpu"
     
-    print(f"Using device: {device}")
-    
     _pytorch_pipe = ZImagePipeline.from_pretrained(
         model_path,
         torch_dtype=torch.float32,
@@ -699,7 +805,6 @@ def load_pytorch_pipeline(model_path=None):
     )
     _pytorch_pipe.to(device)
     
-    print("PyTorch Pipeline loaded successfully!")
     return _pytorch_pipe
 
 
@@ -726,13 +831,9 @@ def load_prompt_enhancer():
     
     # Check if local model exists
     if enhancer_path.exists() and (enhancer_path / "config.json").exists():
-        print(f"Loading prompt enhancer from {PROMPT_ENHANCER_PATH}...")
         model, tokenizer = load(str(enhancer_path))
     else:
         # Download and save locally
-        print(f"Prompt enhancer not found. Downloading {PROMPT_ENHANCER_MODEL}...")
-        print("This will be saved to models/prompt_enhancer/ for future use.")
-        
         from huggingface_hub import snapshot_download
         
         # Download to local path
@@ -743,7 +844,6 @@ def load_prompt_enhancer():
             local_dir_use_symlinks=False,
         )
         
-        print(f"✓ Prompt enhancer saved to {PROMPT_ENHANCER_PATH}")
         model, tokenizer = load(str(enhancer_path))
     
     _prompt_enhancer = (model, tokenizer)
@@ -962,7 +1062,7 @@ def update_aspect_ratios(base_resolution):
     return gr.update(choices=choices, value=choices[0])
 
 
-def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height):
+def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name):
     """Add a generated image to the gallery"""
     global _image_gallery
     _image_gallery.append({
@@ -976,6 +1076,7 @@ def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, b
         "backend": backend,
         "width": width,
         "height": height,
+        "model_name": model_name,
     })
     return [item["image"] for item in _image_gallery]
 
@@ -989,7 +1090,8 @@ def get_selected_image_info(evt: gr.SelectData):
     """Get info for the selected image from gallery"""
     if evt.index < len(_image_gallery):
         item = _image_gallery[evt.index]
-        details = f"Seed: {item['seed']}\nSize: {item['width']}×{item['height']}\nSteps: {item['steps']} | Time Shift: {item['time_shift']}\nBackend: {item['backend']}\nIndex: {evt.index + 1} of {len(_image_gallery)}"
+        model_name = item.get('model_name', 'Unknown')
+        details = f"Model: {model_name}\nSeed: {item['seed']}\nSize: {item['width']}×{item['height']}\nSteps: {item['steps']} | Time Shift: {item['time_shift']}\nBackend: {item['backend']}\nIndex: {evt.index + 1} of {len(_image_gallery)}"
         return (
             details,
             item["prompt"],
@@ -1022,22 +1124,25 @@ def clear_gallery():
     return [], None, "", "", "", "", 0, ""
 
 
-def create_metadata_string(prompt, seed, steps, time_shift, backend, width, height):
+def create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name):
     """Create a metadata string for embedding in images"""
     return f"""{prompt}
 
 ---
-Model: Z-Image-Turbo
+Model: {model_name}
 Size: {width}×{height}
 Seed: {seed}
 Steps: {steps}
 Time Shift: {time_shift}
-Backend: {backend}"""
+Backend: {backend}
+
+Generated with Z-Image-Turbo-MLX
+https://github.com/FiditeNemini/z-image-turbo-mlx"""
 
 
-def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shift, backend, width, height):
+def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shift, backend, width, height, model_name):
     """Save image with embedded metadata"""
-    metadata_str = create_metadata_string(prompt, seed, steps, time_shift, backend, width, height)
+    metadata_str = create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name)
     
     if filepath.lower().endswith('.png'):
         # PNG metadata using PngInfo
@@ -1050,11 +1155,12 @@ def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shif
         png_info.add_text("backend", backend)
         png_info.add_text("width", str(width))
         png_info.add_text("height", str(height))
-        png_info.add_text("model", "Z-Image-Turbo")
+        png_info.add_text("model", model_name)
+        png_info.add_text("generator", "Z-Image-Turbo-MLX")
+        png_info.add_text("generator_url", "https://github.com/FiditeNemini/z-image-turbo-mlx")
         pil_image.save(filepath, "PNG", pnginfo=png_info)
     else:
         # JPEG metadata using EXIF UserComment
-        from PIL.ExifTags import TAGS
         import piexif
         
         # Save image first
@@ -1063,8 +1169,9 @@ def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shif
         # Add EXIF metadata
         try:
             exif_dict = piexif.load(filepath)
-            # UserComment field (tag 0x9286)
-            user_comment = piexif.helper.UserComment.dump(metadata_str, encoding="unicode")
+            # UserComment field - encode as ASCII with proper header
+            # Format: charset code (8 bytes) + comment
+            user_comment = b"UNICODE\x00" + metadata_str.encode('utf-16')
             exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
             # ImageDescription
             exif_dict["0th"][piexif.ImageIFD.ImageDescription] = metadata_str.encode('utf-8')
@@ -1142,11 +1249,14 @@ def save_selected_or_all(selected_index, png_path, jpg_path, prompt, seed, datas
         return f"BATCH SAVE COMPLETE:\n{result}"
 
 
-def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, progress=gr.Progress()):
-    """Generate an image using selected backend"""
+def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, progress=gr.Progress()):
+    """Generate an image using selected backend and model"""
     
     if not prompt.strip():
         raise gr.Error("Please enter a prompt")
+    
+    if not model_name:
+        raise gr.Error(f"No model selected for {backend}")
     
     # Get dimensions from preset
     width, height = DIMENSION_PRESETS[base_resolution][aspect_ratio]
@@ -1156,30 +1266,36 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
         seed = random.randint(0, 2147483647)
     seed = int(seed)
     
-    progress(0, desc=f"Loading {backend} models...")
+    progress(0, desc=f"Loading {model_name}...")
     
     if backend == "MLX (Apple Silicon)":
+        # Select the MLX model
+        select_mlx_model(model_name)
         pil_image = generate_mlx(prompt, width, height, steps, time_shift, seed, progress)
     else:
+        # Select the PyTorch model
+        select_pytorch_model(model_name)
         pil_image = generate_pytorch(prompt, width, height, steps, time_shift, seed, progress)
     
     progress(0.95, desc="Saving temporary files...")
     
     # Generate timestamp-based filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    temp_dir = tempfile.gettempdir()
     
-    png_path = os.path.join(temp_dir, f"{timestamp}.png")
-    jpg_path = os.path.join(temp_dir, f"{timestamp}.jpg")
+    # Ensure temp directory exists
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    
+    png_path = os.path.join(TEMP_DIR, f"{timestamp}.png")
+    jpg_path = os.path.join(TEMP_DIR, f"{timestamp}.jpg")
     
     # Save images with embedded metadata
-    save_image_with_metadata(pil_image, png_path, prompt, seed, steps, time_shift, backend, width, height)
-    save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, width, height)
+    save_image_with_metadata(pil_image, png_path, prompt, seed, steps, time_shift, backend, width, height, model_name)
+    save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, width, height, model_name)
     
     progress(1.0, desc="Done!")
     
     # Add to gallery with all generation parameters
-    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height)
+    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name)
     
     return gallery_images, png_path, jpg_path, prompt, seed
 
@@ -1227,6 +1343,15 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                             value="MLX (Apple Silicon)",
                             label="Backend",
                         )
+                    
+                    with gr.Row():
+                        active_model_dropdown = gr.Dropdown(
+                            choices=get_available_mlx_models(),
+                            value=get_current_model_name("MLX (Apple Silicon)"),
+                            label="Model",
+                            info="Available models for selected backend",
+                        )
+                        refresh_active_model_btn = gr.Button("🔄", scale=0, min_width=40)
                     
                     with gr.Row():
                         steps = gr.Slider(
@@ -1328,19 +1453,6 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             )
             
             gr.Markdown("---")
-            gr.Markdown("#### 🎯 Select Active Model")
-            with gr.Row():
-                model_selector = gr.Dropdown(
-                    choices=get_available_mlx_models(),
-                    value=get_current_model_name(),
-                    label="Available MLX Models",
-                    info="Models in ./models/mlx/ - select one for generation",
-                    scale=3,
-                )
-                refresh_models_btn = gr.Button("🔄 Refresh", scale=1)
-            select_model_status = gr.Textbox(label="Selection Status", interactive=False, lines=2)
-            
-            gr.Markdown("---")
             gr.Markdown("#### 📥 Import from Hugging Face")
             gr.Markdown(
                 """
@@ -1381,28 +1493,20 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                     info="Full path to the .safetensors file",
                     scale=2,
                 )
-                validate_btn = gr.Button("🔍 Validate", variant="secondary", scale=0)
-            validate_status = gr.Textbox(label="Validation Result", interactive=False, lines=3)
-            
-            with gr.Row():
                 model_output_name = gr.Textbox(
-                    label="Model Name",
-                    placeholder="e.g., my_custom_model",
-                    info="Name for the imported model",
+                    label="Save As (optional)",
+                    placeholder="Leave blank to use filename",
+                    info="Custom name for the imported model",
                     scale=1,
                 )
-                convert_format = gr.Radio(
-                    choices=["MLX (Apple Silicon)", "PyTorch"],
-                    value="MLX (Apple Silicon)",
-                    label="Target Format",
-                    scale=1,
-                )
-            convert_single_btn = gr.Button("📦 Import Checkpoint", variant="primary")
+            with gr.Row():
+                convert_mlx_btn = gr.Button("📦 Import to MLX", variant="primary")
+                convert_pytorch_btn = gr.Button("📦 Import to PyTorch", variant="secondary")
             convert_status = gr.Textbox(label="Import Status", interactive=False, lines=4)
             
             gr.Markdown("---")
             gr.Markdown("#### 📊 Installed Models")
-            model_status = gr.Textbox(label="Model Inventory", interactive=False, lines=8, value="Checking...")
+            model_status = gr.Textbox(label="Model Inventory", interactive=False, lines=12, max_lines=30, autoscroll=False, value="Checking...")
             refresh_status_btn = gr.Button("🔄 Refresh Inventory", variant="secondary")
     
     # Hidden state to store temporary paths, prompt, seed, and selected index
@@ -1419,6 +1523,35 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         fn=update_aspect_ratios,
         inputs=[base_resolution],
         outputs=[aspect_ratio],
+    )
+    
+    # Update model selector when backend changes
+    def update_model_selector(backend_choice):
+        models = get_available_models_for_backend(backend_choice)
+        current = get_current_model_name(backend_choice)
+        # If current model not in list, use first available or None
+        if current not in models:
+            current = models[0] if models else None
+        return gr.update(choices=models, value=current)
+    
+    backend.change(
+        fn=update_model_selector,
+        inputs=[backend],
+        outputs=[active_model_dropdown],
+    )
+    
+    # Refresh model list for current backend
+    def refresh_model_list_for_backend(backend_choice):
+        models = get_available_models_for_backend(backend_choice)
+        current = get_current_model_name(backend_choice)
+        if current not in models:
+            current = models[0] if models else None
+        return gr.update(choices=models, value=current)
+    
+    refresh_active_model_btn.click(
+        fn=refresh_model_list_for_backend,
+        inputs=[backend],
+        outputs=[active_model_dropdown],
     )
     
     # Toggle seed slider based on random checkbox
@@ -1439,7 +1572,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     
     generate_btn.click(
         fn=generate_image,
-        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend],
+        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown],
         outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed],
     ).then(
         fn=lambda: (gr.update(visible=True), None, "", "", "", "", 0, ""),
@@ -1640,7 +1773,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         except Exception as e:
             return f"❌ Error: {str(e)}"
     
-    def convert_single_file(file_path, output_name, target_format, progress=gr.Progress()):
+    def convert_single_file_to_format(file_path, output_name, target_format, progress=gr.Progress()):
         """Import single-file safetensors checkpoint"""
         if not file_path or not file_path.strip():
             return "❌ Please provide a path to the .safetensors file"
@@ -1669,7 +1802,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             return f"❌ Incomplete checkpoint!\n\nFound components: {', '.join(components)}\n\nAll-in-one checkpoints must contain Transformer, VAE, and Text Encoder."
         
         # Determine target path based on format
-        is_mlx = "MLX" in target_format
+        is_mlx = target_format == "mlx"
         if is_mlx:
             output_path = str(Path(MLX_MODELS_DIR) / model_name)
         else:
@@ -1680,37 +1813,24 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                 convert_single_file_to_mlx(str(file_path), output_path, progress)
                 return f"✅ Successfully imported: {model_name}\n\nSaved to: {output_path}\n\nYou can now select '{model_name}' from the model dropdown."
             else:
-                # For PyTorch, we need to extract and save in diffusers format
-                progress(0.5, desc="Extracting checkpoint...")
-                # TODO: Implement PyTorch extraction
-                return f"⚠️ PyTorch import from single-file is not yet implemented.\n\nPlease use 'MLX (Apple Silicon)' format for now, or download from Hugging Face."
+                # For PyTorch, use the ComfyUI to PyTorch converter
+                progress(0.1, desc="Converting to PyTorch format...")
+                from src.convert_comfyui_to_pytorch import convert_comfyui_to_pytorch
+                convert_comfyui_to_pytorch(str(file_path), output_path)
+                progress(1.0, desc="Complete!")
+                return f"✅ Successfully imported: {model_name}\n\nSaved to: {output_path}\n\nYou can now select '{model_name}' from the model dropdown (PyTorch backend)."
         except Exception as e:
             return f"❌ Error: {str(e)}"
     
-    def handle_model_select(model_name):
-        """Handle model selection from dropdown"""
-        if not model_name:
-            return "⚠️ No model selected"
-        
-        success = select_mlx_model(model_name)
-        if success:
-            return f"✅ Selected: {model_name}\n\nThe model will be loaded on next generation."
-        else:
-            return f"❌ Could not select model: {model_name}\n\nModel may be invalid or missing files."
+    def convert_to_mlx(file_path, output_name, progress=gr.Progress()):
+        """Import single-file checkpoint to MLX format"""
+        return convert_single_file_to_format(file_path, output_name, "mlx", progress)
     
-    def refresh_model_list():
-        """Refresh the list of available models"""
-        models = get_available_mlx_models()
-        current = get_current_model_name()
-        return gr.Dropdown(choices=models, value=current)
+    def convert_to_pytorch(file_path, output_name, progress=gr.Progress()):
+        """Import single-file checkpoint to PyTorch format"""
+        return convert_single_file_to_format(file_path, output_name, "pytorch", progress)
     
     # Wire up event handlers
-    validate_btn.click(
-        fn=validate_checkpoint_file,
-        inputs=[single_file_path],
-        outputs=[validate_status],
-    )
-    
     download_hf_btn.click(
         fn=download_from_hf,
         inputs=[hf_model_id, hf_model_name],
@@ -1723,23 +1843,16 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         outputs=[hf_status],
     )
     
-    convert_single_btn.click(
-        fn=convert_single_file,
-        inputs=[single_file_path, model_output_name, convert_format],
+    convert_mlx_btn.click(
+        fn=convert_to_mlx,
+        inputs=[single_file_path, model_output_name],
         outputs=[convert_status],
     )
     
-    # Model selector event handlers
-    model_selector.change(
-        fn=handle_model_select,
-        inputs=[model_selector],
-        outputs=[select_model_status],
-    )
-    
-    refresh_models_btn.click(
-        fn=refresh_model_list,
-        inputs=None,
-        outputs=[model_selector],
+    convert_pytorch_btn.click(
+        fn=convert_to_pytorch,
+        inputs=[single_file_path, model_output_name],
+        outputs=[convert_status],
     )
     
     refresh_status_btn.click(
@@ -1756,7 +1869,22 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     )
 
 
+def cleanup_temp_files():
+    """Clean up temporary files on exit"""
+    global _image_gallery
+    if os.path.exists(TEMP_DIR):
+        try:
+            shutil.rmtree(TEMP_DIR)
+            print(f"Cleaned up temp directory: {TEMP_DIR}")
+        except Exception as e:
+            print(f"Warning: Could not clean up temp directory: {e}")
+    _image_gallery = []
+
+
 if __name__ == "__main__":
+    import atexit
+    atexit.register(cleanup_temp_files)
+    
     # Check and setup models on startup
     print("\n" + "="*50)
     print("Z-Image-Turbo - Checking models...")

@@ -3,6 +3,7 @@
 /reference
 !/reference/*.md
 /models/*
+/temp/
 .conda-env
 .agent/
 
