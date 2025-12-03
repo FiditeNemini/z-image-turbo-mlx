@@ -11,6 +11,8 @@ Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-
 - **Fast generation**: 9 inference steps for high-quality results
 - **Apple Silicon optimized**: Native MLX implementation for M1/M2/M3/M4 Macs
 - **Bit-perfect accuracy**: MLX output matches PyTorch within 1 pixel per channel
+- **Model management**: Support for multiple models and fine-tuned variants
+- **Gradio UI**: User-friendly web interface for image generation
 
 ## Installation
 
@@ -35,18 +37,32 @@ cd src
 python convert_to_mlx.py
 ```
 
-The conversion script will automatically download the Z-Image-Turbo model from Hugging Face (~20GB) if it's not already present in `models/Z-Image-Turbo/`.
+The conversion script will automatically download the Z-Image-Turbo model from Hugging Face (~20GB) if it's not already present in `models/pytorch/Z-Image-Turbo/`.
 
 ## Usage
 
-### Quick Start (MLX)
+### Web UI (Recommended)
+
+Launch the Gradio web interface:
+
+```bash
+python app.py
+```
+
+This opens a browser-based UI with:
+- **Generation Tab**: Create images with full control over parameters
+- **Model Settings Tab**: Manage, import, and switch between models
+
+### Command Line
+
+#### Quick Start (MLX)
 
 ```bash
 cd src
 python generate_mlx.py --prompt "A beautiful sunset over the ocean" --output sunset.png
 ```
 
-### Full Options
+#### Full Options
 
 ```bash
 python src/generate_mlx.py \
@@ -58,7 +74,7 @@ python src/generate_mlx.py \
     --width 1024
 ```
 
-### PyTorch Reference
+#### PyTorch Reference
 
 For comparison or on non-Apple hardware:
 
@@ -66,11 +82,85 @@ For comparison or on non-Apple hardware:
 python src/generate_pytorch.py --prompt "Your prompt" --output output.png
 ```
 
+## Model Management
+
+### Directory Structure
+
+Models are organized by platform:
+
+```
+models/
+├── mlx/                    # MLX-converted models (used for generation)
+│   ├── mlx_model/          # Default converted model
+│   └── RedCraft-AIO/       # Example: fine-tuned variant
+└── pytorch/                # PyTorch/Diffusers format models
+    └── Z-Image-Turbo/      # Original model (for conversion)
+```
+
+### Migrating from Previous Versions
+
+If you're upgrading from a version that used the old directory structure (`models/mlx_model/`, `models/Z-Image-Turbo/`), run the migration script:
+
+```bash
+# Preview what will be migrated (dry run)
+python migrate_models.py
+
+# Apply the migration
+python migrate_models.py --apply
+```
+
+The script will:
+- Create the new `models/mlx/` and `models/pytorch/` directories
+- Move existing models to the correct locations
+- Validate that models are still accessible after migration
+
+### Supported Model Formats
+
+#### MLX Models (Ready to Use)
+Place pre-converted MLX models in `models/mlx/<model_name>/`. Each model folder should contain:
+- `weights.safetensors` - Transformer weights
+- `text_encoder.safetensors` - Text encoder weights
+- `vae.safetensors` - VAE decoder weights
+- `config.json`, `vae_config.json`, `text_encoder_config.json`
+
+#### Hugging Face Models (Diffusers Format)
+Download from Hugging Face and convert:
+1. Place in `models/pytorch/<model_name>/`
+2. Run `python src/convert_to_mlx.py`
+
+#### ComfyUI Checkpoints (Single-File)
+The app supports ComfyUI-style all-in-one `.safetensors` files for Z-Image-Turbo architecture:
+- These use `diffusion_` prefix for transformer weights
+- Text encoder weights use `text_encoders.qwen3_4b.` prefix
+- Import via Model Settings → Import Single-File Checkpoint
+
+> **Note**: Only Z-Image-Turbo architecture checkpoints are compatible. Other architectures (SDXL, SD1.5, Flux, Hunyuan) will be detected and show an error message.
+
+### Adding New Models
+
+#### From Hugging Face
+1. Go to **Model Settings** → **Import from Hugging Face**
+2. Enter the repository ID (e.g., `username/model-name`)
+3. Select format: "Diffusers (requires conversion)" or "Pre-converted MLX"
+4. Click **Download Model**
+
+#### From Local Checkpoint
+1. Go to **Model Settings** → **Import Single-File Checkpoint**
+2. Click **Browse** and select your `.safetensors` file
+3. The app will validate compatibility before import
+4. Enter a name for the model and click **Import**
+
+### Switching Models
+
+Use the dropdown in **Model Settings** → **Select Model** to switch between available models. Click the refresh button (🔄) to rescan for newly added models.
+
 ## Project Structure
 
 ```
 z-image-turbo-mlx/
-├── src/                    # Essential source files
+├── app.py                  # Gradio web UI
+├── migrate_models.py       # Migration script for directory structure
+├── src/                    # Core source files
 │   ├── generate_mlx.py     # MLX image generation
 │   ├── generate_pytorch.py # PyTorch reference
 │   ├── z_image_mlx.py      # MLX transformer model
@@ -78,8 +168,8 @@ z-image-turbo-mlx/
 │   ├── vae.py              # MLX VAE decoder
 │   └── convert_to_mlx.py   # Weight converter
 ├── models/                 # Model weights
-│   ├── Z-Image-Turbo/      # Original PyTorch weights
-│   └── mlx_model/          # Converted MLX weights
+│   ├── mlx/                # MLX-converted models
+│   └── pytorch/            # PyTorch/Diffusers models
 ├── debugging/              # Debug & diagnostic tools
 └── requirements.txt
 ```
@@ -112,6 +202,18 @@ The model requires significant RAM. If you encounter memory issues:
 - Use a smaller resolution (e.g., 512×512)
 - Consider using CPU offloading (PyTorch only)
 
+### Model Not Showing in Dropdown
+- Ensure the model is in `models/mlx/<model_name>/`
+- Check that all required files are present (weights.safetensors, etc.)
+- Click the refresh button (🔄) to rescan
+
+### Incompatible Checkpoint Error
+When importing a single-file checkpoint, you may see an error like:
+- "SDXL checkpoint detected" 
+- "Flux model detected"
+
+This means the checkpoint is not a Z-Image-Turbo model. Only checkpoints fine-tuned from Z-Image-Turbo are compatible.
+
 ### Model Path Errors
 Ensure you're running from the correct directory:
 ```bash
@@ -121,7 +223,7 @@ python src/generate_mlx.py --prompt "..."
 
 Or specify the model path explicitly:
 ```bash
-python src/generate_mlx.py --model_path /full/path/to/models/mlx_model --prompt "..."
+python src/generate_mlx.py --model_path /full/path/to/models/mlx/mlx_model --prompt "..."
 ```
 
 ## License
