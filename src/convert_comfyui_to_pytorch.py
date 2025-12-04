@@ -7,6 +7,11 @@ ComfyUI checkpoints have all components in one file with prefixes:
 - diffusion_* : Transformer weights
 - text_encoders.qwen3_4b.* : Text encoder weights  
 - vae.* : VAE weights (may or may not be present)
+
+Precision options:
+- Original: Keep as bfloat16 (default PyTorch training precision)
+- FP16: Convert to float16 (smaller, compatible with most hardware)
+- FP8: Convert to float8_e4m3fn (smallest, requires PyTorch 2.1+ and compatible hardware)
 """
 
 import argparse
@@ -18,6 +23,31 @@ from safetensors import safe_open
 from safetensors.torch import save_file as torch_save_safetensors
 from tqdm import tqdm
 import torch
+
+
+def get_target_dtype(precision: str):
+    """Get the target PyTorch dtype based on precision string.
+    
+    Args:
+        precision: "Original", "FP16", or "FP8"
+        
+    Returns:
+        tuple: (torch.dtype for weight storage, actual precision string used)
+        
+    Note: FP8 requires PyTorch 2.1+ and compatible hardware for inference.
+    Models saved in FP8 are ~50% smaller than FP16/BF16.
+    Diffusers will upcast FP8 weights to the compute dtype at load time.
+    """
+    if precision == "FP8":
+        if hasattr(torch, 'float8_e4m3fn'):
+            return torch.float8_e4m3fn, "FP8"
+        else:
+            print("  Warning: FP8 not available in this PyTorch version, using FP16")
+            return torch.float16, "FP16"
+    elif precision == "FP16":
+        return torch.float16, "FP16"
+    else:  # Original
+        return torch.bfloat16, "Original"
 
 
 # Reference configs for Z-Image-Turbo architecture (Diffusers format)
@@ -227,8 +257,17 @@ def convert_checkpoint(
     output_path: str,
     reference_model_path: str = None,
     model_name: str = None,
+    precision: str = "FP16",
 ):
-    """Convert a ComfyUI checkpoint to PyTorch/Diffusers format."""
+    """Convert a ComfyUI checkpoint to PyTorch/Diffusers format.
+    
+    Args:
+        checkpoint_path: Path to the ComfyUI .safetensors checkpoint
+        output_path: Output directory for converted model
+        reference_model_path: Path to reference model for VAE/tokenizer/configs
+        model_name: Model name (default: checkpoint filename)
+        precision: "Original" (bfloat16), "FP16" (float16), or "FP8" (float8_e4m3fn)
+    """
     checkpoint_path = Path(checkpoint_path)
     output_path = Path(output_path)
     
@@ -252,6 +291,10 @@ def convert_checkpoint(
     
     if len(components["transformer"]) == 0:
         raise ValueError("No transformer weights found in checkpoint")
+    
+    # Determine target dtype for weights
+    target_dtype, actual_precision = get_target_dtype(precision)
+    print(f"  Target precision: {precision} -> {target_dtype}")
     
     # Load and convert weights
     print("\nLoading checkpoint...")
@@ -280,14 +323,14 @@ def convert_checkpoint(
                 base_key = new_key.replace(".qkv.weight", "")
                 # Split along first axis: [3*dim, dim] -> 3x [dim, dim]
                 q, k, v = torch.chunk(value, 3, dim=0)
-                transformer_weights[f"{base_key}.to_q.weight"] = q.to(torch.bfloat16)
-                transformer_weights[f"{base_key}.to_k.weight"] = k.to(torch.bfloat16)
-                transformer_weights[f"{base_key}.to_v.weight"] = v.to(torch.bfloat16)
+                transformer_weights[f"{base_key}.to_q.weight"] = q.to(target_dtype)
+                transformer_weights[f"{base_key}.to_k.weight"] = k.to(target_dtype)
+                transformer_weights[f"{base_key}.to_v.weight"] = v.to(target_dtype)
                 qkv_split_count += 1
                 continue
             
-            # Convert to bfloat16 for storage
-            transformer_weights[new_key] = value.to(torch.bfloat16)
+            # Convert to target precision
+            transformer_weights[new_key] = value.to(target_dtype)
         
         if qkv_split_count > 0:
             print(f"  Split {qkv_split_count} fused QKV weights into separate Q/K/V")
@@ -309,9 +352,15 @@ def convert_checkpoint(
             for key in tqdm(components["text_encoder"], desc="Text Encoder"):
                 new_key = convert_text_encoder_key(key)
                 value = f.get_tensor(key)
-                te_weights[new_key] = value.float()  # Text encoder in float32
+                # Text encoder: keep at FP16 for FP8 mode (embedding ops need higher precision)
+                # This is similar to keeping VAE at FP16 for MLX
+                if actual_precision == "FP8":
+                    te_weights[new_key] = value.to(torch.float16)
+                else:
+                    te_weights[new_key] = value.to(target_dtype)
             
-            print(f"  Converted {len(te_weights)} text encoder weights")
+            te_precision = "FP16" if actual_precision == "FP8" else actual_precision
+            print(f"  Converted {len(te_weights)} text encoder weights ({te_precision})")
             torch_save_safetensors(
                 te_weights, 
                 str(output_dir / "text_encoder" / "model.safetensors")
@@ -406,6 +455,42 @@ def convert_checkpoint(
     print(f"  pipe = ZImagePipeline.from_pretrained('{output_dir}')")
     
     return str(output_dir)
+
+
+def convert_comfyui_to_pytorch(
+    checkpoint_path: str,
+    output_path: str,
+    precision: str = "FP16",
+    reference_model_path: str = None,
+):
+    """Convenience wrapper for converting ComfyUI checkpoint to PyTorch format.
+    
+    This is the main entry point used by app.py for single-file imports.
+    
+    Args:
+        checkpoint_path: Path to the ComfyUI .safetensors checkpoint
+        output_path: Output directory for converted model
+        precision: "Original", "FP16", or "FP8"
+        reference_model_path: Optional path to reference model for VAE/tokenizer
+    """
+    # Default to Z-Image-Turbo reference if available
+    if reference_model_path is None:
+        default_ref = Path("./models/pytorch/Z-Image-Turbo")
+        if default_ref.exists():
+            reference_model_path = str(default_ref)
+    
+    # Extract model name from output path
+    output_path = Path(output_path)
+    model_name = output_path.name
+    parent_path = output_path.parent
+    
+    return convert_checkpoint(
+        checkpoint_path=checkpoint_path,
+        output_path=str(parent_path),
+        reference_model_path=reference_model_path,
+        model_name=model_name,
+        precision=precision,
+    )
 
 
 def main():

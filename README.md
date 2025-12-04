@@ -14,6 +14,20 @@ Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-
 - **Model management**: Support for multiple models and fine-tuned variants
 - **Gradio UI**: User-friendly web interface for image generation
 
+## 📚 Documentation
+
+| Document | Description |
+|----------|-------------|
+| [**WALKTHROUGH-DOCUMENTATION.md**](WALKTHROUGH-DOCUMENTATION.md) | **Start here!** Beginner-friendly guide covering installation, GUI usage, CLI commands, and tips for getting the best results |
+| [**TECHNICAL_DOCUMENTATION.md**](TECHNICAL_DOCUMENTATION.md) | In-depth technical reference covering architecture, weight formats, quantization, model loading, and implementation details |
+
+### Quick Start
+
+New to the project? Follow these steps:
+1. Read the **Installation** section below
+2. Follow the [User Walkthrough Guide](WALKTHROUGH-DOCUMENTATION.md) for step-by-step usage instructions
+3. Consult the [Technical Documentation](TECHNICAL_DOCUMENTATION.md) if you need to understand the internals or debug issues
+
 ## Installation
 
 ### Requirements
