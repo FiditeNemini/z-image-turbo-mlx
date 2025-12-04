@@ -3,6 +3,9 @@
 /reference
 !/reference/*.md
 /models/*
+!/models/loras/
+/models/loras/**/*.safetensors
+!/models/loras/.gitkeep
 /temp/
 .conda-env
 .agent/

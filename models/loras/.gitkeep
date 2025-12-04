@@ -1,0 +1,9 @@
+# LoRA Directory
+# Place your Z-Image-Turbo compatible LoRA files (.safetensors) here
+# 
+# Supports subfolders for organization:
+#   models/loras/styles/      - Style LoRAs (film looks, art styles)
+#   models/loras/characters/  - Character LoRAs
+#   models/loras/concepts/    - Concept LoRAs
+#
+# LoRA files are not tracked by git due to their size

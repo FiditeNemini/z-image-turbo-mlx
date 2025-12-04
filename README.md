@@ -12,6 +12,7 @@ Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-
 - **Apple Silicon optimized**: Native MLX implementation for M1/M2/M3/M4 Macs
 - **Bit-perfect accuracy**: MLX output matches PyTorch within 1 pixel per channel
 - **Model management**: Support for multiple models and fine-tuned variants
+- **LoRA support**: Apply style and concept customizations with adjustable weights
 - **Gradio UI**: User-friendly web interface for image generation
 
 ## 📚 Documentation
@@ -168,6 +169,43 @@ The app supports ComfyUI-style all-in-one `.safetensors` files for Z-Image-Turbo
 
 Use the dropdown in **Model Settings** → **Select Model** to switch between available models. Click the refresh button (🔄) to rescan for newly added models.
 
+## LoRA Support
+
+LoRAs (Low-Rank Adaptations) allow you to customize the generation style without modifying the base model.
+
+### Adding LoRAs
+
+1. Place `.safetensors` LoRA files in `models/loras/`
+2. Optionally organize in subfolders: `styles/`, `concepts/`, `characters/`
+
+```
+models/loras/
+├── anime_style.safetensors
+├── styles/
+│   └── watercolor.safetensors
+└── concepts/
+    └── cyberpunk.safetensors
+```
+
+### Using LoRAs
+
+1. In the **Generate** tab, expand **🎨 LoRA Settings**
+2. Enable desired LoRAs with the checkbox
+3. Adjust weight (0.0-2.0) using the spinner
+4. Include trigger words in your prompt if the LoRA has them
+
+### LoRA Features
+
+| Feature | Description |
+|---------|-------------|
+| **Multiple LoRAs** | Stack multiple LoRAs with independent weights |
+| **Per-LoRA Weights** | Fine-tune each LoRA's influence (0.05 increments) |
+| **Trigger Words** | Auto-displayed from LoRA metadata |
+| **Subfolder Support** | Organize LoRAs in categories |
+| **Live Tags** | See active LoRAs as `<lora:name:weight>` |
+
+> **Note**: Only Z-Image-Turbo compatible LoRAs work. LoRAs trained for SDXL, SD1.5, Flux, etc. are NOT compatible.
+
 ## Project Structure
 
 ```
@@ -180,10 +218,12 @@ z-image-turbo-mlx/
 │   ├── z_image_mlx.py      # MLX transformer model
 │   ├── text_encoder.py     # MLX Qwen3-4B encoder
 │   ├── vae.py              # MLX VAE decoder
+│   ├── lora.py             # LoRA loading and application
 │   └── convert_to_mlx.py   # Weight converter
 ├── models/                 # Model weights
 │   ├── mlx/                # MLX-converted models
-│   └── pytorch/            # PyTorch/Diffusers models
+│   ├── pytorch/            # PyTorch/Diffusers models
+│   └── loras/              # LoRA files (.safetensors)
 ├── debugging/              # Debug & diagnostic tools
 └── requirements.txt
 ```
@@ -249,3 +289,26 @@ This project is for research and personal use. Please refer to the original Z-Im
 - Original Z-Image-Turbo model from Tongyi-MAI
 - MLX framework by Apple
 - Diffusers library by Hugging Face
+
+```bibtex
+@article{team2025zimage,
+  title={Z-Image: An Efficient Image Generation Foundation Model with Single-Stream Diffusion Transformer},
+  author={Z-Image Team},
+  journal={arXiv preprint arXiv:2511.22699},
+  year={2025}
+}
+
+@article{liu2025decoupled,
+  title={Decoupled DMD: CFG Augmentation as the Spear, Distribution Matching as the Shield},
+  author={Dongyang Liu and Peng Gao and David Liu and Ruoyi Du and Zhen Li and Qilong Wu and Xin Jin and Sihan Cao and Shifeng Zhang and Hongsheng Li and Steven Hoi},
+  journal={arXiv preprint arXiv:2511.22677},
+  year={2025}
+}
+
+@article{jiang2025distribution,
+  title={Distribution Matching Distillation Meets Reinforcement Learning},
+  author={Jiang, Dengyang and Liu, Dongyang and Wang, Zanyi and Wu, Qilong and Jin, Xin and Liu, David and Li, Zhen and Wang, Mengmeng and Gao, Peng and Yang, Harry},
+  journal={arXiv preprint arXiv:2511.13649},
+  year={2025}
+}
+```

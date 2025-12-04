@@ -5,14 +5,15 @@
 2. [Architecture Overview](#architecture-overview)
 3. [Directory Structure](#directory-structure)
 4. [Model Components](#model-components)
-5. [Weight Key Mappings](#weight-key-mappings)
-6. [Precision Modes & Quantization](#precision-modes--quantization)
-7. [Model Loading Flow](#model-loading-flow)
-8. [Image Generation Pipeline](#image-generation-pipeline)
-9. [Model Conversion](#model-conversion)
-10. [Critical Implementation Details](#critical-implementation-details)
-11. [Known Issues & Solutions](#known-issues--solutions)
-12. [Configuration Reference](#configuration-reference)
+5. [LoRA Support](#lora-support)
+6. [Weight Key Mappings](#weight-key-mappings)
+7. [Precision Modes & Quantization](#precision-modes--quantization)
+8. [Model Loading Flow](#model-loading-flow)
+9. [Image Generation Pipeline](#image-generation-pipeline)
+10. [Model Conversion](#model-conversion)
+11. [Critical Implementation Details](#critical-implementation-details)
+12. [Known Issues & Solutions](#known-issues--solutions)
+13. [Configuration Reference](#configuration-reference)
 
 ---
 
@@ -27,6 +28,7 @@ The project supports:
 - Three precision modes: Original, FP16, FP8 (quantized)
 - Prompt enhancement using a local LLM
 - Multiple aspect ratios and resolutions
+- **LoRA support** for style and concept customization
 
 ---
 
@@ -96,6 +98,7 @@ z-image-turbo-mlx/
 │   ├── z_image_mlx.py        # MLX Transformer implementation
 │   ├── vae.py                # MLX VAE implementation
 │   ├── text_encoder.py       # MLX Qwen2 Text Encoder implementation
+│   ├── lora.py               # LoRA loading and application
 │   ├── generate_mlx.py       # Standalone MLX generation script
 │   ├── generate_pytorch.py   # Standalone PyTorch generation script
 │   ├── convert_to_mlx.py     # HuggingFace → MLX converter
@@ -124,6 +127,10 @@ z-image-turbo-mlx/
 │   │       ├── text_encoder/
 │   │       ├── tokenizer/
 │   │       └── scheduler/
+│   ├── loras/                     # LoRA files (.safetensors)
+│   │   ├── styles/                # Style LoRAs
+│   │   ├── concepts/              # Concept LoRAs
+│   │   └── characters/            # Character LoRAs
 │   ├── comfyui/                   # ComfyUI single-file checkpoints
 │   └── prompt_enhancer/           # Qwen2.5-1.5B for prompt enhancement
 └── debugging/                     # Debug and testing scripts
@@ -218,6 +225,135 @@ max_position_embeddings: 32768
 - `Qwen2RMSNorm`: RMS normalization
 
 **CRITICAL**: Text encoder should **NOT be quantized** - FP8 quantization causes zero outputs.
+
+---
+
+## LoRA Support
+
+### Overview
+
+LoRA (Low-Rank Adaptation) support allows applying style and concept customizations to the base model without full fine-tuning. The implementation is in `src/lora.py`.
+
+### LoRA Architecture
+
+LoRAs modify Linear layer weights using low-rank decomposition:
+
+```
+W' = W + scale * (B @ A)
+
+where:
+- W: Original weight matrix (out_features, in_features)
+- A: Down-projection matrix (rank, in_features)
+- B: Up-projection matrix (out_features, rank)
+- scale: User-adjustable strength (default 1.0)
+```
+
+### Supported LoRA Targets
+
+The following transformer layers can be modified by LoRAs:
+
+| Layer Type | Weight Keys |
+|-----------|-------------|
+| **Attention QKV** | `layers.{0-29}.attention.to_q/k/v.weight` |
+| **Attention Output** | `layers.{0-29}.attention.to_out.weight` |
+| **Feed Forward** | `layers.{0-29}.feed_forward.w1/w2/w3.weight` |
+| **AdaLN Modulation** | `layers.{0-29}.adaLN_modulation.weight` |
+
+### LoRA Key Mapping
+
+ComfyUI format LoRAs use `diffusion_model.*` prefix:
+
+```python
+# LoRA key format:
+"diffusion_model.layers.0.attention.to_q.lora_A.weight"
+"diffusion_model.layers.0.attention.to_q.lora_B.weight"
+
+# Maps to model key:
+"layers.0.attention.to_q.weight"
+```
+
+### Key Functions (`src/lora.py`)
+
+```python
+# Scan for available LoRAs
+loras = get_available_loras()  # Returns list of relative paths
+loras = get_lora_with_folders()  # Returns [(folder, filename), ...]
+
+# Load LoRA weights
+lora_weights = load_lora("path/to/lora.safetensors")
+
+# Apply single LoRA
+applied = apply_lora_to_model(model, lora_weights, scale=1.0)
+
+# Apply multiple LoRAs
+results = apply_multiple_loras(model, lora_paths, scales=[0.8, 1.0])
+
+# Get LoRA metadata
+info = get_lora_info(lora_path)  # rank, targets, trigger words
+trigger_words = get_lora_trigger_words(lora_path)
+default_weight = get_lora_default_weight(lora_path)
+```
+
+### LoRA Metadata
+
+LoRA files can contain metadata in the safetensors header:
+
+| Field | Description |
+|-------|-------------|
+| `ss_tag_frequency` | Trigger words (ai-toolkit format) |
+| `trigger_word` | Single trigger word |
+| `trigger_words` | Comma-separated trigger words |
+| `recommended_weight` | Suggested strength value |
+| `default_weight` | Default strength value |
+
+### Directory Structure
+
+```
+models/loras/
+├── style_lora.safetensors      # Root level
+├── styles/                      # Subfolder organization
+│   ├── anime.safetensors
+│   └── photorealistic.safetensors
+├── concepts/
+│   └── cyberpunk.safetensors
+└── characters/
+    └── character_lora.safetensors
+```
+
+### UI Integration
+
+The Gradio UI displays LoRAs in the "🎨 LoRA Settings" accordion:
+
+- **Enable Checkbox**: Toggle LoRA on/off
+- **Name + Trigger**: Display name and trigger words (if any)
+- **Weight Spinner**: Adjust strength from 0.0 to 2.0 (step 0.05)
+- **LoRA Tags Display**: Shows active LoRAs as `<lora:name:weight>`
+
+### Generation Flow with LoRAs
+
+```python
+# 1. Model is loaded fresh (base weights)
+model = load_transformer(model_path)
+
+# 2. Each enabled LoRA is applied sequentially
+for lora_path, weight in enabled_loras:
+    lora_weights = load_lora(lora_path)
+    apply_lora_to_model(model, lora_weights, scale=weight)
+    # W' = W + weight * (B @ A)
+
+# 3. Generation proceeds with modified weights
+noise_pred = model(latents, t, prompt_embeds)
+```
+
+### Important Notes
+
+1. **Runtime Merge**: LoRAs are merged into base weights at load time. Changing LoRA configuration requires model reload.
+
+2. **Multiple LoRAs**: LoRAs are applied additively. Order matters slightly but effects usually combine well.
+
+3. **Text Encoder LoRAs**: Not currently supported. Only transformer LoRAs are applied.
+
+4. **Quantized Models**: LoRAs can be applied to FP8 quantized models, but the LoRA weights themselves are not quantized.
 
 ---
 
