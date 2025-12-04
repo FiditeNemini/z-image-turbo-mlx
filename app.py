@@ -1255,15 +1255,110 @@ def get_lora_default_weight(lora_path):
     return _get_default_weight(full_path)
 
 
+# Maximum number of LoRA slots in the UI
+MAX_LORA_SLOTS = 20
+
+
+def get_lora_choices():
+    """Get list of LoRA choices for dropdown.
+    
+    Returns list of (display_name, value) tuples where:
+    - display_name: "folder/filename" or just "filename" 
+    - value: relative path to the LoRA
+    """
+    lora_entries = get_loras_with_folders()
+    choices = []
+    for folder, filename in lora_entries:
+        if folder:
+            display = f"{folder}/{filename}"
+            value = f"{folder}/{filename}"
+        else:
+            display = filename
+            value = filename
+        choices.append((display, value))
+    return choices
+
+
+def get_lora_trigger_for_path(lora_path):
+    """Get trigger words for a LoRA path"""
+    if not lora_path:
+        return ""
+    try:
+        info = get_lora_info(lora_path)
+        return ", ".join(info.get('trigger_words', [])) or ""
+    except:
+        return ""
+
+
+def build_lora_tags_from_components(lora_states):
+    """Build LoRA tags string from component states.
+    
+    Args:
+        lora_states: List of (enabled, lora_path, weight) tuples
+        
+    Returns:
+        String like "<lora:name:1.0> trigger1, trigger2"
+    """
+    lora_tags = []
+    triggers = []
+    
+    for enabled, lora_path, weight in lora_states:
+        if enabled and lora_path:
+            # Get clean name (without .safetensors extension and folder)
+            lora_name = Path(lora_path).stem
+            weight_val = float(weight) if weight else 1.0
+            lora_tags.append(f"<lora:{lora_name}:{weight_val:.2f}>")
+            
+            # Get trigger words
+            trigger = get_lora_trigger_for_path(lora_path)
+            if trigger:
+                triggers.append(trigger)
+    
+    parts = []
+    if lora_tags:
+        parts.append(" ".join(lora_tags))
+    if triggers:
+        parts.append(", ".join(triggers))
+    
+    return " ".join(parts)
+
+
+def get_enabled_loras_from_components(lora_states):
+    """Extract enabled LoRA configs from component states.
+    
+    Args:
+        lora_states: List of (enabled, lora_path, weight) tuples
+        
+    Returns:
+        List of {"name": str, "scale": float, "trigger": str} dicts
+    """
+    enabled_loras = []
+    for enabled, lora_path, weight in lora_states:
+        if enabled and lora_path:
+            try:
+                scale = float(weight) if weight else 1.0
+            except (ValueError, TypeError):
+                scale = 1.0
+            
+            trigger = get_lora_trigger_for_path(lora_path)
+            enabled_loras.append({
+                "name": lora_path,
+                "scale": scale,
+                "trigger": trigger
+            })
+    return enabled_loras
+
+
 def get_lora_table_data():
     """Get LoRA data formatted for table display.
     
-    Returns a list of [enabled, folder, name, trigger_words, weight] rows, 
+    Returns a list of [enabled, folder, name, trigger_words, weight, row_index] rows, 
     sorted alphabetically by folder then name.
+    Row index is used for per-row weight adjustment.
     """
     lora_entries = get_loras_with_folders()
     rows = []
-    for folder, filename in lora_entries:
+    for idx, (folder, filename) in enumerate(lora_entries):
         try:
             # Build relative path for get_lora_info
             if folder:
@@ -1279,6 +1374,46 @@ def get_lora_table_data():
             print(f"Error loading LoRA info for {filename}: {e}")
             rows.append([False, folder, filename, "", 1.0])
     return rows
+
+
+def adjust_single_lora_weight(table_data, row_index, delta):
+    """Adjust weight of a single LoRA row by delta amount.
+    
+    Args:
+        table_data: The table data
+        row_index: Index of the row to adjust
+        delta: Amount to add to weight (+0.05 or -0.05)
+    
+    Returns:
+        Updated table data
+    """
+    if table_data is None:
+        return table_data
+    
+    # Handle pandas DataFrame
+    try:
+        if hasattr(table_data, 'values'):
+            table_data = table_data.values.tolist()
+    except Exception:
+        pass
+    
+    # Make a copy
+    modified = [list(row) for row in table_data]
+    
+    # Adjust the specific row
+    if 0 <= row_index < len(modified):
+        row = modified[row_index]
+        if len(row) >= 5:
+            try:
+                current_weight = float(row[4]) if row[4] else 1.0
+                new_weight = round(current_weight + delta, 2)
+                # Clamp between 0 and 2
+                new_weight = max(0.0, min(2.0, new_weight))
+                modified[row_index][4] = new_weight
+            except (ValueError, TypeError):
+                pass
+    
+    return modified
 
 
 def get_lora_display_info(lora_name):
@@ -1923,8 +2058,13 @@ def save_selected_or_all(selected_index, png_path, jpg_path, prompt, seed, datas
         return f"BATCH SAVE COMPLETE:\n{result}"
 
 
-def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, lora_table_data=None, progress=gr.Progress()):
-    """Generate an image using selected backend and model"""
+def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, lora_configs=None, lora_tags="", progress=gr.Progress()):
+    """Generate an image using selected backend and model
+    
+    Args:
+        lora_configs: List of {"name": str, "scale": float, "trigger": str} dicts
+        lora_tags: Pre-built string of LoRA tags to append to prompt
+    """
     
     if not prompt.strip():
         raise gr.Error("Please enter a prompt")
@@ -1940,11 +2080,11 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
         seed = random.randint(0, 2147483647)
     seed = int(seed)
     
-    # Build LoRA configs from table data
-    lora_configs = get_enabled_loras_from_table(lora_table_data)
+    # Ensure lora_configs is a list
+    if lora_configs is None:
+        lora_configs = []
     
-    # Build the LoRA tags string and append to prompt
-    lora_tags = build_lora_tags_string(lora_table_data)
+    # Append LoRA tags to prompt if present
     if lora_tags:
         full_prompt = f"{prompt.strip()}, {lora_tags}"
         print(f"Full prompt with LoRA tags: {full_prompt}")
@@ -2059,26 +2199,53 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                             info="Scheduler shift parameter (default: 3.0)",
                         )
                     
-                    # LoRA Section
+                    # LoRA Section - Individual rows with spinners
                     with gr.Accordion("🎨 LoRA Settings", open=False) as lora_accordion:
-                        gr.Markdown("*Check the box to enable a LoRA. Adjust weight as needed (1.0 = full strength). Organize LoRAs in subfolders under `models/loras/`.*")
+                        gr.Markdown("*Enable LoRAs and adjust weights using the spinners (0.05 increments). Organize LoRAs in subfolders under `models/loras/`.*")
                         
-                        lora_table = gr.Dataframe(
-                            headers=["Enabled", "Folder", "LoRA Name", "Trigger Words", "Weight"],
-                            datatype=["bool", "str", "str", "str", "number"],
-                            value=get_lora_table_data(),
-                            col_count=(5, "fixed"),
-                            interactive=True,
-                            wrap=True,
-                            row_count=(len(get_lora_table_data()), "dynamic"),
-                        )
+                        # Get initial LoRA data
+                        initial_lora_choices = get_lora_choices()
                         
-                        with gr.Row():
-                            weight_down_btn = gr.Button("➖ 0.05", size="sm")
-                            weight_up_btn = gr.Button("➕ 0.05", size="sm")
-                            weight_reset_btn = gr.Button("Reset to 1.0", size="sm")
+                        # Create individual LoRA slot rows
+                        lora_rows = []  # Will store (checkbox, lora_path, weight) tuples
                         
-                        gr.Markdown("*Buttons adjust weight of all **enabled** LoRAs*")
+                        if not initial_lora_choices:
+                            gr.Markdown("*No LoRAs found. Place `.safetensors` files in `models/loras/`*")
+                        
+                        for i, (display_name, lora_path) in enumerate(initial_lora_choices):
+                            # Get trigger words for this LoRA
+                            trigger = get_lora_trigger_for_path(lora_path)
+                            trigger_display = f" `{trigger}`" if trigger else ""
+                            
+                            with gr.Row():
+                                enabled = gr.Checkbox(
+                                    label="",
+                                    show_label=False,
+                                    value=False,
+                                    min_width=30,
+                                    scale=0,
+                                )
+                                # Hidden state to store the lora path
+                                lora_path_state = gr.State(value=lora_path)
+                                # Display name and trigger as text (using Textbox as label since Markdown doesn't support scale)
+                                gr.Textbox(
+                                    value=f"{display_name}{trigger_display}",
+                                    label="",
+                                    show_label=False,
+                                    interactive=False,
+                                    scale=4,
+                                )
+                                weight = gr.Number(
+                                    label="",
+                                    show_label=False,
+                                    value=1.0,
+                                    minimum=0.0,
+                                    maximum=2.0,
+                                    step=0.05,
+                                    scale=1,
+                                    min_width=80,
+                                )
+                                lora_rows.append((enabled, lora_path_state, weight))
                         
                         lora_tags_display = gr.Textbox(
                             label="Applied LoRAs (auto-appended to prompt)",
@@ -2302,97 +2469,70 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         outputs=[prompt],
     )
     
-    # LoRA event handlers
-    def update_lora_tags(table_data):
-        """Update the LoRA tags display when table changes"""
-        return build_lora_tags_string(table_data)
-    
-    def refresh_lora_table():
-        """Refresh the LoRA table data and clear tags"""
-        return get_lora_table_data(), ""
-    
-    def adjust_all_enabled_weights(table_data, delta):
-        """Adjust weights of all enabled LoRAs by delta amount"""
-        if table_data is None:
-            return table_data
+    # LoRA event handlers for component-based UI
+    def update_lora_tags_from_rows(*args):
+        """Update LoRA tags from individual row components.
         
-        # Handle pandas DataFrame
-        try:
-            if hasattr(table_data, 'values'):
-                table_data = table_data.values.tolist()
-        except Exception:
-            pass
+        Args are in order: enabled1, lora1, weight1, enabled2, lora2, weight2, ...
+        """
+        lora_states = []
+        for i in range(0, len(args), 3):
+            if i + 2 < len(args):
+                enabled = args[i]
+                lora_path = args[i + 1]
+                weight = args[i + 2]
+                lora_states.append((enabled, lora_path, weight))
         
-        modified = []
-        for row in table_data:
-            row = list(row)  # Make mutable copy
-            if len(row) >= 5 and row[0]:  # If enabled
-                try:
-                    current_weight = float(row[4]) if row[4] else 1.0
-                    new_weight = round(current_weight + delta, 2)
-                    # Clamp between 0 and 2
-                    new_weight = max(0.0, min(2.0, new_weight))
-                    row[4] = new_weight
-                except (ValueError, TypeError):
-                    pass
-            modified.append(row)
-        return modified
+        return build_lora_tags_from_components(lora_states)
     
-    def reset_all_enabled_weights(table_data):
-        """Reset weights of all enabled LoRAs to 1.0"""
-        if table_data is None:
-            return table_data
-        
-        # Handle pandas DataFrame
-        try:
-            if hasattr(table_data, 'values'):
-                table_data = table_data.values.tolist()
-        except Exception:
-            pass
-        
-        modified = []
-        for row in table_data:
-            row = list(row)  # Make mutable copy
-            if len(row) >= 5 and row[0]:  # If enabled
-                row[4] = 1.0
-            modified.append(row)
-        return modified
+    # Flatten lora_rows into individual components for event binding
+    all_lora_components = []
+    for enabled, lora_path_state, weight in lora_rows:
+        all_lora_components.extend([enabled, lora_path_state, weight])
     
-    # Update tags display when table changes
-    lora_table.change(
-        fn=update_lora_tags,
-        inputs=[lora_table],
+    # Update tags when checkbox or weight changes
+    for enabled, lora_path_state, weight in lora_rows:
+        enabled.change(
+            fn=update_lora_tags_from_rows,
+            inputs=all_lora_components,
+            outputs=[lora_tags_display],
+        )
+        weight.change(
+            fn=update_lora_tags_from_rows,
+            inputs=all_lora_components,
+            outputs=[lora_tags_display],
+        )
+    
+    # Refresh button - just show a message since LoRAs are fixed at load time
+    refresh_loras_btn.click(
+        fn=lambda: "Refresh the page to see new LoRAs",
+        inputs=None,
         outputs=[lora_tags_display],
     )
     
-    refresh_loras_btn.click(
-        fn=refresh_lora_table,
-        inputs=None,
-        outputs=[lora_table, lora_tags_display],
-    )
-    
-    # Weight adjustment buttons
-    weight_down_btn.click(
-        fn=lambda t: adjust_all_enabled_weights(t, -0.05),
-        inputs=[lora_table],
-        outputs=[lora_table],
-    )
-    
-    weight_up_btn.click(
-        fn=lambda t: adjust_all_enabled_weights(t, 0.05),
-        inputs=[lora_table],
-        outputs=[lora_table],
-    )
-    
-    weight_reset_btn.click(
-        fn=reset_all_enabled_weights,
-        inputs=[lora_table],
-        outputs=[lora_table],
-    )
+    # Wrapper function to collect LoRA states and generate
+    def generate_with_loras(prompt, base_res, aspect, steps, time_shift, seed, backend, model, *lora_args):
+        """Wrapper that collects LoRA component states and calls generate_image"""
+        # lora_args are: enabled1, lora1, weight1, enabled2, lora2, weight2, ...
+        lora_states = []
+        for i in range(0, len(lora_args), 3):
+            if i + 2 < len(lora_args):
+                enabled = lora_args[i]
+                lora_path = lora_args[i + 1]
+                weight = lora_args[i + 2]
+                lora_states.append((enabled, lora_path, weight))
+        
+        # Get enabled LoRA configs
+        lora_configs = get_enabled_loras_from_components(lora_states)
+        
+        # Build tags string
+        lora_tags = build_lora_tags_from_components(lora_states)
+        
+        return generate_image(prompt, base_res, aspect, steps, time_shift, seed, backend, model, lora_configs, lora_tags)
     
     generate_btn.click(
-        fn=generate_image,
-        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown, lora_table],
+        fn=generate_with_loras,
+        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown] + all_lora_components,
         outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed],
     ).then(
         fn=lambda: (gr.update(visible=True), None, "", "", "", "", 0, ""),
