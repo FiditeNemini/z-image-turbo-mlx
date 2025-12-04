@@ -16,6 +16,8 @@
 
 4. **Multiple Ways to Use** - Whether you prefer clicking buttons in a web interface or typing commands in a terminal, both options are available.
 
+5. **LoRA Support** - Customize your generations with style and concept LoRAs for unique artistic effects.
+
 ### How Does It Work? (The Simple Version)
 
 ```
@@ -151,6 +153,69 @@ Most users should stick with **MLX**.
 | **FP8** | Very Good | Fastest | Least |
 
 **Recommendation**: Start with FP16 for the best balance. Use FP8 if you have memory constraints.
+
+### Using LoRAs (Style & Concept Customization)
+
+LoRAs (Low-Rank Adaptations) let you add custom styles, concepts, or characters to your generations without modifying the base model.
+
+#### What are LoRAs?
+
+Think of LoRAs as "add-ons" that teach the AI new styles or concepts:
+- **Style LoRAs**: Anime, photorealistic, oil painting, etc.
+- **Concept LoRAs**: Specific objects, environments, or themes
+- **Character LoRAs**: Specific characters or people
+
+#### Setting Up LoRAs
+
+1. **Download LoRAs**: Get Z-Image-Turbo compatible LoRAs (`.safetensors` files)
+2. **Place in folder**: Put them in `models/loras/`
+3. **Organize (optional)**: Use subfolders like `styles/`, `concepts/`, `characters/`
+
+```
+models/loras/
+├── anime_style.safetensors
+├── styles/
+│   └── watercolor.safetensors
+└── concepts/
+    └── cyberpunk_city.safetensors
+```
+
+#### Using LoRAs in the UI
+
+1. Expand the **🎨 LoRA Settings** accordion (below the Model selector)
+2. You'll see a list of available LoRAs with:
+   - **Checkbox**: Enable/disable the LoRA
+   - **Name + Trigger**: The LoRA name and any trigger words
+   - **Weight**: Adjust strength (0.0 to 2.0, default 1.0)
+
+3. **Enable a LoRA**: Check the box next to it
+4. **Adjust Weight**: Use the spinner (0.05 increments)
+   - Lower (0.3-0.7): Subtle effect
+   - Normal (0.8-1.2): Standard effect
+   - Higher (1.3-2.0): Strong effect
+
+5. The **LoRA Tags** display shows your active LoRAs: `<lora:anime:1.0>`
+
+#### Trigger Words
+
+Many LoRAs have trigger words that activate their effects. These appear next to the LoRA name in backticks, for example:
+
+```
+anime_style `anime style, detailed`
+```
+
+Include these trigger words in your prompt for best results:
+- ❌ "A beautiful landscape"
+- ✅ "A beautiful landscape, anime style, detailed"
+
+#### Tips for LoRAs
+
+1. **Start with weight 1.0** and adjust from there
+2. **Use trigger words** if the LoRA has them
+3. **Stack multiple LoRAs** for combined effects (style + concept)
+4. **Lower weights when stacking** to prevent over-saturation
+
+⚠️ **Note**: LoRAs are applied when the model loads. Changing LoRA settings requires a model reload (happens automatically when you generate).
 
 ### The Model Settings Tab
 
@@ -437,6 +502,7 @@ python generate_mlx.py --prompt "..." --height 768 --width 1344
 ```
 models/mlx/          # MLX models (used for generation)
 models/pytorch/      # PyTorch models (for conversion)
+models/loras/        # LoRA files for customization
 temp/                # Session-generated images
 src/                 # Source code and CLI scripts
 ```

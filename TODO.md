@@ -1,28 +1,48 @@
-## Plan: LoRA Support for Image Generator
+## LoRA Support for Image Generator
+
+✅ **COMPLETED** - LoRA support has been fully implemented!
 
 Add the ability to load and apply LoRA (Low-Rank Adaptation) models to the MLX image generator, enabling style and concept customization without full model retraining.
 
-### Steps
+### Completed Implementation
 
-1. **Create LoRA module** at `src/lora.py`: Implement `LoRALinear` class wrapping `nn.Linear` with low-rank A/B matrices, plus functions for loading `.safetensors` LoRA files and mapping keys to the transformer's attention layers (`layers.{0-29}.attention.to_q/k/v/out`, `feed_forward.w1/w2/w3`).
+1. ✅ **Created LoRA module** at `src/lora.py`:
+   - `load_lora()` - Load LoRA weights from `.safetensors` files
+   - `apply_lora_to_model()` - Merge LoRA weights into transformer using `W' = W + scale * (B @ A)`
+   - `apply_multiple_loras()` - Apply multiple LoRAs sequentially with independent scales
+   - `get_available_loras()` - Scan `models/loras/` directory (with subfolder support)
+   - `get_lora_with_folders()` - Get LoRAs organized by subfolder
+   - `get_lora_trigger_words()` - Extract trigger words from LoRA metadata
+   - `get_lora_default_weight()` - Get recommended weight from metadata
+   - `get_lora_info()` - Get detailed LoRA information (rank, target layers, etc.)
+   - Key mapping for ComfyUI format (`diffusion_model.*` prefix)
 
-2. **Add LoRA injection to `src/z_image_mlx.py`**: Create `apply_lora()` method on `ZImageTransformer` that merges LoRA weights into target Linear layers using the formula `W' = W + scale * (B @ A)`.
+2. ✅ **Updated UI in `app.py`**:
+   - Added collapsible "🎨 LoRA Settings" accordion in Generate tab
+   - Individual rows per LoRA with: Enable checkbox | Name + Trigger words | Weight spinner
+   - Per-row weight spinners with 0.05 step increments (like A1111)
+   - Automatic LoRA tag display showing active LoRAs: `<lora:name:weight>`
+   - LoRAs auto-applied during generation when enabled
 
-3. **Extend `src/generate_mlx.py`**: Add `lora_paths` and `lora_strengths` parameters to `generate()` and `load_model()`, loading and applying LoRAs after base model weights are loaded.
+3. ✅ **Added LoRA folder structure**:
+   - `models/loras/` directory for LoRA storage
+   - Subfolder organization support (e.g., `styles/`, `concepts/`, `characters/`)
+   - Auto-detection of new LoRA files on app refresh
+   - `.gitignore` updated to exclude LoRA files from version control
 
-4. **Update UI in `app.py`**: In the Generate tab, add a new Accordion "🎨 LoRA Settings" below the Guidance Scale slider containing:
-   - File browser/dropdown to select available LoRAs from `models/lora/` directory
-   - Multi-select list of enabled LoRAs with individual strength sliders (0.0-2.0, default 1.0)
-   - Add/remove LoRA buttons
+### Features
 
-5. **Create LoRA key mapping** in `src/lora.py`: Handle ComfyUI format (`lora_unet_*`, `lora_te_*` prefixes) and diffusers format, reusing existing `_map_transformer_keys()` pattern from `src/generate_mlx.py`.
+- **Multiple LoRA Support**: Stack multiple LoRAs with independent weight values
+- **Per-LoRA Weight Control**: Fine-tune each LoRA's influence with 0.05 increments
+- **Trigger Words**: Automatically displays trigger words from LoRA metadata
+- **Subfolder Organization**: Organize LoRAs in subfolders for better management
+- **ComfyUI Format**: Supports ComfyUI-style LoRAs with `diffusion_model.*` prefix
+- **Runtime Merge**: LoRAs merged into base weights during model reload
 
-6. **Add LoRA folder structure**: Create `models/lora/` directory for LoRA storage with auto-detection of new files on app refresh.
+### Future Considerations
 
-### Further Considerations
+1. **Text Encoder LoRAs** - Many LoRAs include text encoder weights (`lora_te_*`). Could extend `src/text_encoder.py` to support these. **Status: Deferred to Phase 2**
 
-1. **Text Encoder LoRAs?** Many LoRAs include text encoder weights (`lora_te_*`). Support them by extending `src/text_encoder.py`, or defer to a later phase? **Recommend: Phase 2**
+2. **Live Weight Adjustment** - Currently requires model reload to change weights. Layer injection approach would allow live adjustment. **Status: Deferred**
 
-2. **Runtime merge vs. layer injection?** Runtime merge (adding LoRA to base weights) is simpler but requires reload to change strength. Layer injection is more flexible but more complex. **Recommend: Runtime merge for MVP**
-
-3. **Multiple LoRAs?** Support stacking multiple LoRAs with independent strengths, or single LoRA only? **Recommend: Multi-LoRA from start (common use case)**
+3. **LoRA Training** - Add support for training custom LoRAs. **Status: Not planned**
