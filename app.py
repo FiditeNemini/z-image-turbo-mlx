@@ -33,6 +33,10 @@ _mlx_models = None
 _pytorch_pipe = None
 _current_mlx_model_path = None  # Track which MLX model is currently loaded
 _current_pytorch_model_path = None  # Track which PyTorch model is currently loaded
+_current_applied_lora = None  # Track which LoRA is currently applied to the cached model
+
+# LoRA state - list of (lora_name, scale) tuples for active LoRAs
+_active_loras = []  # Format: [{"name": str, "path": str, "scale": float}, ...]
 
 # Session image gallery storage
 _image_gallery = []  # List of dicts: {"image": PIL.Image, "prompt": str, "seed": int, "png_path": str, "jpg_path": str}
@@ -47,6 +51,7 @@ PYTORCH_MODELS_DIR = "./models/pytorch"  # PyTorch models directory
 PYTORCH_MODEL_PATH = "./models/pytorch/Z-Image-Turbo"  # Default PyTorch model
 MLX_MODEL_PATH = "./models/mlx/Z-Image-Turbo-MLX"  # Default MLX model
 SINGLE_FILE_MODEL_PATH = "./models/single_file"  # For single-file .safetensors models
+LORAS_DIR = "./models/loras"  # LoRA models directory (supports subfolders)
 
 # Z-Image-Turbo architecture signature keys
 # These patterns identify Z-Image-Turbo compatible models
@@ -515,7 +520,7 @@ def get_available_models_for_backend(backend):
 
 def select_mlx_model(model_name):
     """Select and load a specific MLX model"""
-    global _mlx_models, _current_mlx_model_path
+    global _mlx_models, _current_mlx_model_path, _current_applied_lora
     
     if not model_name:
         return False
@@ -538,6 +543,7 @@ def select_mlx_model(model_name):
     # Clear cached model to force reload
     _mlx_models = None
     _current_mlx_model_path = str(model_path)
+    _current_applied_lora = None  # Reset LoRA when model changes
     
     return True
 
@@ -1062,6 +1068,8 @@ def load_mlx_models(model_path=None):
     if _current_mlx_model_path != model_path:
         _mlx_models = None
         _current_mlx_model_path = model_path
+        global _current_applied_lora
+        _current_applied_lora = None  # Reset LoRA when model changes
     
     import mlx.core as mx
     import mlx.nn as nn
@@ -1219,6 +1227,221 @@ def load_pytorch_pipeline(model_path=None):
     return _pytorch_pipe
 
 
+# --- LoRA Management Functions ---
+
+def get_available_loras():
+    """Get list of available LoRA files (relative paths)"""
+    from lora import get_available_loras as _get_loras
+    return _get_loras(Path(LORAS_DIR))
+
+
+def get_loras_with_folders():
+    """Get list of (folder, filename) tuples for all LoRAs"""
+    from lora import get_lora_with_folders
+    return get_lora_with_folders(Path(LORAS_DIR))
+
+
+def get_lora_info(lora_path):
+    """Get detailed info about a LoRA (lora_path is relative to LORAS_DIR)"""
+    from lora import get_lora_info as _get_info
+    full_path = Path(LORAS_DIR) / lora_path
+    return _get_info(full_path)
+
+
+def get_lora_default_weight(lora_path):
+    """Get default weight for a LoRA from metadata (lora_path is relative to LORAS_DIR)"""
+    from lora import get_lora_default_weight as _get_default_weight
+    full_path = Path(LORAS_DIR) / lora_path
+    return _get_default_weight(full_path)
+
+
+def get_lora_table_data():
+    """Get LoRA data formatted for table display.
+    
+    Returns a list of [enabled, folder, name, trigger_words, weight] rows, 
+    sorted alphabetically by folder then name.
+    """
+    lora_entries = get_loras_with_folders()
+    rows = []
+    for folder, filename in lora_entries:
+        try:
+            # Build relative path for get_lora_info
+            if folder:
+                rel_path = f"{folder}/{filename}"
+            else:
+                rel_path = filename
+            info = get_lora_info(rel_path)
+            trigger = ", ".join(info.get('trigger_words', [])) or ""
+            default_weight = get_lora_default_weight(rel_path)
+            # [Enabled, Folder, Name, Trigger Words, Weight]
+            rows.append([False, folder, filename, trigger, default_weight])
+        except Exception as e:
+            print(f"Error loading LoRA info for {filename}: {e}")
+            rows.append([False, folder, filename, "", 1.0])
+    return rows
+
+
+def get_lora_display_info(lora_name):
+    """Get formatted display info for a LoRA"""
+    try:
+        info = get_lora_info(lora_name)
+        lines = [f"**{info['name']}**"]
+        lines.append(f"Rank: {info['rank']} | Weights: {info['num_weights']}")
+        lines.append(f"Layers: {info['layer_range'][0]}-{info['layer_range'][1]}")
+        if info['trigger_words']:
+            lines.append(f"**Trigger words:** `{', '.join(info['trigger_words'])}`")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error loading LoRA info: {e}"
+
+
+def get_enabled_loras_from_table(table_data):
+    """Extract list of enabled LoRA configs from table data.
+    
+    Args:
+        table_data: List/DataFrame of [enabled, folder, name, trigger, weight] rows
+        
+    Returns:
+        List of {"name": str, "scale": float} dicts for enabled LoRAs
+        (name includes folder path if in a subfolder)
+    """
+    if table_data is None:
+        return []
+    
+    # Handle pandas DataFrame (Gradio may send this)
+    try:
+        if hasattr(table_data, 'values'):
+            table_data = table_data.values.tolist()
+    except Exception:
+        pass
+    
+    enabled_loras = []
+    for row in table_data:
+        try:
+            if len(row) >= 5 and row[0]:  # row[0] is the enabled checkbox
+                folder = str(row[1]) if row[1] else ""
+                filename = str(row[2]) if row[2] else ""
+                trigger = str(row[3]) if row[3] else ""
+                weight = row[4]
+                
+                # Build relative path
+                if folder:
+                    rel_path = f"{folder}/{filename}"
+                else:
+                    rel_path = filename
+                
+                # Parse weight - handle various formats
+                try:
+                    scale = float(weight) if weight else 1.0
+                except (ValueError, TypeError):
+                    print(f"Warning: Could not parse weight '{weight}', using 1.0")
+                    scale = 1.0
+                
+                enabled_loras.append({
+                    "name": rel_path,
+                    "scale": scale,
+                    "trigger": trigger
+                })
+        except Exception as e:
+            print(f"Error processing LoRA row {row}: {e}")
+            continue
+            
+    return enabled_loras
+
+
+def build_lora_tags_string(table_data):
+    """Build a string of LoRA tags from table data.
+    
+    Format: <lora:name:weight> for each enabled LoRA
+    Also includes trigger words if present.
+    
+    Args:
+        table_data: List/DataFrame of [enabled, folder, name, trigger, weight] rows
+        
+    Returns:
+        String like "<lora:style_lora:1.0> trigger1, trigger2"
+    """
+    if table_data is None:
+        return ""
+    
+    # Handle pandas DataFrame (Gradio sends this)
+    try:
+        if hasattr(table_data, 'values'):
+            table_data = table_data.values.tolist()
+    except Exception:
+        pass
+    
+    lora_tags = []
+    triggers = []
+    
+    try:
+        for row in table_data:
+            if len(row) >= 5 and row[0]:  # row[0] is enabled
+                folder = str(row[1]) if row[1] else ""
+                filename = str(row[2]) if row[2] else ""
+                trigger = str(row[3]) if row[3] else ""
+                weight = row[4]
+                
+                # Get clean name (without .safetensors extension)
+                # Use just the filename for the tag, not the folder path
+                lora_name = filename.replace('.safetensors', '')
+                
+                # Format weight
+                weight_val = float(weight) if weight else 1.0
+                
+                # Build tag (folder is for organization only, not in the tag)
+                lora_tags.append(f"<lora:{lora_name}:{weight_val:.2f}>")
+                
+                # Collect trigger words
+                if trigger and trigger.strip():
+                    triggers.append(trigger.strip())
+    except Exception as e:
+        print(f"Error building LoRA tags: {e}")
+        return ""
+    
+    # Combine: lora tags first, then triggers
+    parts = []
+    if lora_tags:
+        parts.append(" ".join(lora_tags))
+    if triggers:
+        parts.append(", ".join(triggers))
+    
+    return " ".join(parts)
+
+
+def apply_loras_to_model(model, lora_configs, progress=None):
+    """
+    Apply multiple LoRAs to a model.
+    
+    Args:
+        model: The transformer model
+        lora_configs: List of dicts with 'name' and 'scale' keys
+        progress: Optional progress callback
+        
+    Returns:
+        Number of LoRAs successfully applied
+    """
+    from lora import load_lora, apply_lora_to_model
+    
+    applied = 0
+    for config in lora_configs:
+        lora_path = Path(LORAS_DIR) / config['name']
+        scale = config.get('scale', 1.0)
+        
+        if progress:
+            progress(desc=f"Applying LoRA: {config['name']} (scale={scale})...")
+        
+        try:
+            lora_weights = load_lora(lora_path)
+            apply_lora_to_model(model, lora_weights, scale=scale, verbose=False)
+            applied += 1
+            print(f"Applied LoRA: {config['name']} with scale {scale}")
+        except Exception as e:
+            print(f"Error applying LoRA {config['name']}: {e}")
+    
+    return applied
+
+
 # Global cache for prompt enhancer model
 _prompt_enhancer = None
 
@@ -1326,9 +1549,33 @@ Respond ONLY with the enhanced prompt, no explanations or preamble."""
     return enhanced
 
 
-def generate_mlx(prompt, width, height, steps, time_shift, seed, progress):
-    """Generate image using MLX backend"""
+def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_configs=None):
+    """Generate image using MLX backend
+    
+    Args:
+        lora_configs: Optional list of dicts with 'name' and 'scale' keys for LoRAs to apply
+    """
     import mlx.core as mx
+    global _mlx_models, _current_applied_lora
+    
+    # Normalize lora_configs to empty list if None
+    if lora_configs is None:
+        lora_configs = []
+    
+    # Create a key to identify the current LoRA configuration (sorted for consistency)
+    if lora_configs:
+        lora_key = "|".join(sorted([f"{c['name']}@{c['scale']}" for c in lora_configs]))
+    else:
+        lora_key = None
+    
+    # Check if we need to reload the model due to LoRA change
+    need_lora_apply = False
+    if _current_applied_lora != lora_key:
+        # LoRA config changed - need to reload base model before applying new LoRAs
+        if _mlx_models is not None:
+            progress(0.02, desc="LoRA configuration changed - reloading base model...")
+            _mlx_models = None  # Force reload
+        need_lora_apply = len(lora_configs) > 0
     
     models = load_mlx_models()
     
@@ -1338,6 +1585,22 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress):
     text_encoder = models["text_encoder"]
     tokenizer = models["tokenizer"]
     scheduler = models["scheduler"]
+    
+    # Apply LoRAs if we just reloaded the model and have LoRA configs
+    if need_lora_apply and lora_configs:
+        lora_names = [c['name'] for c in lora_configs]
+        progress(0.05, desc=f"Applying {len(lora_configs)} LoRA(s): {', '.join(lora_names)}...")
+        try:
+            applied = apply_loras_to_model(model, lora_configs, progress=None)
+            if applied > 0:
+                mx.eval(model.parameters())  # Ensure LoRA deltas are computed
+                _current_applied_lora = lora_key  # Mark LoRAs as successfully applied
+                print(f"Successfully applied {applied} LoRA(s)")
+        except Exception as e:
+            print(f"Warning: Failed to apply LoRAs: {e}")
+            _current_applied_lora = None  # Reset on failure
+    elif not lora_configs:
+        _current_applied_lora = None
     
     # Update scheduler with time shift
     scheduler.config.shift = time_shift
@@ -1660,7 +1923,7 @@ def save_selected_or_all(selected_index, png_path, jpg_path, prompt, seed, datas
         return f"BATCH SAVE COMPLETE:\n{result}"
 
 
-def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, progress=gr.Progress()):
+def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, lora_table_data=None, progress=gr.Progress()):
     """Generate an image using selected backend and model"""
     
     if not prompt.strip():
@@ -1677,16 +1940,29 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
         seed = random.randint(0, 2147483647)
     seed = int(seed)
     
+    # Build LoRA configs from table data
+    lora_configs = get_enabled_loras_from_table(lora_table_data)
+    
+    # Build the LoRA tags string and append to prompt
+    lora_tags = build_lora_tags_string(lora_table_data)
+    if lora_tags:
+        full_prompt = f"{prompt.strip()}, {lora_tags}"
+        print(f"Full prompt with LoRA tags: {full_prompt}")
+    else:
+        full_prompt = prompt.strip()
+    
     progress(0, desc=f"Loading {model_name}...")
     
     if backend == "MLX (Apple Silicon)":
         # Select the MLX model
         select_mlx_model(model_name)
-        pil_image = generate_mlx(prompt, width, height, steps, time_shift, seed, progress)
+        pil_image = generate_mlx(full_prompt, width, height, steps, time_shift, seed, progress, lora_configs=lora_configs)
     else:
         # Select the PyTorch model
         select_pytorch_model(model_name)
-        pil_image = generate_pytorch(prompt, width, height, steps, time_shift, seed, progress)
+        if lora_configs:
+            print(f"Warning: LoRA support for PyTorch backend not yet implemented")
+        pil_image = generate_pytorch(full_prompt, width, height, steps, time_shift, seed, progress)
     
     progress(0.95, desc="Saving temporary files...")
     
@@ -1782,6 +2058,37 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                             label="Time Shift",
                             info="Scheduler shift parameter (default: 3.0)",
                         )
+                    
+                    # LoRA Section
+                    with gr.Accordion("🎨 LoRA Settings", open=False) as lora_accordion:
+                        gr.Markdown("*Check the box to enable a LoRA. Adjust weight as needed (1.0 = full strength). Organize LoRAs in subfolders under `models/loras/`.*")
+                        
+                        lora_table = gr.Dataframe(
+                            headers=["Enabled", "Folder", "LoRA Name", "Trigger Words", "Weight"],
+                            datatype=["bool", "str", "str", "str", "number"],
+                            value=get_lora_table_data(),
+                            col_count=(5, "fixed"),
+                            interactive=True,
+                            wrap=True,
+                            row_count=(len(get_lora_table_data()), "dynamic"),
+                        )
+                        
+                        with gr.Row():
+                            weight_down_btn = gr.Button("➖ 0.05", size="sm")
+                            weight_up_btn = gr.Button("➕ 0.05", size="sm")
+                            weight_reset_btn = gr.Button("Reset to 1.0", size="sm")
+                        
+                        gr.Markdown("*Buttons adjust weight of all **enabled** LoRAs*")
+                        
+                        lora_tags_display = gr.Textbox(
+                            label="Applied LoRAs (auto-appended to prompt)",
+                            value="",
+                            interactive=False,
+                            placeholder="Enable LoRAs above to see tags here...",
+                            info="These tags and triggers will be automatically added to your prompt",
+                        )
+                        
+                        refresh_loras_btn = gr.Button("🔄 Refresh LoRA List", size="sm")
                     
                     with gr.Row():
                         seed = gr.Slider(
@@ -1995,9 +2302,97 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         outputs=[prompt],
     )
     
+    # LoRA event handlers
+    def update_lora_tags(table_data):
+        """Update the LoRA tags display when table changes"""
+        return build_lora_tags_string(table_data)
+    
+    def refresh_lora_table():
+        """Refresh the LoRA table data and clear tags"""
+        return get_lora_table_data(), ""
+    
+    def adjust_all_enabled_weights(table_data, delta):
+        """Adjust weights of all enabled LoRAs by delta amount"""
+        if table_data is None:
+            return table_data
+        
+        # Handle pandas DataFrame
+        try:
+            if hasattr(table_data, 'values'):
+                table_data = table_data.values.tolist()
+        except Exception:
+            pass
+        
+        modified = []
+        for row in table_data:
+            row = list(row)  # Make mutable copy
+            if len(row) >= 5 and row[0]:  # If enabled
+                try:
+                    current_weight = float(row[4]) if row[4] else 1.0
+                    new_weight = round(current_weight + delta, 2)
+                    # Clamp between 0 and 2
+                    new_weight = max(0.0, min(2.0, new_weight))
+                    row[4] = new_weight
+                except (ValueError, TypeError):
+                    pass
+            modified.append(row)
+        return modified
+    
+    def reset_all_enabled_weights(table_data):
+        """Reset weights of all enabled LoRAs to 1.0"""
+        if table_data is None:
+            return table_data
+        
+        # Handle pandas DataFrame
+        try:
+            if hasattr(table_data, 'values'):
+                table_data = table_data.values.tolist()
+        except Exception:
+            pass
+        
+        modified = []
+        for row in table_data:
+            row = list(row)  # Make mutable copy
+            if len(row) >= 5 and row[0]:  # If enabled
+                row[4] = 1.0
+            modified.append(row)
+        return modified
+    
+    # Update tags display when table changes
+    lora_table.change(
+        fn=update_lora_tags,
+        inputs=[lora_table],
+        outputs=[lora_tags_display],
+    )
+    
+    refresh_loras_btn.click(
+        fn=refresh_lora_table,
+        inputs=None,
+        outputs=[lora_table, lora_tags_display],
+    )
+    
+    # Weight adjustment buttons
+    weight_down_btn.click(
+        fn=lambda t: adjust_all_enabled_weights(t, -0.05),
+        inputs=[lora_table],
+        outputs=[lora_table],
+    )
+    
+    weight_up_btn.click(
+        fn=lambda t: adjust_all_enabled_weights(t, 0.05),
+        inputs=[lora_table],
+        outputs=[lora_table],
+    )
+    
+    weight_reset_btn.click(
+        fn=reset_all_enabled_weights,
+        inputs=[lora_table],
+        outputs=[lora_table],
+    )
+    
     generate_btn.click(
         fn=generate_image,
-        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown],
+        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown, lora_table],
         outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed],
     ).then(
         fn=lambda: (gr.update(visible=True), None, "", "", "", "", 0, ""),
