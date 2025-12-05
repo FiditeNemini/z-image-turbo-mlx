@@ -1294,7 +1294,7 @@ def build_lora_tags_from_components(lora_states):
     """Build LoRA tags string from component states.
     
     Args:
-        lora_states: List of (enabled, lora_path, weight) tuples
+        lora_states: List of (enabled, lora_path, trigger, weight) tuples
         
     Returns:
         String like "<lora:name:1.0> trigger1, trigger2"
@@ -1302,17 +1302,16 @@ def build_lora_tags_from_components(lora_states):
     lora_tags = []
     triggers = []
     
-    for enabled, lora_path, weight in lora_states:
+    for enabled, lora_path, trigger, weight in lora_states:
         if enabled and lora_path:
             # Get clean name (without .safetensors extension and folder)
             lora_name = Path(lora_path).stem
             weight_val = float(weight) if weight else 1.0
             lora_tags.append(f"<lora:{lora_name}:{weight_val:.2f}>")
             
-            # Get trigger words
-            trigger = get_lora_trigger_for_path(lora_path)
-            if trigger:
-                triggers.append(trigger)
+            # Use the user-edited trigger words
+            if trigger and trigger.strip():
+                triggers.append(trigger.strip())
     
     parts = []
     if lora_tags:
@@ -1327,24 +1326,23 @@ def get_enabled_loras_from_components(lora_states):
     """Extract enabled LoRA configs from component states.
     
     Args:
-        lora_states: List of (enabled, lora_path, weight) tuples
+        lora_states: List of (enabled, lora_path, trigger, weight) tuples
         
     Returns:
         List of {"name": str, "scale": float, "trigger": str} dicts
     """
     enabled_loras = []
-    for enabled, lora_path, weight in lora_states:
+    for enabled, lora_path, trigger, weight in lora_states:
         if enabled and lora_path:
             try:
                 scale = float(weight) if weight else 1.0
             except (ValueError, TypeError):
                 scale = 1.0
             
-            trigger = get_lora_trigger_for_path(lora_path)
             enabled_loras.append({
                 "name": lora_path,
                 "scale": scale,
-                "trigger": trigger
+                "trigger": trigger.strip() if trigger else ""
             })
     return enabled_loras
 
@@ -1871,7 +1869,7 @@ def update_aspect_ratios(base_resolution):
     return gr.update(choices=choices, value=choices[0])
 
 
-def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name):
+def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name, lora_configs=None):
     """Add a generated image to the gallery"""
     global _image_gallery
     _image_gallery.append({
@@ -1886,6 +1884,7 @@ def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, b
         "width": width,
         "height": height,
         "model_name": model_name,
+        "lora_configs": lora_configs or [],
     })
     return [item["image"] for item in _image_gallery]
 
@@ -1900,7 +1899,26 @@ def get_selected_image_info(evt: gr.SelectData):
     if evt.index < len(_image_gallery):
         item = _image_gallery[evt.index]
         model_name = item.get('model_name', 'Unknown')
-        details = f"Model: {model_name}\nSeed: {item['seed']}\nSize: {item['width']}×{item['height']}\nSteps: {item['steps']} | Time Shift: {item['time_shift']}\nBackend: {item['backend']}\nIndex: {evt.index + 1} of {len(_image_gallery)}"
+        
+        # Build details in logical order
+        details_lines = [
+            f"Backend: {item['backend']}",
+            f"Model: {model_name}",
+            f"Seed: {item['seed']}",
+            f"Size: {item['width']}×{item['height']}",
+            f"Steps: {item['steps']}",
+            f"Time Shift: {item['time_shift']}",
+        ]
+        
+        # Add LoRA info if present
+        lora_configs = item.get('lora_configs', [])
+        if lora_configs:
+            lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
+            details_lines.append(f"LoRAs: {', '.join(lora_strs)}")
+        
+        details_lines.append(f"Index: {evt.index + 1} of {len(_image_gallery)}")
+        details = "\n".join(details_lines)
+        
         return (
             details,
             item["prompt"],
@@ -1933,25 +1951,37 @@ def clear_gallery():
     return [], None, "", "", "", "", 0, ""
 
 
-def create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name):
+def create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None):
     """Create a metadata string for embedding in images"""
-    return f"""{prompt}
+    lines = [
+        prompt,
+        "",
+        "---",
+        f"Backend: {backend}",
+        f"Model: {model_name}",
+        f"Seed: {seed}",
+        f"Size: {width}×{height}",
+        f"Steps: {steps}",
+        f"Time Shift: {time_shift}",
+    ]
+    
+    # Add LoRA info if present
+    if lora_configs:
+        lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
+        lines.append(f"LoRAs: {', '.join(lora_strs)}")
+    
+    lines.extend([
+        "",
+        "Generated with Z-Image-Turbo-MLX",
+        "https://github.com/FiditeNemini/z-image-turbo-mlx"
+    ])
+    
+    return "\n".join(lines)
 
----
-Model: {model_name}
-Size: {width}×{height}
-Seed: {seed}
-Steps: {steps}
-Time Shift: {time_shift}
-Backend: {backend}
 
-Generated with Z-Image-Turbo-MLX
-https://github.com/FiditeNemini/z-image-turbo-mlx"""
-
-
-def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shift, backend, width, height, model_name):
+def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None):
     """Save image with embedded metadata"""
-    metadata_str = create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name)
+    metadata_str = create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs)
     
     if filepath.lower().endswith('.png'):
         # PNG metadata using PngInfo
@@ -1965,6 +1995,9 @@ def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shif
         png_info.add_text("width", str(width))
         png_info.add_text("height", str(height))
         png_info.add_text("model", model_name)
+        if lora_configs:
+            lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
+            png_info.add_text("loras", ", ".join(lora_strs))
         png_info.add_text("generator", "Z-Image-Turbo-MLX")
         png_info.add_text("generator_url", "https://github.com/FiditeNemini/z-image-turbo-mlx")
         pil_image.save(filepath, "PNG", pnginfo=png_info)
@@ -2116,13 +2149,13 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     jpg_path = os.path.join(TEMP_DIR, f"{timestamp}.jpg")
     
     # Save images with embedded metadata
-    save_image_with_metadata(pil_image, png_path, prompt, seed, steps, time_shift, backend, width, height, model_name)
-    save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, width, height, model_name)
+    save_image_with_metadata(pil_image, png_path, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs)
+    save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs)
     
     progress(1.0, desc="Done!")
     
     # Add to gallery with all generation parameters
-    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name)
+    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name, lora_configs)
     
     return gallery_images, png_path, jpg_path, prompt, seed
 
@@ -2201,13 +2234,13 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                     
                     # LoRA Section - Individual rows with spinners
                     with gr.Accordion("🎨 LoRA Settings", open=False) as lora_accordion:
-                        gr.Markdown("*Enable LoRAs and adjust weights using the spinners (0.05 increments). Organize LoRAs in subfolders under `models/loras/`.*")
+                        gr.Markdown("*Enable LoRAs and adjust weights using the spinners (0.05 increments). Edit trigger words as needed.*")
                         
                         # Get initial LoRA data
                         initial_lora_choices = get_lora_choices()
                         
                         # Create individual LoRA slot rows
-                        lora_rows = []  # Will store (checkbox, lora_path, weight) tuples
+                        lora_rows = []  # Will store (checkbox, lora_path, trigger_textbox, weight) tuples
                         
                         if not initial_lora_choices:
                             gr.Markdown("*No LoRAs found. Place `.safetensors` files in `models/loras/`*")
@@ -2215,7 +2248,6 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         for i, (display_name, lora_path) in enumerate(initial_lora_choices):
                             # Get trigger words for this LoRA
                             trigger = get_lora_trigger_for_path(lora_path)
-                            trigger_display = f" `{trigger}`" if trigger else ""
                             
                             with gr.Row():
                                 enabled = gr.Checkbox(
@@ -2227,13 +2259,22 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                                 )
                                 # Hidden state to store the lora path
                                 lora_path_state = gr.State(value=lora_path)
-                                # Display name and trigger as text (using Textbox as label since Markdown doesn't support scale)
+                                # Display name as static text
                                 gr.Textbox(
-                                    value=f"{display_name}{trigger_display}",
+                                    value=display_name,
                                     label="",
                                     show_label=False,
                                     interactive=False,
-                                    scale=4,
+                                    scale=3,
+                                )
+                                # Editable trigger words textbox
+                                trigger_textbox = gr.Textbox(
+                                    value=trigger,
+                                    label="",
+                                    show_label=False,
+                                    placeholder="trigger words",
+                                    interactive=True,
+                                    scale=2,
                                 )
                                 weight = gr.Number(
                                     label="",
@@ -2245,7 +2286,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                                     scale=1,
                                     min_width=80,
                                 )
-                                lora_rows.append((enabled, lora_path_state, weight))
+                                lora_rows.append((enabled, lora_path_state, trigger_textbox, weight))
                         
                         lora_tags_display = gr.Textbox(
                             label="Applied LoRAs (auto-appended to prompt)",
@@ -2476,23 +2517,29 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         Args are in order: enabled1, lora1, weight1, enabled2, lora2, weight2, ...
         """
         lora_states = []
-        for i in range(0, len(args), 3):
-            if i + 2 < len(args):
+        for i in range(0, len(args), 4):
+            if i + 3 < len(args):
                 enabled = args[i]
                 lora_path = args[i + 1]
-                weight = args[i + 2]
-                lora_states.append((enabled, lora_path, weight))
+                trigger = args[i + 2]
+                weight = args[i + 3]
+                lora_states.append((enabled, lora_path, trigger, weight))
         
         return build_lora_tags_from_components(lora_states)
     
     # Flatten lora_rows into individual components for event binding
     all_lora_components = []
-    for enabled, lora_path_state, weight in lora_rows:
-        all_lora_components.extend([enabled, lora_path_state, weight])
+    for enabled, lora_path_state, trigger_textbox, weight in lora_rows:
+        all_lora_components.extend([enabled, lora_path_state, trigger_textbox, weight])
     
-    # Update tags when checkbox or weight changes
-    for enabled, lora_path_state, weight in lora_rows:
+    # Update tags when checkbox, trigger, or weight changes
+    for enabled, lora_path_state, trigger_textbox, weight in lora_rows:
         enabled.change(
+            fn=update_lora_tags_from_rows,
+            inputs=all_lora_components,
+            outputs=[lora_tags_display],
+        )
+        trigger_textbox.change(
             fn=update_lora_tags_from_rows,
             inputs=all_lora_components,
             outputs=[lora_tags_display],
@@ -2513,14 +2560,15 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     # Wrapper function to collect LoRA states and generate
     def generate_with_loras(prompt, base_res, aspect, steps, time_shift, seed, backend, model, *lora_args):
         """Wrapper that collects LoRA component states and calls generate_image"""
-        # lora_args are: enabled1, lora1, weight1, enabled2, lora2, weight2, ...
+        # lora_args are: enabled1, lora1, trigger1, weight1, enabled2, lora2, trigger2, weight2, ...
         lora_states = []
-        for i in range(0, len(lora_args), 3):
-            if i + 2 < len(lora_args):
+        for i in range(0, len(lora_args), 4):
+            if i + 3 < len(lora_args):
                 enabled = lora_args[i]
                 lora_path = lora_args[i + 1]
-                weight = lora_args[i + 2]
-                lora_states.append((enabled, lora_path, weight))
+                trigger = lora_args[i + 2]
+                weight = lora_args[i + 3]
+                lora_states.append((enabled, lora_path, trigger, weight))
         
         # Get enabled LoRA configs
         lora_configs = get_enabled_loras_from_components(lora_states)
