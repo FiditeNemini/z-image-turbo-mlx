@@ -29,6 +29,9 @@ The project supports:
 - Prompt enhancement using a local LLM
 - Multiple aspect ratios and resolutions
 - **LoRA support** for style and concept customization
+- **LeMiCa speed acceleration** for up to 30% faster generation
+- **Latent upscaling** for enhanced detail before decoding
+- **ESRGAN upscaling** for pixel-space resolution enhancement
 
 ---
 
@@ -145,7 +148,7 @@ z-image-turbo-mlx/
 **Purpose**: Denoises latent representations conditioned on text embeddings.
 
 **Key Classes**:
-- `ZImageTransformer2DModel`: Main model class
+- `ZImageTransformer2DModel`: Main model class (with LeMiCa caching support)
 - `ZImageTransformerBlock`: Single transformer layer
 - `Attention`: Multi-head attention with QK normalization and MRoPE
 - `FeedForward`: SwiGLU MLP
@@ -748,6 +751,199 @@ self.norm = nn.GroupNorm(groups, channels, eps=1e-6, pytorch_compatible=True)
 
 ---
 
+## LeMiCa Speed Acceleration
+
+LeMiCa (Lexicographic Minimax Path Caching) is a training-free acceleration technique integrated into the transformer for faster inference.
+
+### Overview
+
+Based on [LeMiCa: Lexicographic Minimax Path Caching](https://github.com/UnicomAI/LeMiCa) (NeurIPS 2025 Spotlight), this technique caches transformer residuals between denoising steps instead of recomputing from scratch.
+
+### How It Works
+
+1. **Compute Steps**: Full transformer forward pass runs, stores `residual = output - input`
+2. **Skip Steps**: Cached residual is reused: `output = input + cached_residual`
+3. **Schedule**: Precomputed boolean list determines which steps compute vs skip
+
+### Implementation Details
+
+#### Constants and Schedules (`src/z_image_mlx.py`)
+
+```python
+LEMICA_SCHEDULES = {
+    "slow": [0, 1, 2, 3, 5, 7, 8],      # 7/9 steps computed
+    "medium": [0, 1, 2, 4, 6, 8],       # 6/9 steps computed  
+    "fast": [0, 1, 2, 5, 8],            # 5/9 steps computed
+}
+```
+
+#### Transformer State Variables
+
+```python
+class ZImageTransformer2DModel:
+    # LeMiCa caching state
+    self.enable_lemica = False           # Enable/disable caching
+    self.lemica_bool_list = None         # Which steps to compute
+    self.lemica_step_counter = 0         # Current step index
+    self.lemica_previous_residual = None # Cached residual tensor
+```
+
+#### Key Methods
+
+```python
+def configure_lemica(self, cache_mode, num_steps=9):
+    """Configure LeMiCa caching for a generation run.
+    
+    Args:
+        cache_mode: 'slow', 'medium', 'fast', or None to disable
+        num_steps: Number of inference steps
+    """
+    self.reset_lemica_state()
+    if cache_mode:
+        self.enable_lemica = True
+        self.lemica_bool_list = get_lemica_bool_list(cache_mode, num_steps)
+
+def reset_lemica_state(self):
+    """Reset state for a new generation."""
+    self.lemica_step_counter = 0
+    self.lemica_previous_residual = None
+```
+
+#### Main Layer Caching Logic
+
+```python
+# In __call__ method, main layers section:
+if self.enable_lemica and self.lemica_bool_list is not None:
+    step_idx = self.lemica_step_counter
+    should_compute = self.lemica_bool_list[step_idx]
+    
+    if should_compute:
+        # Full computation - store residual
+        unified_input = unified
+        for layer in self.layers:
+            unified = layer(unified, unified_cos, unified_sin, mask=None, adaln_input=t_emb)
+        self.lemica_previous_residual = unified - unified_input
+    else:
+        # Use cached residual
+        if self.lemica_previous_residual is not None:
+            unified = unified + self.lemica_previous_residual
+    
+    self.lemica_step_counter += 1
+```
+
+### Speed Modes
+
+| Mode | Steps Computed | Speedup | Quality Impact |
+|------|----------------|---------|----------------|
+| None | 9/9 | Baseline | Reference |
+| slow | 7/9 | ~14% | Minimal |
+| medium | 6/9 | ~22% | Very slight |
+| fast | 5/9 | ~30% | Slight |
+
+### Usage
+
+**CLI** (`src/generate_mlx.py`):
+```bash
+python generate_mlx.py --prompt "..." --cache medium
+```
+
+**App** (`app.py`):
+```python
+model.configure_lemica(cache_mode, steps)
+# ... denoising loop
+model.reset_lemica_state()  # Automatic after generation
+```
+
+**GUI**: Use the "⚡ LeMiCa Speed" dropdown in the generation settings.
+
+---
+
+## Latent Upscaling
+
+Latent upscaling enhances image detail by upscaling in latent space before VAE decoding, then running additional denoising steps.
+
+### Overview
+
+Unlike pixel-space upscaling (ESRGAN), latent upscaling works in the compressed latent representation:
+
+1. Generate base latents at target resolution (e.g., 1024×1024 → 128×128 latents)
+2. Upscale latents spatially (e.g., 2× → 256×256 latents)
+3. Add noise at specified denoise strength
+4. Run additional denoising steps to refine detail
+5. VAE decode the upscaled latents
+
+### Implementation
+
+#### Function: `latent_upscale_mlx()` in `app.py`
+
+```python
+def latent_upscale_mlx(
+    latents,              # Input latents [B, H, W, C] in NHWC format
+    prompt_embeds,        # Text embeddings for conditioning
+    model,                # ZImageTransformer2DModel
+    vae,                  # AutoencoderKL (for re-encoding if needed)
+    vae_config,           # VAE configuration dict
+    scheduler,            # FlowMatchEulerDiscreteScheduler
+    scale_factor=2.0,     # Upscale factor (1.0-4.0)
+    denoise_strength=0.55, # How much to denoise (0.0-1.0)
+    hires_steps=None,     # Override step count (None = auto)
+    seed=42,              # Random seed for noise
+    interp_mode='cubic',  # Interpolation: 'nearest', 'linear', 'cubic'
+    progress=None,        # Gradio progress callback
+    progress_start=0.8,   # Progress bar start position
+):
+```
+
+#### Memory-Efficient Tiled Processing
+
+For large upscales, automatic tiled processing prevents OOM:
+
+```python
+def get_available_memory_gb():
+    """Estimate available GPU memory (50% of system RAM for Apple Silicon)."""
+    
+def calculate_optimal_tile_size(latent_height, latent_width, scale_factor):
+    """Calculate tile size and overlap based on available memory.
+    
+    Returns:
+        (tile_size, overlap) or None if no tiling needed
+    """
+```
+
+### Parameters
+
+| Parameter | Range | Default | Description |
+|-----------|-------|---------|-------------|
+| `scale_factor` | 1.0-4.0 | 1.0 | Latent upscale multiplier |
+| `denoise_strength` | 0.0-1.0 | 0.55 | Amount of noise/refinement |
+| `hires_steps` | 0-20 | 0 (auto) | Refinement steps (0 = auto) |
+| `interp_mode` | nearest/linear/cubic | cubic | Interpolation method |
+
+### Interpolation Modes
+
+- **nearest**: Fast, produces blocky results
+- **linear**: Smooth but may blur fine details
+- **cubic**: Best quality, slight computational overhead (default)
+
+### Auto Step Calculation
+
+When `hires_steps=0`, steps are calculated from denoise strength:
+
+```python
+hires_steps = max(1, int(9 * denoise_strength))  # Based on 9-step base
+```
+
+### Pipeline Flow
+
+```
+Base Generation (1024²) → Latent Upscale (2×) → Denoise → VAE Decode → ESRGAN (optional)
+     ↓                         ↓                    ↓           ↓
+128×128 latents           256×256 latents    Refined    2048×2048 pixels
+                          + noise             latents    (final output)
+```
+
+---
+
 ## Known Issues & Solutions
 
 ### Issue 1: FP8 Model Produces Noise/Garbage
@@ -939,9 +1135,14 @@ for k in ['layers.0.attention.to_q.weight', 'layers.0.attention.norm_q.weight']:
 - [ ] Generated images correlate >0.99 between FP16 and FP8
 - [ ] Seeds produce reproducible results
 - [ ] Different aspect ratios work correctly
+- [ ] LeMiCa caching produces consistent results across modes
+- [ ] LeMiCa step counter resets correctly between generations
+- [ ] Latent upscaling produces higher-detail images
+- [ ] Tiled latent upscaling works for large scale factors
+- [ ] ESRGAN upscaling integrates correctly with latent upscale
 
 ---
 
-*Document Version: 1.0*
-*Last Updated: December 2024*
+*Document Version: 2.0*
+*Last Updated: December 2025*
 *Project: Z-Image-Turbo-MLX*

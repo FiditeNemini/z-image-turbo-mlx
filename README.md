@@ -9,12 +9,14 @@ Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-
 ### Key Features
 
 - **Fast generation**: 9 inference steps for high-quality results
+- **LeMiCa speed acceleration**: Training-free caching for up to 30% faster generation
 - **Apple Silicon optimized**: Native MLX implementation for M1/M2/M3/M4 Macs
 - **Bit-perfect accuracy**: MLX output matches PyTorch within 1 pixel per channel
 - **Model management**: Support for multiple models and fine-tuned variants
 - **LoRA support**: Apply style and concept customizations with adjustable weights
 - **LoRA fusion**: Permanently fuse LoRAs and export to MLX, PyTorch, or ComfyUI formats
-- **ESRGAN upscaling**: 4x resolution enhancement with RRDB-based models
+- **Latent upscaling**: Upscale in latent space for enhanced detail before decoding
+- **ESRGAN upscaling**: 4× pixel-space resolution enhancement with RRDB-based models
 - **Gradio UI**: User-friendly web interface for image generation
 
 ## 📚 Documentation
@@ -88,7 +90,26 @@ python src/generate_mlx.py \
     --seed 42 \
     --steps 9 \
     --height 1024 \
-    --width 1024
+    --width 1024 \
+    --cache medium
+```
+
+#### Speed Acceleration (LeMiCa)
+
+Use the `--cache` option for faster generation with minimal quality impact:
+
+| Mode | Steps Computed | Speed Gain | Quality |
+|------|----------------|------------|----------|
+| `slow` | 7/9 | ~14% faster | Highest |
+| `medium` | 6/9 | ~22% faster | Excellent |
+| `fast` | 5/9 | ~30% faster | Very Good |
+
+```bash
+# Fast mode for quick iterations
+python src/generate_mlx.py --prompt "..." --cache fast
+
+# Medium mode for balanced speed/quality
+python src/generate_mlx.py --prompt "..." --cache medium
 ```
 
 #### PyTorch Reference
@@ -208,6 +229,42 @@ models/loras/
 
 > **Note**: Only Z-Image-Turbo compatible LoRAs work. LoRAs trained for SDXL, SD1.5, Flux, etc. are NOT compatible.
 
+## Speed Acceleration (LeMiCa)
+
+LeMiCa (Lexicographic Minimax Path Caching) is a training-free acceleration technique that caches transformer residuals between denoising steps instead of recomputing from scratch.
+
+### How It Works
+
+1. On "compute" steps, the full transformer forward pass runs and stores the residual
+2. On "skip" steps, the cached residual is reused: `output = input + cached_residual`
+3. The schedule determines which steps compute vs skip
+
+### Speed Modes
+
+| Mode | Computed Steps | Speedup | Quality |
+|------|----------------|---------|----------|
+| **None** | 9/9 | Baseline | Reference |
+| **slow** | 7/9 | ~14% faster | Highest |
+| **medium** | 6/9 | ~22% faster | Excellent |
+| **fast** | 5/9 | ~30% faster | Very Good |
+
+### Usage
+
+**GUI**: Use the "⚡ LeMiCa Speed" dropdown below the Steps slider
+
+**CLI**:
+```bash
+python src/generate_mlx.py --prompt "..." --cache medium
+```
+
+### Technical Details
+
+Based on [LeMiCa: Lexicographic Minimax Path Caching](https://github.com/UnicomAI/LeMiCa) (NeurIPS 2025 Spotlight). The Z-Image implementation uses optimized step schedules derived from the original research:
+
+- `slow`: Steps 0,1,2,3,5,7,8 compute (skip 4,6)
+- `medium`: Steps 0,1,2,4,6,8 compute (skip 3,5,7)
+- `fast`: Steps 0,1,2,5,8 compute (skip 3,4,6,7)
+
 ### Saving Fused Models
 
 You can permanently fuse loaded LoRAs into the base model and export to multiple formats:
@@ -224,12 +281,12 @@ You can permanently fuse loaded LoRAs into the base model and export to multiple
 
 ```
 z-image-turbo-mlx/
-├── app.py                  # Gradio web UI
+├── app.py                  # Gradio web UI (with LeMiCa & upscaling)
 ├── migrate_models.py       # Migration script for directory structure
 ├── src/                    # Core source files
-│   ├── generate_mlx.py     # MLX image generation
+│   ├── generate_mlx.py     # MLX image generation (--cache for LeMiCa)
 │   ├── generate_pytorch.py # PyTorch reference
-│   ├── z_image_mlx.py      # MLX transformer model
+│   ├── z_image_mlx.py      # MLX transformer model (LeMiCa caching)
 │   ├── text_encoder.py     # MLX Qwen3-4B encoder
 │   ├── vae.py              # MLX VAE decoder
 │   ├── lora.py             # LoRA loading and application
@@ -237,7 +294,8 @@ z-image-turbo-mlx/
 ├── models/                 # Model weights
 │   ├── mlx/                # MLX-converted models
 │   ├── pytorch/            # PyTorch/Diffusers models
-│   └── loras/              # LoRA files (.safetensors)
+│   ├── loras/              # LoRA files (.safetensors)
+│   └── upscalers/          # ESRGAN upscaler models
 ├── debugging/              # Debug & diagnostic tools
 └── requirements.txt
 ```
@@ -303,6 +361,7 @@ This project is for research and personal use. Please refer to the original Z-Im
 - Original Z-Image-Turbo model from Tongyi-MAI
 - MLX framework by Apple
 - Diffusers library by Hugging Face
+- LeMiCa acceleration from UnicomAI
 
 ```bibtex
 @article{team2025zimage,
@@ -310,6 +369,14 @@ This project is for research and personal use. Please refer to the original Z-Im
   author={Z-Image Team},
   journal={arXiv preprint arXiv:2511.22699},
   year={2025}
+}
+
+@inproceedings{gao2025lemica,
+  title={LeMiCa: Lexicographic Minimax Path Caching for Efficient Diffusion-Based Video Generation},
+  author={Huanlin Gao and Ping Chen and Fuyuan Shi and Chao Tan and Zhaoxiang Liu and Fang Zhao and Kai Wang and Shiguo Lian},
+  journal={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2025},
+  url={https://arxiv.org/abs/2511.00090}
 }
 
 @article{liu2025decoupled,

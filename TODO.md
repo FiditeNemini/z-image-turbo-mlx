@@ -52,40 +52,45 @@ Add the ability to load and apply LoRA (Low-Rank Adaptation) models to the MLX i
 
 ## Image Upscaling & Refinement
 
-✅ **IMPLEMENTED** - ESRGAN 4× upscaling integrated!
+✅ **FULLY IMPLEMENTED** - Both latent and ESRGAN upscaling integrated!
 
-Post-generation image enhancement using ESRGAN-type upscalers. Community-requested feature to improve image quality and resolution.
+Post-generation image enhancement using both latent-space and pixel-space upscaling methods.
 
 ### Implemented Features
 
-#### ESRGAN Image Upscaler (Option 2 - Recommended)
+#### Latent Upscaling (Phase 4 - COMPLETED)
+- **Latent space upscaling** before VAE decode for enhanced detail
+- **Configurable scale factor** (1.0-4.0) with 0.25 steps
+- **Interpolation modes**: nearest, linear, cubic (default)
+- **Auto-calculated hires steps** based on denoise strength
+- **Tiled processing** with automatic memory detection for large upscales
+- **Weighted gradient blending** at tile seams
+
+#### ESRGAN Image Upscaler (Phase 1-3 - COMPLETED)
 - **4× upscaling** using RRDB-Net architecture
 - **MLX-native inference** - runs efficiently on Apple Silicon
 - **Tiled processing** for large images (memory efficient)
 - **Multiple upscaler support** - choose from available ESRGAN models
 - **ESRGAN/RRDB only** - SPAN and other architectures filtered from UI
 
-### Implementation Completed
+### Combined Pipeline
 
-#### Phase 1: File Structure & Model Support ✅
-- [x] Created `models/upscalers/` directory
-- [x] Added upscaler model loading support (ESRGAN `.pth` format)
-- [x] Implemented MLX-compatible upscaler inference (`src/upscaler.py`)
-- [x] Supports RRDB-Net architecture (23 blocks, 64 features)
+```
+Base Gen (1024²) → Latent Upscale → Denoise → VAE Decode → ESRGAN
+                         ↓              ↓           ↓          ↓
+                   256×256 latents  Refined    2048×2048   4096×4096
+                   (from 128×128)   latents     pixels      pixels
+```
 
-#### Phase 2: UI Changes ✅
-- [x] Added "🔍 Upscaling (ESRGAN)" accordion in Generate tab
-- [x] **Upscaler Dropdown**: Select upscaler model (None, 4x-UltraSharp, etc.)
-- [x] Upscaler info displayed in generation details
+### UI Controls
 
-#### Phase 3: Backend Implementation ✅
-- [x] Created `src/upscaler.py` module with:
-  - `load_upscaler()` - Load ESRGAN-type model
-  - `upscale_image()` - Run image through upscaler
-  - `get_available_upscalers()` - Scan `models/upscalers/` directory
-  - `RRDBNet` - MLX implementation of RRDB network
-- [x] Integrated with generation pipeline (optional post-process step)
-- [x] Updated metadata to include upscaling info
+**🔍 Upscaling Accordion**:
+- **Latent Scale**: 1.0-4.0 slider (1.0 = disabled)
+- **Interpolation**: Dropdown (nearest/linear/cubic)
+- **Hires Steps**: 0-20 slider (0 = auto)
+- **Denoise Strength**: 0.0-1.0 slider
+- **ESRGAN Model**: Dropdown of available upscalers
+- **ESRGAN Scale**: 1.0-4.0 slider
 
 ### Available Upscaler Models
 
@@ -97,13 +102,6 @@ Post-generation image enhancement using ESRGAN-type upscalers. Community-request
 | 4x_NMKD-Siax_200k | 4× | Anime/illustrations |
 | 4x_NMKD-Superscale-SP_178000_G | 4× | General upscaling |
 
-### Future Enhancements (Optional)
-
-#### Phase 4: Latent Upscale Method
-- [ ] Implement latent space upscaling
-- [ ] Add short refinement sampler pass (Euler/Euler-a)
-- [ ] Allow selection between methods (Image vs Latent upscale)
-
 ### Technical Notes
 
 - Upscaler models cached for performance (single load per session)
@@ -111,4 +109,50 @@ Post-generation image enhancement using ESRGAN-type upscalers. Community-request
 - Upscaled image size stored in metadata (final dimensions)
 - Memory: 4× upscale = 16× pixels (e.g., 1024² → 4096²)
 
-### Status: ✅ Completed (ESRGAN method)
+### Status: ✅ Completed (both methods)
+
+---
+
+## Speed Acceleration (LeMiCa)
+
+✅ **COMPLETED** - LeMiCa training-free caching implemented!
+
+Training-free acceleration using residual caching between denoising steps.
+
+### Implemented Features
+
+- **LeMiCa caching** in transformer main layers
+- **Three speed modes**: slow (~14% faster), medium (~22% faster), fast (~30% faster)
+- **CLI support**: `--cache slow/medium/fast` argument
+- **UI support**: "⚡ LeMiCa Speed" dropdown in generation settings
+
+### Implementation Details
+
+#### Added to `src/z_image_mlx.py`:
+- `LEMICA_SCHEDULES` - Precomputed step schedules for each mode
+- `get_lemica_bool_list()` - Convert mode to boolean list
+- `ZImageTransformer2DModel.configure_lemica()` - Set up caching
+- `ZImageTransformer2DModel.reset_lemica_state()` - Reset for new generation
+- Caching logic in `__call__` main layers section
+
+#### Added to `src/generate_mlx.py`:
+- `--cache` CLI argument with choices: slow, medium, fast
+
+#### Added to `app.py`:
+- `cache_mode` dropdown in UI
+- Wired through `generate_with_loras` → `generate_image` → `generate_mlx`
+
+### Speed Modes
+
+| Mode | Steps Computed | Speedup | Quality |
+|------|----------------|---------|----------|
+| None | 9/9 | Baseline | Reference |
+| slow | 7/9 | ~14% | Highest |
+| medium | 6/9 | ~22% | Excellent |
+| fast | 5/9 | ~30% | Very Good |
+
+### Technical Reference
+
+Based on [LeMiCa: Lexicographic Minimax Path Caching](https://github.com/UnicomAI/LeMiCa) (NeurIPS 2025 Spotlight).
+
+### Status: ✅ Completed
