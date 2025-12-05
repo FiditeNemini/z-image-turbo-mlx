@@ -2102,6 +2102,414 @@ def apply_upscaler(image, upscaler_name, scale_factor=2.0, progress=None):
         return image
 
 
+# --- Latent Upscaling Functions ---
+
+def get_available_memory_gb():
+    """Estimate available GPU memory in GB for tile size calculation.
+    
+    Returns conservative estimate based on system memory and Metal limits.
+    """
+    import subprocess
+    try:
+        # Get total system memory (proxy for unified memory on Apple Silicon)
+        result = subprocess.run(['sysctl', '-n', 'hw.memsize'], capture_output=True, text=True)
+        total_bytes = int(result.stdout.strip())
+        total_gb = total_bytes / (1024 ** 3)
+        
+        # Conservative estimate: assume 50% available for GPU, minus overhead
+        # This accounts for system usage, other apps, and MLX overhead
+        available_gb = (total_gb * 0.5) - 4.0  # Reserve 4GB for system
+        return max(4.0, available_gb)  # Minimum 4GB
+    except Exception:
+        return 8.0  # Default fallback
+
+
+def calculate_optimal_tile_size(latent_height, latent_width, scale_factor, available_memory_gb=None):
+    """Calculate optimal tile size based on available memory.
+    
+    Args:
+        latent_height: Height of latent tensor
+        latent_width: Width of latent tensor
+        scale_factor: Upscale multiplier (1.0-4.0)
+        available_memory_gb: Override for available memory (auto-detect if None)
+        
+    Returns:
+        Tuple of (tile_size, overlap) in latent pixels
+    """
+    if available_memory_gb is None:
+        available_memory_gb = get_available_memory_gb()
+    
+    # Estimate memory per latent pixel (empirically determined)
+    # Transformer forward pass is ~0.5MB per latent pixel at 1x scale
+    # Scale quadratically with upscale factor
+    memory_per_pixel_mb = 0.5 * (scale_factor ** 2)
+    
+    # Calculate max tile area that fits in memory
+    # Reserve 30% for overhead (attention, intermediates, etc.)
+    usable_memory_mb = available_memory_gb * 1024 * 0.7
+    max_tile_area = usable_memory_mb / memory_per_pixel_mb
+    
+    # Calculate tile size (square tiles)
+    max_tile_size = int(max_tile_area ** 0.5)
+    
+    # Clamp to reasonable range and ensure divisible by 8
+    tile_size = max(32, min(256, max_tile_size))
+    tile_size = (tile_size // 8) * 8
+    
+    # Overlap should be ~12.5% of tile size for smooth blending
+    overlap = max(8, tile_size // 8)
+    
+    # If the full latent fits in memory, use no tiling
+    total_area = latent_height * latent_width * (scale_factor ** 2)
+    if total_area <= max_tile_area * 0.8:  # 80% threshold for safety
+        return None, None  # No tiling needed
+    
+    return tile_size, overlap
+
+
+def blend_tiles(output, tile, y_start, x_start, tile_h, tile_w, overlap, full_h, full_w):
+    """Blend a tile into the output with linear gradient at overlapping edges.
+    
+    Args:
+        output: Full output tensor [B, H, W, C]
+        tile: Tile to blend [B, tile_h, tile_w, C]
+        y_start, x_start: Position of tile in output
+        tile_h, tile_w: Size of tile
+        overlap: Overlap size in pixels
+        full_h, full_w: Full output dimensions
+        
+    Returns:
+        Updated output tensor
+    """
+    import mlx.core as mx
+    
+    # Create weight mask for blending
+    weight = mx.ones((tile_h, tile_w))
+    
+    # Apply linear gradient at edges that overlap with other tiles
+    # Top edge
+    if y_start > 0:
+        for i in range(min(overlap, tile_h)):
+            weight = weight.at[i, :].set(weight[i, :] * (i / overlap))
+    
+    # Left edge
+    if x_start > 0:
+        for j in range(min(overlap, tile_w)):
+            weight = weight.at[:, j].set(weight[:, j] * (j / overlap))
+    
+    # Bottom edge
+    if y_start + tile_h < full_h:
+        for i in range(min(overlap, tile_h)):
+            idx = tile_h - 1 - i
+            weight = weight.at[idx, :].set(weight[idx, :] * (i / overlap))
+    
+    # Right edge
+    if x_start + tile_w < full_w:
+        for j in range(min(overlap, tile_w)):
+            idx = tile_w - 1 - j
+            weight = weight.at[:, idx].set(weight[:, idx] * (j / overlap))
+    
+    # Expand weight to match tile shape [B, H, W, C]
+    weight = weight[None, :, :, None]
+    
+    # Blend into output
+    y_end = y_start + tile_h
+    x_end = x_start + tile_w
+    
+    current = output[:, y_start:y_end, x_start:x_end, :]
+    blended = current + (tile - current) * weight
+    output = output.at[:, y_start:y_end, x_start:x_end, :].set(blended)
+    
+    return output
+
+
+def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler, 
+                       scale_factor=2.0, denoise_strength=0.55, hires_steps=None,
+                       seed=None, interp_mode='cubic', progress=None, progress_start=0.8):
+    """Upscale latents in latent space with refinement denoising.
+    
+    This adds detail at higher resolution by:
+    1. Spatially upscaling the denoised latents
+    2. Adding noise at specified strength
+    3. Running partial denoising to generate new detail
+    
+    Uses tiled processing for memory efficiency on large upscales.
+    
+    Args:
+        latents: Denoised latents [B, H, W, C] in NHWC format
+        prompt_embeds: Text embeddings (list of tensors)
+        model: Transformer model
+        vae: VAE (not used directly, for future encode/decode cycle)
+        vae_config: VAE configuration dict
+        scheduler: FlowMatchEulerDiscreteScheduler
+        scale_factor: Upscale multiplier (1.0-4.0)
+        denoise_strength: How much to re-noise (0.0-1.0, higher = more change)
+        hires_steps: Refinement steps (None = auto based on denoise_strength)
+        seed: Random seed for noise
+        interp_mode: Interpolation mode ('nearest', 'linear', 'cubic')
+        progress: Optional Gradio progress callback
+        progress_start: Progress percentage where latent upscale starts
+        
+    Returns:
+        Upscaled and refined latents [B, H*scale, W*scale, C]
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+    
+    if scale_factor <= 1.0 or denoise_strength <= 0.0:
+        return latents
+    
+    batch_size, h, w, channels = latents.shape
+    new_h = int(h * scale_factor)
+    new_w = int(w * scale_factor)
+    
+    if progress:
+        progress(progress_start, desc=f"Latent upscale: {h}×{w} → {new_h}×{new_w}...")
+    
+    # Step 1: Spatially upscale latents
+    # MLX Upsample expects NHWC format which we already have
+    upsampler = nn.Upsample(scale_factor=scale_factor, mode=interp_mode, align_corners=True)
+    upscaled = upsampler(latents)
+    mx.eval(upscaled)
+    
+    if progress:
+        progress(progress_start + 0.02, desc="Adding noise for refinement...")
+    
+    # Step 2: Determine number of refinement steps
+    if hires_steps is None or hires_steps == 0:
+        # Auto: scale steps based on denoise strength
+        # At strength 1.0, use full steps; at 0.5, use half
+        hires_steps = max(1, int(9 * denoise_strength))  # Base on typical 9 steps
+    
+    # Step 3: Calculate start step based on denoise strength
+    # strength 1.0 = start from full noise (step 0)
+    # strength 0.0 = no denoising (would skip entirely)
+    scheduler.set_timesteps(hires_steps)
+    timesteps = scheduler.timesteps
+    
+    # Start step: strength=1.0 → step 0; strength=0.5 → step halfway
+    start_step = int((1.0 - denoise_strength) * len(timesteps))
+    start_step = max(0, min(start_step, len(timesteps) - 1))
+    
+    # Get timestep for noise level
+    t_start = timesteps[start_step]
+    
+    # Step 4: Generate noise and add to upscaled latents
+    if seed is not None:
+        torch.manual_seed(seed + 1000)  # Offset seed for variety
+    
+    # Generate noise in PyTorch for reproducibility, then convert
+    noise_pt = torch.randn(batch_size, channels, 1, new_h, new_w)
+    noise = mx.array(noise_pt.numpy())
+    noise = noise.squeeze(2).transpose(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+    
+    # Add noise at the calculated timestep
+    # For flow matching: noisy = (1 - t) * clean + t * noise, where t is normalized
+    t_normalized = t_start.item() / 1000.0  # Normalize to [0, 1]
+    noisy_latents = (1.0 - t_normalized) * upscaled + t_normalized * noise
+    mx.eval(noisy_latents)
+    
+    # Step 5: Check if tiling is needed
+    tile_size, overlap = calculate_optimal_tile_size(new_h, new_w, 1.0)  # Already upscaled
+    
+    use_tiling = tile_size is not None and (new_h > tile_size or new_w > tile_size)
+    
+    if use_tiling:
+        if progress:
+            progress(progress_start + 0.05, desc=f"Using tiled processing ({tile_size}×{tile_size} tiles)...")
+        return _latent_upscale_tiled(
+            noisy_latents, prompt_embeds, model, scheduler, timesteps,
+            start_step, new_h, new_w, tile_size, overlap, progress, progress_start
+        )
+    else:
+        # Process full resolution
+        return _latent_denoise_steps(
+            noisy_latents, prompt_embeds, model, scheduler, timesteps,
+            start_step, progress, progress_start
+        )
+
+
+def _latent_denoise_steps(latents, prompt_embeds, model, scheduler, timesteps,
+                          start_step, progress=None, progress_start=0.8):
+    """Run denoising steps on latents.
+    
+    Args:
+        latents: Noisy latents [B, H, W, C] in NHWC format
+        prompt_embeds: Text embeddings
+        model: Transformer model
+        scheduler: Scheduler with timesteps set
+        timesteps: Full timestep schedule
+        start_step: Index to start denoising from
+        progress: Optional progress callback
+        progress_start: Base progress percentage
+        
+    Returns:
+        Denoised latents [B, H, W, C]
+    """
+    import mlx.core as mx
+    
+    remaining_steps = len(timesteps) - start_step
+    
+    for i, t in enumerate(timesteps[start_step:]):
+        step_num = i + 1
+        total_steps = remaining_steps
+        
+        if progress:
+            step_progress = progress_start + 0.1 + (0.08 * (step_num / total_steps))
+            progress(step_progress, desc=f"Hires step {step_num}/{total_steps}...")
+        
+        # Convert latents to model format: [B, H, W, C] -> [B, C, 1, H, W]
+        latents_5d = latents.transpose(0, 3, 1, 2)[:, :, None, :, :]
+        
+        # Timestep in model format
+        t_mx = mx.array([(1000.0 - t.item()) / 1000.0])
+        
+        # Forward pass
+        noise_pred = model(latents_5d, t_mx, prompt_embeds)
+        noise_pred = -noise_pred  # Negate as in main pipeline
+        mx.eval(noise_pred)
+        
+        # Scheduler step (via PyTorch)
+        noise_pred_sq = noise_pred.squeeze(2)  # [B, C, H, W]
+        latents_sq = latents.transpose(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        
+        noise_pred_pt = torch.from_numpy(np.array(noise_pred_sq))
+        latents_pt = torch.from_numpy(np.array(latents_sq))
+        
+        step_output = scheduler.step(noise_pred_pt, t, latents_pt, return_dict=True)
+        
+        # Convert back to MLX NHWC format
+        latents = mx.array(step_output.prev_sample.numpy())
+        latents = latents.transpose(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+    
+    return latents
+
+
+def _latent_upscale_tiled(latents, prompt_embeds, model, scheduler, timesteps,
+                          start_step, full_h, full_w, tile_size, overlap,
+                          progress=None, progress_start=0.8):
+    """Process latent denoising in tiles for memory efficiency.
+    
+    Args:
+        latents: Noisy latents [B, H, W, C]
+        prompt_embeds: Text embeddings
+        model: Transformer model
+        scheduler: Scheduler
+        timesteps: Timestep schedule
+        start_step: Index to start from
+        full_h, full_w: Full latent dimensions
+        tile_size: Size of each tile
+        overlap: Overlap between tiles
+        progress: Optional progress callback
+        progress_start: Base progress percentage
+        
+    Returns:
+        Denoised latents [B, H, W, C]
+    """
+    import mlx.core as mx
+    
+    batch_size = latents.shape[0]
+    channels = latents.shape[3]
+    remaining_steps = len(timesteps) - start_step
+    
+    # Calculate tile positions
+    stride = tile_size - overlap
+    y_positions = list(range(0, full_h - overlap, stride))
+    x_positions = list(range(0, full_w - overlap, stride))
+    
+    # Ensure we cover the full image
+    if y_positions[-1] + tile_size < full_h:
+        y_positions.append(full_h - tile_size)
+    if x_positions[-1] + tile_size < full_w:
+        x_positions.append(full_w - tile_size)
+    
+    total_tiles = len(y_positions) * len(x_positions)
+    
+    # Process each denoising step
+    for step_idx, t in enumerate(timesteps[start_step:]):
+        step_num = step_idx + 1
+        
+        if progress:
+            step_progress = progress_start + 0.1 + (0.08 * (step_num / remaining_steps))
+            progress(step_progress, desc=f"Hires step {step_num}/{remaining_steps} ({total_tiles} tiles)...")
+        
+        # Initialize output for this step
+        output = mx.zeros((batch_size, full_h, full_w, channels))
+        weight_sum = mx.zeros((1, full_h, full_w, 1))
+        
+        # Process each tile
+        for y_idx, y_start in enumerate(y_positions):
+            for x_idx, x_start in enumerate(x_positions):
+                # Calculate actual tile bounds (may be smaller at edges)
+                y_end = min(y_start + tile_size, full_h)
+                x_end = min(x_start + tile_size, full_w)
+                tile_h = y_end - y_start
+                tile_w = x_end - x_start
+                
+                # Extract tile
+                tile = latents[:, y_start:y_end, x_start:x_end, :]
+                
+                # Convert to model format: [B, H, W, C] -> [B, C, 1, H, W]
+                tile_5d = tile.transpose(0, 3, 1, 2)[:, :, None, :, :]
+                
+                # Timestep
+                t_mx = mx.array([(1000.0 - t.item()) / 1000.0])
+                
+                # Forward pass on tile
+                noise_pred = model(tile_5d, t_mx, prompt_embeds)
+                noise_pred = -noise_pred
+                mx.eval(noise_pred)
+                
+                # Scheduler step
+                noise_pred_sq = noise_pred.squeeze(2)
+                tile_sq = tile.transpose(0, 3, 1, 2)
+                
+                noise_pred_pt = torch.from_numpy(np.array(noise_pred_sq))
+                tile_pt = torch.from_numpy(np.array(tile_sq))
+                
+                step_output = scheduler.step(noise_pred_pt, t, tile_pt, return_dict=True)
+                
+                # Convert back to NHWC
+                denoised_tile = mx.array(step_output.prev_sample.numpy())
+                denoised_tile = denoised_tile.transpose(0, 2, 3, 1)
+                
+                # Create blending weights
+                weight = mx.ones((1, tile_h, tile_w, 1))
+                
+                # Apply gradient at overlapping edges
+                if y_start > 0:
+                    for i in range(min(overlap, tile_h)):
+                        alpha = i / overlap
+                        weight = weight.at[:, i, :, :].set(weight[:, i, :, :] * alpha)
+                
+                if x_start > 0:
+                    for j in range(min(overlap, tile_w)):
+                        alpha = j / overlap
+                        weight = weight.at[:, :, j, :].set(weight[:, :, j, :] * alpha)
+                
+                if y_end < full_h:
+                    for i in range(min(overlap, tile_h)):
+                        idx = tile_h - 1 - i
+                        alpha = i / overlap
+                        weight = weight.at[:, idx, :, :].set(weight[:, idx, :, :] * alpha)
+                
+                if x_end < full_w:
+                    for j in range(min(overlap, tile_w)):
+                        idx = tile_w - 1 - j
+                        alpha = j / overlap
+                        weight = weight.at[:, :, idx, :].set(weight[:, :, idx, :] * alpha)
+                
+                # Accumulate weighted tile
+                output = output.at[:, y_start:y_end, x_start:x_end, :].add(denoised_tile * weight)
+                weight_sum = weight_sum.at[:, y_start:y_end, x_start:x_end, :].add(weight)
+        
+        # Normalize by weight sum
+        latents = output / (weight_sum + 1e-8)
+        mx.eval(latents)
+    
+    return latents
+
+
 # Global cache for prompt enhancer model
 _prompt_enhancer = None
 
@@ -2209,14 +2617,22 @@ Respond ONLY with the enhanced prompt, no explanations or preamble."""
     return enhanced
 
 
-def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_configs=None):
+def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_configs=None,
+                 latent_scale=1.0, latent_steps=0, latent_denoise=0.55, latent_interp='cubic'):
     """Generate image using MLX backend
     
     Args:
         lora_configs: Optional list of dicts with 'name' and 'scale' keys for LoRAs to apply
+        latent_scale: Latent space upscale factor (1.0-4.0, 1.0 = no upscale)
+        latent_steps: Hires refinement steps (0 = auto based on denoise strength)
+        latent_denoise: Denoising strength for latent upscale (0.0-1.0)
+        latent_interp: Interpolation mode ('nearest', 'linear', 'cubic')
     """
     import mlx.core as mx
     global _mlx_models, _current_applied_lora
+    
+    # Determine if latent upscaling is enabled
+    do_latent_upscale = latent_scale > 1.0 and latent_denoise > 0.0
     
     # Normalize lora_configs to empty list if None
     if lora_configs is None:
@@ -2332,12 +2748,33 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
         latents = mx.array(step_output.prev_sample.numpy())
         latents = latents[:, :, None, :, :]
     
-    progress(0.85, desc="Decoding image...")
+    # Convert latents to NHWC format for potential latent upscaling and VAE decode
+    latents = latents.squeeze(2)  # [B, C, H, W]
+    latents = latents.transpose(0, 2, 3, 1)  # [B, H, W, C]
     
-    # Decode latents
-    latents = latents.squeeze(2)
-    latents = latents.transpose(0, 2, 3, 1)
+    # Apply latent upscaling if enabled
+    if do_latent_upscale:
+        progress(0.80, desc=f"Latent upscale {latent_scale}× ({latent_interp})...")
+        latents = latent_upscale_mlx(
+            latents=latents,
+            prompt_embeds=prompt_embeds_list,
+            model=model,
+            vae=vae,
+            vae_config=vae_config,
+            scheduler=scheduler,
+            scale_factor=latent_scale,
+            denoise_strength=latent_denoise,
+            hires_steps=latent_steps if latent_steps > 0 else None,
+            seed=seed,
+            interp_mode=latent_interp,
+            progress=progress,
+            progress_start=0.80,
+        )
+        progress(0.92, desc="Decoding upscaled image...")
+    else:
+        progress(0.85, desc="Decoding image...")
     
+    # Decode latents (already in NHWC format)
     scaling_factor = vae_config.get("scaling_factor", 0.3611)
     shift_factor = vae_config.get("shift_factor", 0.1159)
     
@@ -2396,7 +2833,7 @@ def update_aspect_ratios(base_resolution):
     return gr.update(choices=choices, value=choices[0])
 
 
-def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None):
+def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None, latent_scale=None, latent_denoise=None, latent_interp=None):
     """Add a generated image to the gallery"""
     global _image_gallery
     _image_gallery.append({
@@ -2414,6 +2851,9 @@ def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, b
         "lora_configs": lora_configs or [],
         "upscaler": upscaler_name,
         "upscale_factor": upscale_factor,
+        "latent_scale": latent_scale,
+        "latent_denoise": latent_denoise,
+        "latent_interp": latent_interp,
     })
     return [item["image"] for item in _image_gallery]
 
@@ -2445,12 +2885,19 @@ def get_selected_image_info(evt: gr.SelectData):
             lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
             details_lines.append(f"LoRAs: {', '.join(lora_strs)}")
         
-        # Add upscaler info if used
+        # Add latent upscale info if used
+        latent_scale = item.get('latent_scale')
+        if latent_scale and latent_scale > 1.0:
+            latent_denoise = item.get('latent_denoise', 0.55)
+            latent_interp = item.get('latent_interp', 'cubic')
+            details_lines.append(f"Latent Upscale: {latent_scale}× (denoise: {latent_denoise}, {latent_interp})")
+        
+        # Add ESRGAN upscaler info if used
         upscaler = item.get('upscaler')
         if upscaler and upscaler != "None":
             upscale_factor = item.get('upscale_factor')
             scale_str = f"{upscale_factor}×" if upscale_factor else "4×"
-            details_lines.append(f"Upscaler: {upscaler} ({scale_str})")
+            details_lines.append(f"ESRGAN: {upscaler} ({scale_str})")
         
         details_lines.append(f"Index: {evt.index + 1} of {len(_image_gallery)}")
         details = "\n".join(details_lines)
@@ -2487,7 +2934,7 @@ def clear_gallery():
     return [], None, "", "", "", "", 0, ""
 
 
-def create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None):
+def create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None, latent_scale=None, latent_denoise=None, latent_interp=None):
     """Create a metadata string for embedding in images"""
     lines = [
         prompt,
@@ -2506,10 +2953,14 @@ def create_metadata_string(prompt, seed, steps, time_shift, backend, width, heig
         lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
         lines.append(f"LoRAs: {', '.join(lora_strs)}")
     
-    # Add upscaler info if used
+    # Add latent upscale info if used
+    if latent_scale and latent_scale > 1.0:
+        lines.append(f"Latent Upscale: {latent_scale}× (denoise: {latent_denoise}, interp: {latent_interp})")
+    
+    # Add ESRGAN upscaler info if used
     if upscaler_name and upscaler_name != "None":
         scale_str = f"{upscale_factor}×" if upscale_factor else "4×"
-        lines.append(f"Upscaler: {upscaler_name} ({scale_str})")
+        lines.append(f"ESRGAN: {upscaler_name} ({scale_str})")
     
     lines.extend([
         "",
@@ -2520,9 +2971,9 @@ def create_metadata_string(prompt, seed, steps, time_shift, backend, width, heig
     return "\n".join(lines)
 
 
-def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None):
+def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None, latent_scale=None, latent_denoise=None, latent_interp=None):
     """Save image with embedded metadata"""
-    metadata_str = create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs, upscaler_name, upscale_factor)
+    metadata_str = create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs, upscaler_name, upscale_factor, latent_scale, latent_denoise, latent_interp)
     
     if filepath.lower().endswith('.png'):
         # PNG metadata using PngInfo
@@ -2539,8 +2990,13 @@ def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shif
         if lora_configs:
             lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
             png_info.add_text("loras", ", ".join(lora_strs))
+        if latent_scale and latent_scale > 1.0:
+            png_info.add_text("latent_scale", str(latent_scale))
+            png_info.add_text("latent_denoise", str(latent_denoise))
+            png_info.add_text("latent_interp", latent_interp)
         if upscaler_name and upscaler_name != "None":
             png_info.add_text("upscaler", upscaler_name)
+            png_info.add_text("upscale_factor", str(upscale_factor))
         png_info.add_text("generator", "Z-Image-Turbo-MLX")
         png_info.add_text("generator_url", "https://github.com/FiditeNemini/z-image-turbo-mlx")
         pil_image.save(filepath, "PNG", pnginfo=png_info)
@@ -2634,16 +3090,21 @@ def save_selected_or_all(selected_index, png_path, jpg_path, prompt, seed, datas
         return f"BATCH SAVE COMPLETE:\n{result}"
 
 
-def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, lora_configs=None, lora_tags="", upscaler_name="None", upscale_factor=2.0, upscale_steps=0, upscale_denoise=0.55, progress=gr.Progress()):
+def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, 
+                   lora_configs=None, lora_tags="", 
+                   latent_scale=1.0, latent_steps=0, latent_denoise=0.55, latent_interp='cubic',
+                   upscaler_name="None", upscale_factor=2.0, progress=gr.Progress()):
     """Generate an image using selected backend and model
     
     Args:
         lora_configs: List of {"name": str, "scale": float, "trigger": str} dicts
         lora_tags: Pre-built string of LoRA tags to append to prompt
+        latent_scale: Latent upscale factor (1.0-4.0, 1.0 = disabled)
+        latent_steps: Hires refinement steps (0 = auto)
+        latent_denoise: Denoising strength for latent upscale (0.0-1.0)
+        latent_interp: Interpolation mode ('nearest', 'linear', 'cubic')
         upscaler_name: Name of ESRGAN upscaler to use (or "None" to skip)
-        upscale_factor: Scale factor for upscaling (1.0-4.0)
-        upscale_steps: Hires steps (0 = use main steps) - for future latent upscale
-        upscale_denoise: Denoising strength - for future latent upscale
+        upscale_factor: ESRGAN scale factor (1.0-4.0)
     """
     
     if not prompt.strip():
@@ -2671,32 +3132,44 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     else:
         full_prompt = prompt.strip()
     
-    # Determine if upscaling is enabled (affects progress percentages)
+    # Determine if ESRGAN upscaling is enabled
     will_upscale = (upscaler_name and upscaler_name != "None" and 
                     not upscaler_name.startswith("None") and upscale_factor > 1.0)
+    
+    # Determine if latent upscaling is enabled
+    will_latent_upscale = latent_scale > 1.0 and latent_denoise > 0.0
     
     progress(0, desc=f"Loading {model_name}...")
     
     if backend == "MLX (Apple Silicon)":
         # Select the MLX model
         select_mlx_model(model_name)
-        pil_image = generate_mlx(full_prompt, width, height, steps, time_shift, seed, progress, lora_configs=lora_configs)
+        pil_image = generate_mlx(
+            full_prompt, width, height, steps, time_shift, seed, progress, 
+            lora_configs=lora_configs,
+            latent_scale=latent_scale if will_latent_upscale else 1.0,
+            latent_steps=latent_steps,
+            latent_denoise=latent_denoise,
+            latent_interp=latent_interp
+        )
     else:
         # Select the PyTorch model
         select_pytorch_model(model_name)
         if lora_configs:
             print(f"Warning: LoRA support for PyTorch backend not yet implemented")
+        if will_latent_upscale:
+            print(f"Warning: Latent upscaling for PyTorch backend not yet implemented")
         pil_image = generate_pytorch(full_prompt, width, height, steps, time_shift, seed, progress)
     
-    # Apply upscaling if enabled
+    # Apply ESRGAN upscaling if enabled
     if will_upscale:
-        progress(0.88, desc=f"Upscaling {upscale_factor}× with {upscaler_name}...")
+        progress(0.93, desc=f"ESRGAN {upscale_factor}× with {upscaler_name}...")
         original_size = pil_image.size
         pil_image = apply_upscaler(pil_image, upscaler_name, upscale_factor, progress)
         new_size = pil_image.size
-        print(f"Upscaled: {original_size[0]}×{original_size[1]} → {new_size[0]}×{new_size[1]}")
+        print(f"ESRGAN: {original_size[0]}×{original_size[1]} → {new_size[0]}×{new_size[1]}")
     
-    progress(0.95, desc="Saving temporary files...")
+    progress(0.97, desc="Saving temporary files...")
     
     # Generate timestamp-based filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2710,13 +3183,16 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     # Save images with embedded metadata (use final image size after upscaling)
     final_width, final_height = pil_image.size
     actual_upscale_factor = upscale_factor if will_upscale else None
-    save_image_with_metadata(pil_image, png_path, prompt, seed, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor)
-    save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor)
+    actual_latent_scale = latent_scale if will_latent_upscale else None
+    actual_latent_denoise = latent_denoise if will_latent_upscale else None
+    actual_latent_interp = latent_interp if will_latent_upscale else None
+    save_image_with_metadata(pil_image, png_path, prompt, seed, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor, actual_latent_scale, actual_latent_denoise, actual_latent_interp)
+    save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor, actual_latent_scale, actual_latent_denoise, actual_latent_interp)
     
     progress(1.0, desc="Done!")
     
     # Add to gallery with all generation parameters
-    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor)
+    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor, actual_latent_scale, actual_latent_denoise, actual_latent_interp)
     
     return gallery_images, png_path, jpg_path, prompt, seed
 
@@ -2898,10 +3374,49 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                     
                     # Upscaler Section
                     with gr.Accordion("🔍 Upscaling", open=False) as upscaler_accordion:
+                        gr.Markdown("**Latent Upscale** - Adds detail by upscaling in latent space before decoding")
+                        
+                        with gr.Row():
+                            latent_scale = gr.Slider(
+                                minimum=1.0,
+                                maximum=4.0,
+                                value=1.0,
+                                step=0.25,
+                                label="Latent Scale",
+                                info="1.0 = disabled, higher = more detail",
+                            )
+                            latent_interp = gr.Dropdown(
+                                choices=["nearest", "linear", "cubic"],
+                                value="cubic",
+                                label="Interpolation",
+                                info="Upscale method (cubic = smoothest)",
+                            )
+                        
+                        with gr.Row():
+                            latent_steps = gr.Slider(
+                                minimum=0,
+                                maximum=20,
+                                value=0,
+                                step=1,
+                                label="Hires Steps",
+                                info="0 = auto (based on denoise)",
+                            )
+                            latent_denoise = gr.Slider(
+                                minimum=0.0,
+                                maximum=1.0,
+                                value=0.55,
+                                step=0.05,
+                                label="Denoise Strength",
+                                info="Higher = more change/detail",
+                            )
+                        
+                        gr.Markdown("---")
+                        gr.Markdown("**ESRGAN Upscale** - Pixel-space sharpening after generation")
+                        
                         upscaler_dropdown = gr.Dropdown(
                             choices=get_upscaler_choices(),
                             value="None",
-                            label="Upscaler",
+                            label="ESRGAN Model",
                             info="Select an upscaler or 'None' to skip",
                         )
                         
@@ -2910,32 +3425,15 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                                 minimum=1.0,
                                 maximum=4.0,
                                 value=2.0,
-                                step=0.5,
-                                label="Upscale by",
+                                step=0.25,
+                                label="ESRGAN Scale",
                                 info="Scale factor (1× = no upscale)",
-                            )
-                            # Hidden for now - will be used for latent upscaling
-                            upscale_steps = gr.Slider(
-                                minimum=0,
-                                maximum=20,
-                                value=0,
-                                step=1,
-                                label="Hires steps",
-                                visible=False,
-                            )
-                            upscale_denoise = gr.Slider(
-                                minimum=0.0,
-                                maximum=1.0,
-                                value=0.55,
-                                step=0.05,
-                                label="Denoising strength",
-                                visible=False,
                             )
                         
                         if not UPSCALER_AVAILABLE:
-                            gr.Markdown("*⚠️ Upscaler not available. Install PyTorch: `pip install torch`*")
+                            gr.Markdown("*⚠️ ESRGAN not available. Install PyTorch: `pip install torch`*")
                         else:
-                            gr.Markdown("*💡 4x-UltraSharp recommended for best quality.*")
+                            gr.Markdown("*💡 Combine latent upscale + ESRGAN for maximum detail.*")
                     
                     with gr.Row():
                         seed = gr.Slider(
@@ -3226,7 +3724,9 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     )
     
     # Wrapper function to collect LoRA states and generate
-    def generate_with_loras(prompt, base_res, aspect, steps, time_shift, seed, backend, model, upscaler, upscale_by, hires_steps, denoise_strength, *lora_args):
+    def generate_with_loras(prompt, base_res, aspect, steps, time_shift, seed, backend, model, 
+                           lat_scale, lat_interp, lat_steps, lat_denoise,
+                           upscaler, upscale_by, *lora_args):
         """Wrapper that collects LoRA component states and calls generate_image"""
         # lora_args are: enabled1, lora1, trigger1, weight1, enabled2, lora2, trigger2, weight2, ...
         lora_states = []
@@ -3244,11 +3744,16 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         # Build tags string
         lora_tags = build_lora_tags_from_components(lora_states)
         
-        return generate_image(prompt, base_res, aspect, steps, time_shift, seed, backend, model, lora_configs, lora_tags, upscaler, upscale_by, hires_steps, denoise_strength)
+        return generate_image(prompt, base_res, aspect, steps, time_shift, seed, backend, model, 
+                            lora_configs, lora_tags, 
+                            lat_scale, lat_steps, lat_denoise, lat_interp,
+                            upscaler, upscale_by)
     
     generate_btn.click(
         fn=generate_with_loras,
-        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown, upscaler_dropdown, upscale_factor, upscale_steps, upscale_denoise] + all_lora_components,
+        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown, 
+                latent_scale, latent_interp, latent_steps, latent_denoise,
+                upscaler_dropdown, upscale_factor] + all_lora_components,
         outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed],
     ).then(
         fn=lambda: (gr.update(visible=True), None, "", "", "", "", 0, ""),
