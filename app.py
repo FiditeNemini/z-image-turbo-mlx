@@ -28,9 +28,19 @@ import shutil
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
+# Upscaler imports
+try:
+    from upscaler import get_available_upscalers, load_upscaler, upscale_image as upscale_image_esrgan
+    UPSCALER_AVAILABLE = True
+except ImportError:
+    UPSCALER_AVAILABLE = False
+    print("Warning: Upscaler module not available. Install torch to enable upscaling.")
+
 # Global model cache
 _mlx_models = None
 _pytorch_pipe = None
+_upscaler_model = None  # Cached upscaler model
+_current_upscaler_name = None  # Track which upscaler is loaded
 _current_mlx_model_path = None  # Track which MLX model is currently loaded
 _current_pytorch_model_path = None  # Track which PyTorch model is currently loaded
 _current_applied_lora = None  # Track which LoRA is currently applied to the cached model
@@ -52,6 +62,7 @@ PYTORCH_MODEL_PATH = "./models/pytorch/Z-Image-Turbo"  # Default PyTorch model
 MLX_MODEL_PATH = "./models/mlx/Z-Image-Turbo-MLX"  # Default MLX model
 SINGLE_FILE_MODEL_PATH = "./models/single_file"  # For single-file .safetensors models
 LORAS_DIR = "./models/loras"  # LoRA models directory (supports subfolders)
+UPSCALERS_DIR = "./models/upscalers"  # ESRGAN upscaler models directory
 
 # Z-Image-Turbo architecture signature keys
 # These patterns identify Z-Image-Turbo compatible models
@@ -1575,6 +1586,107 @@ def apply_loras_to_model(model, lora_configs, progress=None):
     return applied
 
 
+# --- Upscaler Functions ---
+
+def get_upscaler_choices():
+    """Get list of available upscalers for dropdown.
+    Returns ["None"] plus all supported (ESRGAN/RRDB) upscaler names.
+    """
+    if not UPSCALER_AVAILABLE:
+        return ["None (upscaler not available)"]
+    
+    # Only show supported upscalers (ESRGAN/RRDB architecture)
+    upscalers = get_available_upscalers(Path(UPSCALERS_DIR), filter_supported=True)
+    if not upscalers:
+        return ["None (no supported upscalers found)"]
+    return ["None"] + upscalers
+
+
+def load_cached_upscaler(upscaler_name):
+    """Load and cache an upscaler model.
+    Returns None if upscaler_name is "None" or invalid.
+    """
+    global _upscaler_model, _current_upscaler_name
+    
+    if not UPSCALER_AVAILABLE:
+        return None
+    
+    if upscaler_name == "None" or not upscaler_name or upscaler_name.startswith("None"):
+        _upscaler_model = None
+        _current_upscaler_name = None
+        return None
+    
+    # Check if already loaded
+    if _upscaler_model is not None and _current_upscaler_name == upscaler_name:
+        return _upscaler_model
+    
+    # Load new upscaler
+    try:
+        _upscaler_model = load_upscaler(upscaler_name, Path(UPSCALERS_DIR))
+        _current_upscaler_name = upscaler_name
+        return _upscaler_model
+    except ValueError as e:
+        # Unsupported architecture (e.g., SPAN models)
+        print(f"Warning: {e}")
+        _upscaler_model = None
+        _current_upscaler_name = None
+        return None
+    except Exception as e:
+        print(f"Error loading upscaler {upscaler_name}: {e}")
+        _upscaler_model = None
+        _current_upscaler_name = None
+        return None
+
+
+def apply_upscaler(image, upscaler_name, scale_factor=2.0, progress=None):
+    """Apply upscaler to an image.
+    
+    Args:
+        image: PIL Image to upscale
+        upscaler_name: Name of the upscaler to use (or "None" to skip)
+        scale_factor: Target scale factor (1.0-4.0). ESRGAN does 4x then resizes down.
+        progress: Optional Gradio progress callback
+        
+    Returns:
+        Upscaled PIL Image (or original if upscaler_name is "None" or scale_factor <= 1)
+    """
+    if not UPSCALER_AVAILABLE:
+        return image
+    
+    if upscaler_name == "None" or not upscaler_name or upscaler_name.startswith("None"):
+        return image
+    
+    if scale_factor <= 1.0:
+        return image
+    
+    if progress:
+        progress(desc=f"Loading upscaler: {upscaler_name}...")
+    
+    model = load_cached_upscaler(upscaler_name)
+    if model is None:
+        print(f"Warning: Could not load upscaler {upscaler_name}")
+        return image
+    
+    if progress:
+        progress(desc=f"Upscaling image ({scale_factor}×)...")
+    
+    try:
+        # ESRGAN always does 4x, then we resize to target scale
+        upscaled = upscale_image_esrgan(model, image)
+        
+        # If scale_factor < 4.0, resize down to target
+        if scale_factor < 4.0:
+            orig_w, orig_h = image.size
+            target_w = int(orig_w * scale_factor)
+            target_h = int(orig_h * scale_factor)
+            upscaled = upscaled.resize((target_w, target_h), Image.LANCZOS)
+        
+        return upscaled
+    except Exception as e:
+        print(f"Error upscaling image: {e}")
+        return image
+
+
 # Global cache for prompt enhancer model
 _prompt_enhancer = None
 
@@ -1869,7 +1981,7 @@ def update_aspect_ratios(base_resolution):
     return gr.update(choices=choices, value=choices[0])
 
 
-def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name, lora_configs=None):
+def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None):
     """Add a generated image to the gallery"""
     global _image_gallery
     _image_gallery.append({
@@ -1885,6 +1997,8 @@ def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, b
         "height": height,
         "model_name": model_name,
         "lora_configs": lora_configs or [],
+        "upscaler": upscaler_name,
+        "upscale_factor": upscale_factor,
     })
     return [item["image"] for item in _image_gallery]
 
@@ -1915,6 +2029,13 @@ def get_selected_image_info(evt: gr.SelectData):
         if lora_configs:
             lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
             details_lines.append(f"LoRAs: {', '.join(lora_strs)}")
+        
+        # Add upscaler info if used
+        upscaler = item.get('upscaler')
+        if upscaler and upscaler != "None":
+            upscale_factor = item.get('upscale_factor')
+            scale_str = f"{upscale_factor}×" if upscale_factor else "4×"
+            details_lines.append(f"Upscaler: {upscaler} ({scale_str})")
         
         details_lines.append(f"Index: {evt.index + 1} of {len(_image_gallery)}")
         details = "\n".join(details_lines)
@@ -1951,7 +2072,7 @@ def clear_gallery():
     return [], None, "", "", "", "", 0, ""
 
 
-def create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None):
+def create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None):
     """Create a metadata string for embedding in images"""
     lines = [
         prompt,
@@ -1970,6 +2091,11 @@ def create_metadata_string(prompt, seed, steps, time_shift, backend, width, heig
         lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
         lines.append(f"LoRAs: {', '.join(lora_strs)}")
     
+    # Add upscaler info if used
+    if upscaler_name and upscaler_name != "None":
+        scale_str = f"{upscale_factor}×" if upscale_factor else "4×"
+        lines.append(f"Upscaler: {upscaler_name} ({scale_str})")
+    
     lines.extend([
         "",
         "Generated with Z-Image-Turbo-MLX",
@@ -1979,9 +2105,9 @@ def create_metadata_string(prompt, seed, steps, time_shift, backend, width, heig
     return "\n".join(lines)
 
 
-def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None):
+def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None):
     """Save image with embedded metadata"""
-    metadata_str = create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs)
+    metadata_str = create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs, upscaler_name, upscale_factor)
     
     if filepath.lower().endswith('.png'):
         # PNG metadata using PngInfo
@@ -1998,6 +2124,8 @@ def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shif
         if lora_configs:
             lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
             png_info.add_text("loras", ", ".join(lora_strs))
+        if upscaler_name and upscaler_name != "None":
+            png_info.add_text("upscaler", upscaler_name)
         png_info.add_text("generator", "Z-Image-Turbo-MLX")
         png_info.add_text("generator_url", "https://github.com/FiditeNemini/z-image-turbo-mlx")
         pil_image.save(filepath, "PNG", pnginfo=png_info)
@@ -2091,12 +2219,16 @@ def save_selected_or_all(selected_index, png_path, jpg_path, prompt, seed, datas
         return f"BATCH SAVE COMPLETE:\n{result}"
 
 
-def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, lora_configs=None, lora_tags="", progress=gr.Progress()):
+def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, lora_configs=None, lora_tags="", upscaler_name="None", upscale_factor=2.0, upscale_steps=0, upscale_denoise=0.55, progress=gr.Progress()):
     """Generate an image using selected backend and model
     
     Args:
         lora_configs: List of {"name": str, "scale": float, "trigger": str} dicts
         lora_tags: Pre-built string of LoRA tags to append to prompt
+        upscaler_name: Name of ESRGAN upscaler to use (or "None" to skip)
+        upscale_factor: Scale factor for upscaling (1.0-4.0)
+        upscale_steps: Hires steps (0 = use main steps) - for future latent upscale
+        upscale_denoise: Denoising strength - for future latent upscale
     """
     
     if not prompt.strip():
@@ -2124,6 +2256,10 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     else:
         full_prompt = prompt.strip()
     
+    # Determine if upscaling is enabled (affects progress percentages)
+    will_upscale = (upscaler_name and upscaler_name != "None" and 
+                    not upscaler_name.startswith("None") and upscale_factor > 1.0)
+    
     progress(0, desc=f"Loading {model_name}...")
     
     if backend == "MLX (Apple Silicon)":
@@ -2137,6 +2273,14 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
             print(f"Warning: LoRA support for PyTorch backend not yet implemented")
         pil_image = generate_pytorch(full_prompt, width, height, steps, time_shift, seed, progress)
     
+    # Apply upscaling if enabled
+    if will_upscale:
+        progress(0.88, desc=f"Upscaling {upscale_factor}× with {upscaler_name}...")
+        original_size = pil_image.size
+        pil_image = apply_upscaler(pil_image, upscaler_name, upscale_factor, progress)
+        new_size = pil_image.size
+        print(f"Upscaled: {original_size[0]}×{original_size[1]} → {new_size[0]}×{new_size[1]}")
+    
     progress(0.95, desc="Saving temporary files...")
     
     # Generate timestamp-based filename
@@ -2148,14 +2292,16 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     png_path = os.path.join(TEMP_DIR, f"{timestamp}.png")
     jpg_path = os.path.join(TEMP_DIR, f"{timestamp}.jpg")
     
-    # Save images with embedded metadata
-    save_image_with_metadata(pil_image, png_path, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs)
-    save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs)
+    # Save images with embedded metadata (use final image size after upscaling)
+    final_width, final_height = pil_image.size
+    actual_upscale_factor = upscale_factor if will_upscale else None
+    save_image_with_metadata(pil_image, png_path, prompt, seed, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor)
+    save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor)
     
     progress(1.0, desc="Done!")
     
     # Add to gallery with all generation parameters
-    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name, lora_configs)
+    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor)
     
     return gallery_images, png_path, jpg_path, prompt, seed
 
@@ -2297,6 +2443,46 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         )
                         
                         refresh_loras_btn = gr.Button("🔄 Refresh LoRA List", size="sm")
+                    
+                    # Upscaler Section
+                    with gr.Accordion("🔍 Upscaling", open=False) as upscaler_accordion:
+                        upscaler_dropdown = gr.Dropdown(
+                            choices=get_upscaler_choices(),
+                            value="None",
+                            label="Upscaler",
+                            info="Select an upscaler or 'None' to skip",
+                        )
+                        
+                        with gr.Row():
+                            upscale_factor = gr.Slider(
+                                minimum=1.0,
+                                maximum=4.0,
+                                value=2.0,
+                                step=0.5,
+                                label="Upscale by",
+                                info="Scale factor (1× = no upscale)",
+                            )
+                            upscale_steps = gr.Slider(
+                                minimum=0,
+                                maximum=20,
+                                value=0,
+                                step=1,
+                                label="Hires steps",
+                                info="0 = use main steps (for latent upscale)",
+                            )
+                            upscale_denoise = gr.Slider(
+                                minimum=0.0,
+                                maximum=1.0,
+                                value=0.55,
+                                step=0.05,
+                                label="Denoising strength",
+                                info="For latent upscale method",
+                            )
+                        
+                        if not UPSCALER_AVAILABLE:
+                            gr.Markdown("*⚠️ Upscaler not available. Install PyTorch: `pip install torch`*")
+                        else:
+                            gr.Markdown("*💡 4x-UltraSharp recommended. Steps/Denoise for future latent upscale.*")
                     
                     with gr.Row():
                         seed = gr.Slider(
@@ -2558,7 +2744,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     )
     
     # Wrapper function to collect LoRA states and generate
-    def generate_with_loras(prompt, base_res, aspect, steps, time_shift, seed, backend, model, *lora_args):
+    def generate_with_loras(prompt, base_res, aspect, steps, time_shift, seed, backend, model, upscaler, upscale_by, hires_steps, denoise_strength, *lora_args):
         """Wrapper that collects LoRA component states and calls generate_image"""
         # lora_args are: enabled1, lora1, trigger1, weight1, enabled2, lora2, trigger2, weight2, ...
         lora_states = []
@@ -2576,11 +2762,11 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         # Build tags string
         lora_tags = build_lora_tags_from_components(lora_states)
         
-        return generate_image(prompt, base_res, aspect, steps, time_shift, seed, backend, model, lora_configs, lora_tags)
+        return generate_image(prompt, base_res, aspect, steps, time_shift, seed, backend, model, lora_configs, lora_tags, upscaler, upscale_by, hires_steps, denoise_strength)
     
     generate_btn.click(
         fn=generate_with_loras,
-        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown] + all_lora_components,
+        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown, upscaler_dropdown, upscale_factor, upscale_steps, upscale_denoise] + all_lora_components,
         outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed],
     ).then(
         fn=lambda: (gr.update(visible=True), None, "", "", "", "", 0, ""),

@@ -45,4 +45,68 @@ Add the ability to load and apply LoRA (Low-Rank Adaptation) models to the MLX i
 
 2. **Live Weight Adjustment** - Currently requires model reload to change weights. Layer injection approach would allow live adjustment. **Status: Deferred**
 
-3. **LoRA Training** - Add support for training custom LoRAs. **Status: Not planned**
+3. **LoRA Training** - Add support for training custom LoRAs. **Status: See TRAINING_TODO.md**
+
+---
+
+## Image Upscaling & Refinement
+
+✅ **IMPLEMENTED** - ESRGAN 4× upscaling integrated!
+
+Post-generation image enhancement using ESRGAN-type upscalers. Community-requested feature to improve image quality and resolution.
+
+### Implemented Features
+
+#### ESRGAN Image Upscaler (Option 2 - Recommended)
+- **4× upscaling** using RRDB-Net architecture
+- **MLX-native inference** - runs efficiently on Apple Silicon
+- **Tiled processing** for large images (memory efficient)
+- **Multiple upscaler support** - choose from available models
+
+### Implementation Completed
+
+#### Phase 1: File Structure & Model Support ✅
+- [x] Created `models/upscalers/` directory
+- [x] Added upscaler model loading support (ESRGAN `.pth` format)
+- [x] Implemented MLX-compatible upscaler inference (`src/upscaler.py`)
+- [x] Supports RRDB-Net architecture (23 blocks, 64 features)
+
+#### Phase 2: UI Changes ✅
+- [x] Added "🔍 Upscaling (ESRGAN)" accordion in Generate tab
+- [x] **Upscaler Dropdown**: Select upscaler model (None, 4x-UltraSharp, etc.)
+- [x] Upscaler info displayed in generation details
+
+#### Phase 3: Backend Implementation ✅
+- [x] Created `src/upscaler.py` module with:
+  - `load_upscaler()` - Load ESRGAN-type model
+  - `upscale_image()` - Run image through upscaler
+  - `get_available_upscalers()` - Scan `models/upscalers/` directory
+  - `RRDBNet` - MLX implementation of RRDB network
+- [x] Integrated with generation pipeline (optional post-process step)
+- [x] Updated metadata to include upscaling info
+
+### Available Upscaler Models
+
+| Model | Scale | Best For |
+|-------|-------|----------|
+| 4x-UltraSharp | 4× | ⭐ General upscaling (recommended) |
+| 4x-ClearRealityV1 | 4× | Photorealistic images |
+| 4x-ClearRealityV1_Soft | 4× | Softer/artistic look |
+| 4x_NMKD-Siax_200k | 4× | Anime/illustrations |
+| 4x_NMKD-Superscale-SP_178000_G | 4× | General upscaling |
+
+### Future Enhancements (Optional)
+
+#### Phase 4: Latent Upscale Method
+- [ ] Implement latent space upscaling
+- [ ] Add short refinement sampler pass (Euler/Euler-a)
+- [ ] Allow selection between methods (Image vs Latent upscale)
+
+### Technical Notes
+
+- Upscaler models cached for performance (single load per session)
+- Tiled processing for images larger than 512×512 (configurable)
+- Upscaled image size stored in metadata (final dimensions)
+- Memory: 4× upscale = 16× pixels (e.g., 1024² → 4096²)
+
+### Status: ✅ Completed (ESRGAN method)
