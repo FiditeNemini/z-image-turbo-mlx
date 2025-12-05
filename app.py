@@ -2462,13 +2462,14 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                                 label="Upscale by",
                                 info="Scale factor (1× = no upscale)",
                             )
+                            # Hidden for now - will be used for latent upscaling
                             upscale_steps = gr.Slider(
                                 minimum=0,
                                 maximum=20,
                                 value=0,
                                 step=1,
                                 label="Hires steps",
-                                info="0 = use main steps (for latent upscale)",
+                                visible=False,
                             )
                             upscale_denoise = gr.Slider(
                                 minimum=0.0,
@@ -2476,13 +2477,13 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                                 value=0.55,
                                 step=0.05,
                                 label="Denoising strength",
-                                info="For latent upscale method",
+                                visible=False,
                             )
                         
                         if not UPSCALER_AVAILABLE:
                             gr.Markdown("*⚠️ Upscaler not available. Install PyTorch: `pip install torch`*")
                         else:
-                            gr.Markdown("*💡 4x-UltraSharp recommended. Steps/Denoise for future latent upscale.*")
+                            gr.Markdown("*💡 4x-UltraSharp recommended for best quality.*")
                     
                     with gr.Row():
                         seed = gr.Slider(

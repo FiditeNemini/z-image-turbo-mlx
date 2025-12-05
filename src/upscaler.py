@@ -59,7 +59,7 @@ def is_supported_upscaler(model_path: Path) -> bool:
         model_path: Path to the .pth model file
         
     Returns:
-        True if the model uses a supported architecture (ESRGAN/RRDB or SPAN)
+        True if the model uses a supported architecture (ESRGAN/RRDB only)
     """
     try:
         import torch
@@ -74,7 +74,8 @@ def is_supported_upscaler(model_path: Path) -> bool:
             state_dict = state_dict['model']
         
         architecture = detect_architecture(state_dict)
-        return architecture in ('esrgan', 'esrgan_new', 'span')
+        # Only ESRGAN/RRDB is currently supported
+        return architecture in ('esrgan', 'esrgan_new')
     except Exception:
         return False
 
@@ -266,6 +267,7 @@ class SPAB(nn.Module):
     SPAN Attention Block (SPAB).
     
     Contains 3 Conv3XC layers with attention mechanism.
+    Returns (out, out1, attention) for feature concatenation.
     """
     
     def __init__(self, in_channels: int, mid_channels: int = None):
@@ -277,19 +279,21 @@ class SPAB(nn.Module):
         self.c2_r = Conv3XC(mid_channels, mid_channels)
         self.c3_r = Conv3XC(mid_channels, in_channels)
     
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array) -> Tuple[mx.array, mx.array, mx.array]:
         # Forward through the 3 conv blocks with activations
-        out = nn.silu(self.c1_r(x))
-        out = nn.silu(self.c2_r(out))
-        out = self.c3_r(out)
+        out1 = self.c1_r(x)
+        out1_act = nn.silu(out1)
         
-        # SPAN uses parameter-free attention: sigmoid(out) * out
-        # This is the "Swift Parameter-free Attention"
-        attention = mx.sigmoid(out)
-        out = out * attention
+        out2 = self.c2_r(out1_act)
+        out2_act = nn.silu(out2)
         
-        # Residual connection
-        return out + x
+        out3 = self.c3_r(out2_act)
+        
+        # SPAN attention: sigmoid(out3) - 0.5, then multiply with (out3 + x)
+        sim_att = mx.sigmoid(out3) - 0.5
+        out = (out3 + x) * sim_att
+        
+        return out, out1, sim_att
 
 
 class SPANNet(nn.Module):
@@ -412,6 +416,7 @@ class SPANNetWithPixelShuffle(nn.Module):
     SPAN Network with proper pixel shuffle upsampling.
     
     This version properly handles the upsampling as in the original SPAN.
+    Includes input normalization with ImageNet mean values.
     """
     
     def __init__(
@@ -426,22 +431,25 @@ class SPANNetWithPixelShuffle(nn.Module):
         self.scale = scale
         self.num_feat = num_feat
         self.num_block = num_block
+        self.img_range = 255.0
+        # RGB mean values (ImageNet-ish) - not a parameter, just a constant
+        self._mean = mx.array([0.4488, 0.4371, 0.4040]).reshape(1, 1, 1, 3)
         
         # Initial convolution
         self.conv_1 = Conv3XC(num_in_ch, num_feat)
         
-        # SPAB blocks
+        # SPAB blocks (6 blocks for standard SPAN)
         self.blocks = [SPAB(num_feat) for _ in range(num_block)]
         
         # Final conv before concat
         self.conv_2 = Conv3XC(num_feat, num_feat)
         
-        # Concatenation conv: initial + first_block + last_block + conv_2 = 4 * num_feat
+        # Concatenation conv: out_feature + out_b6 + out_b1 + out_b5_2 = 4 * num_feat
         self.conv_cat = nn.Conv2d(num_feat * 4, num_feat, kernel_size=1, padding=0)
         
         # Upsampler conv - prepares for pixel shuffle
         # For 4x with pixel shuffle: num_feat -> num_out_ch * scale^2
-        # 48 -> 3 * 16 = 48 (convenient!)
+        # 48 -> 3 * 16 = 48
         self.upsampler_conv = nn.Conv2d(num_feat, num_out_ch * scale * scale, kernel_size=3, padding=1)
     
     def pixel_shuffle(self, x: mx.array, scale: int) -> mx.array:
@@ -462,38 +470,42 @@ class SPANNetWithPixelShuffle(nn.Module):
         return x
     
     def __call__(self, x: mx.array) -> mx.array:
-        # Initial conv with SiLU activation
-        out_feature = nn.silu(self.conv_1(x))
+        # Input normalization: (x - mean) * img_range
+        # Input x is in [0, 1], mean is ~0.44
+        x = (x - self._mean) * self.img_range
         
-        # Store features for concatenation
-        features = [out_feature]  # Initial features
+        # Initial conv (no activation here - it's applied inside Conv3XC if needed)
+        out_feature = self.conv_1(x)
         
+        # Run through blocks, collecting intermediate outputs
+        # SPAN concatenates: out_feature, out_b6, out_b1, out_b5_2 (from 2nd-to-last block)
         out = out_feature
+        out_b1 = None  # First block intermediate
+        out_b5_2 = None  # Second-to-last block intermediate (out1)
+        
         for i, block in enumerate(self.blocks):
-            out = block(out)
-            # Store first block output
+            out, out1, _ = block(out)
             if i == 0:
-                features.append(out)
+                out_b1 = out1  # First block's out1
+            if i == self.num_block - 2:  # Second to last block (block_5 in 6-block config)
+                out_b5_2 = out1
         
-        # Last block output
-        features.append(out)
+        out_b6 = out  # Last block output
         
-        # Conv2 output
-        out = self.conv_2(out)
-        features.append(out)
+        # Apply conv_2 to last block output
+        out_b6 = self.conv_2(out_b6)
         
-        # Concatenate all 4 feature maps
-        out = mx.concatenate(features, axis=-1)
+        # Concatenate: [out_feature, out_b6, out_b1, out_b5_2]
+        out = mx.concatenate([out_feature, out_b6, out_b1, out_b5_2], axis=-1)
         
         # 1x1 conv to reduce channels
         out = self.conv_cat(out)
         
-        # Residual with initial features
-        out = out + out_feature
-        
         # Upsample: conv then pixel shuffle
         out = self.upsampler_conv(out)
         out = self.pixel_shuffle(out, self.scale)
+        
+        return out
         
         return out
 
