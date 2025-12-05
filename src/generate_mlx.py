@@ -60,6 +60,8 @@ def main():
                         help='Image width (default: 1024)')
     parser.add_argument('--model_path', type=str, default='../models/mlx_model',
                         help='Path to the MLX model (default: ../models/mlx_model)')
+    parser.add_argument('--cache', type=str, default=None, choices=['slow', 'medium', 'fast'],
+                        help='LeMiCa cache mode for speed: slow (~14%% faster), medium (~22%% faster), fast (~30%% faster)')
     args = parser.parse_args()
 
     print("Loading MLX Models...")
@@ -147,6 +149,13 @@ def main():
     print("Denoising...")
     scheduler.set_timesteps(args.steps)
     timesteps = scheduler.timesteps
+    
+    # Configure LeMiCa caching if enabled
+    if args.cache:
+        model.configure_lemica(args.cache, args.steps)
+        print(f"LeMiCa acceleration: {args.cache} mode")
+    else:
+        model.configure_lemica(None)  # Ensure disabled
     
 
     

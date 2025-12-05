@@ -2618,7 +2618,8 @@ Respond ONLY with the enhanced prompt, no explanations or preamble."""
 
 
 def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_configs=None,
-                 latent_scale=1.0, latent_steps=0, latent_denoise=0.55, latent_interp='cubic'):
+                 latent_scale=1.0, latent_steps=0, latent_denoise=0.55, latent_interp='cubic',
+                 cache_mode=None):
     """Generate image using MLX backend
     
     Args:
@@ -2627,6 +2628,7 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
         latent_steps: Hires refinement steps (0 = auto based on denoise strength)
         latent_denoise: Denoising strength for latent upscale (0.0-1.0)
         latent_interp: Interpolation mode ('nearest', 'linear', 'cubic')
+        cache_mode: LeMiCa cache mode ('slow', 'medium', 'fast') or None to disable
     """
     import mlx.core as mx
     global _mlx_models, _current_applied_lora
@@ -2719,6 +2721,12 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     torch.manual_seed(seed)
     latents_pt = torch.randn(batch_size, num_channels_latents, 1, latent_height, latent_width)
     latents = mx.array(latents_pt.numpy())
+    
+    # Configure LeMiCa caching if enabled
+    if cache_mode and cache_mode.lower() != "none":
+        model.configure_lemica(cache_mode, steps)
+    else:
+        model.configure_lemica(None)
     
     # Denoising loop
     scheduler.set_timesteps(steps)
@@ -3093,7 +3101,7 @@ def save_selected_or_all(selected_index, png_path, jpg_path, prompt, seed, datas
 def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, 
                    lora_configs=None, lora_tags="", 
                    latent_scale=1.0, latent_steps=0, latent_denoise=0.55, latent_interp='cubic',
-                   upscaler_name="None", upscale_factor=2.0, progress=gr.Progress()):
+                   upscaler_name="None", upscale_factor=2.0, cache_mode=None, progress=gr.Progress()):
     """Generate an image using selected backend and model
     
     Args:
@@ -3105,6 +3113,7 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
         latent_interp: Interpolation mode ('nearest', 'linear', 'cubic')
         upscaler_name: Name of ESRGAN upscaler to use (or "None" to skip)
         upscale_factor: ESRGAN scale factor (1.0-4.0)
+        cache_mode: LeMiCa cache mode ('slow', 'medium', 'fast') or None for no caching
     """
     
     if not prompt.strip():
@@ -3150,7 +3159,8 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
             latent_scale=latent_scale if will_latent_upscale else 1.0,
             latent_steps=latent_steps,
             latent_denoise=latent_denoise,
-            latent_interp=latent_interp
+            latent_interp=latent_interp,
+            cache_mode=cache_mode
         )
     else:
         # Select the PyTorch model
@@ -3267,6 +3277,14 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                             step=0.1,
                             label="Time Shift",
                             info="Scheduler shift parameter (default: 3.0)",
+                        )
+                    
+                    with gr.Row():
+                        cache_mode = gr.Dropdown(
+                            choices=["None", "slow", "medium", "fast"],
+                            value="None",
+                            label="⚡ LeMiCa Speed",
+                            info="Cache mode: slow ~14%, medium ~22%, fast ~30% faster",
                         )
                     
                     # LoRA Section - Individual rows with spinners
@@ -3726,7 +3744,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     # Wrapper function to collect LoRA states and generate
     def generate_with_loras(prompt, base_res, aspect, steps, time_shift, seed, backend, model, 
                            lat_scale, lat_interp, lat_steps, lat_denoise,
-                           upscaler, upscale_by, *lora_args):
+                           upscaler, upscale_by, lemica_cache, *lora_args):
         """Wrapper that collects LoRA component states and calls generate_image"""
         # lora_args are: enabled1, lora1, trigger1, weight1, enabled2, lora2, trigger2, weight2, ...
         lora_states = []
@@ -3744,16 +3762,19 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         # Build tags string
         lora_tags = build_lora_tags_from_components(lora_states)
         
+        # Process cache mode
+        cache = lemica_cache if lemica_cache and lemica_cache.lower() != "none" else None
+        
         return generate_image(prompt, base_res, aspect, steps, time_shift, seed, backend, model, 
                             lora_configs, lora_tags, 
                             lat_scale, lat_steps, lat_denoise, lat_interp,
-                            upscaler, upscale_by)
+                            upscaler, upscale_by, cache)
     
     generate_btn.click(
         fn=generate_with_loras,
         inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown, 
                 latent_scale, latent_interp, latent_steps, latent_denoise,
-                upscaler_dropdown, upscale_factor] + all_lora_components,
+                upscaler_dropdown, upscale_factor, cache_mode] + all_lora_components,
         outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed],
     ).then(
         fn=lambda: (gr.update(visible=True), None, "", "", "", "", 0, ""),

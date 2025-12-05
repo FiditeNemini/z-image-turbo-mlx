@@ -7,6 +7,37 @@ import numpy as np
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 
+# LeMiCa cache schedules for 9-step inference
+# Based on https://github.com/UnicomAI/LeMiCa/tree/main/LeMiCa4Z-Image
+LEMICA_SCHEDULES = {
+    "slow": [0, 1, 2, 3, 5, 7, 8],      # 7/9 steps computed (highest quality)
+    "medium": [0, 1, 2, 4, 6, 8],       # 6/9 steps computed (balanced)
+    "fast": [0, 1, 2, 5, 8],            # 5/9 steps computed (fastest)
+}
+
+def get_lemica_bool_list(cache_mode, num_steps=9):
+    """Get boolean list for which steps to fully compute vs use cache.
+    
+    Args:
+        cache_mode: 'slow', 'medium', 'fast', or None for disabled
+        num_steps: Total number of inference steps
+    
+    Returns:
+        List of booleans, True = compute, False = use cache
+        Returns None if cache_mode is None/disabled
+    """
+    if cache_mode is None or cache_mode.lower() == "none":
+        return None
+    
+    cache_key = cache_mode.lower()
+    if cache_key not in LEMICA_SCHEDULES:
+        print(f"Warning: Unknown LeMiCa mode '{cache_mode}', using 'medium'")
+        cache_key = "medium"
+    
+    calc_steps = LEMICA_SCHEDULES[cache_key]
+    bool_list = [i in calc_steps for i in range(num_steps)]
+    return bool_list
+
 class TimestepEmbedder(nn.Module):
     def __init__(self, out_size, mid_size=None, frequency_embedding_size=256):
         super().__init__()
@@ -272,6 +303,12 @@ class ZImageTransformer2DModel(nn.Module):
         self.in_channels = config["in_channels"]
         self.out_channels = config["in_channels"]
         
+        # LeMiCa caching state
+        self.enable_lemica = False
+        self.lemica_bool_list = None
+        self.lemica_step_counter = 0
+        self.lemica_previous_residual = None
+        
         # Embedders
         # all_x_embedder is a dict in PyTorch. We'll implement the one we need.
         # Assuming patch_size=2, f_patch_size=1 for now as per logs/defaults
@@ -311,6 +348,28 @@ class ZImageTransformer2DModel(nn.Module):
         self.t_scale = 1000.0
         self.patch_size = patch_size
         self.f_patch_size = f_patch_size
+    
+    def reset_lemica_state(self):
+        """Reset LeMiCa caching state for a new generation."""
+        self.lemica_step_counter = 0
+        self.lemica_previous_residual = None
+    
+    def configure_lemica(self, cache_mode, num_steps=9):
+        """Configure LeMiCa caching for acceleration.
+        
+        Args:
+            cache_mode: 'slow', 'medium', 'fast', or None to disable
+            num_steps: Number of inference steps
+        """
+        self.reset_lemica_state()
+        if cache_mode is None or cache_mode.lower() == "none":
+            self.enable_lemica = False
+            self.lemica_bool_list = None
+        else:
+            self.enable_lemica = True
+            self.lemica_bool_list = get_lemica_bool_list(cache_mode, num_steps)
+            computed_steps = sum(self.lemica_bool_list) if self.lemica_bool_list else num_steps
+            print(f"LeMiCa enabled: {cache_mode} mode ({computed_steps}/{num_steps} steps computed)")
 
     def create_coordinate_grid(self, size):
         # size: (F, H, W)
@@ -485,9 +544,34 @@ class ZImageTransformer2DModel(nn.Module):
         unified_cos = mx.concatenate([x_cos, cap_cos], axis=1)
         unified_sin = mx.concatenate([x_sin, cap_sin], axis=1)
         
-        # Main Layers
-        for i, layer in enumerate(self.layers):
-            unified = layer(unified, unified_cos, unified_sin, mask=None, adaln_input=t_emb)
+        # Main Layers - with LeMiCa caching
+        if self.enable_lemica and self.lemica_bool_list is not None:
+            # Determine if we should compute or use cache
+            step_idx = self.lemica_step_counter
+            should_compute = self.lemica_bool_list[step_idx] if step_idx < len(self.lemica_bool_list) else True
+            
+            if should_compute:
+                # Full computation - store residual for future cache reuse
+                unified_input = unified
+                for i, layer in enumerate(self.layers):
+                    unified = layer(unified, unified_cos, unified_sin, mask=None, adaln_input=t_emb)
+                # Store residual
+                self.lemica_previous_residual = unified - unified_input
+            else:
+                # Use cached residual instead of full computation
+                if self.lemica_previous_residual is not None:
+                    unified = unified + self.lemica_previous_residual
+                else:
+                    # Fallback to full computation if no cache available
+                    for i, layer in enumerate(self.layers):
+                        unified = layer(unified, unified_cos, unified_sin, mask=None, adaln_input=t_emb)
+            
+            # Increment step counter
+            self.lemica_step_counter += 1
+        else:
+            # Standard computation without caching
+            for i, layer in enumerate(self.layers):
+                unified = layer(unified, unified_cos, unified_sin, mask=None, adaln_input=t_emb)
             
         # Final Layer
         unified = self.final_layer(unified, t_emb)
