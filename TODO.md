@@ -38,6 +38,7 @@ Add the ability to load and apply LoRA (Low-Rank Adaptation) models to the MLX i
 - **Subfolder Organization**: Organize LoRAs in subfolders for better management
 - **ComfyUI Format**: Supports ComfyUI-style LoRAs with `diffusion_model.*` prefix
 - **Runtime Merge**: LoRAs merged into base weights during model reload
+- **LoRA Fusion & Export**: Permanently fuse LoRAs and save as new models in MLX, PyTorch, or ComfyUI formats
 
 ### Future Considerations
 
@@ -61,7 +62,8 @@ Post-generation image enhancement using ESRGAN-type upscalers. Community-request
 - **4× upscaling** using RRDB-Net architecture
 - **MLX-native inference** - runs efficiently on Apple Silicon
 - **Tiled processing** for large images (memory efficient)
-- **Multiple upscaler support** - choose from available models
+- **Multiple upscaler support** - choose from available ESRGAN models
+- **ESRGAN/RRDB only** - SPAN and other architectures filtered from UI
 
 ### Implementation Completed
 

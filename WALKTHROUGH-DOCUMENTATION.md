@@ -217,6 +217,23 @@ Include these trigger words in your prompt for best results:
 
 ⚠️ **Note**: LoRAs are applied when the model loads. Changing LoRA settings requires a model reload (happens automatically when you generate).
 
+#### Saving Fused Models
+
+You can permanently fuse your loaded LoRAs into the base model and save as a new model:
+
+1. **Configure LoRAs**: Enable your desired LoRAs and set weights
+2. **Enter a name**: In the LoRA Settings section, find "Save Fused Model" and enter a model name
+3. **Select formats**: Choose which formats to export:
+   - ☑️ **MLX**: For continued use in this application (`models/mlx/`)
+   - ☑️ **PyTorch**: Diffusers format for sharing (`models/pytorch/`)
+   - ☑️ **ComfyUI**: Single-file checkpoint for ComfyUI (`models/comfyui/`)
+4. **Click Save**: The fused model(s) will be created in the respective directories
+
+**Why fuse LoRAs?**
+- Share your custom model configurations with others
+- Slightly faster inference (no LoRA merge at load time)
+- Use your customized model in other applications (PyTorch/ComfyUI)
+
 ### The Model Settings Tab
 
 This tab lets you manage multiple models.

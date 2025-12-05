@@ -355,6 +355,31 @@ noise_pred = model(latents, t, prompt_embeds)
 
 4. **Quantized Models**: LoRAs can be applied to FP8 quantized models, but the LoRA weights themselves are not quantized.
 
+### LoRA Fusion & Export
+
+The application supports permanently fusing loaded LoRAs into the base model and exporting to multiple formats:
+
+#### Export Formats
+
+| Format | Output Location | Description |
+|--------|-----------------|-------------|
+| **MLX** | `models/mlx/<name>/` | Native Apple Silicon format, ready for inference |
+| **PyTorch** | `models/pytorch/<name>/` | Diffusers-compatible format for sharing/hosting |
+| **ComfyUI** | `models/comfyui/<name>.safetensors` | Single-file checkpoint with QKV fusion |
+
+#### Fusion Process
+
+1. **MLX Export**: Applies LoRA weights directly to MLX base weights and saves
+2. **PyTorch Export**: Loads Diffusers model, applies LoRA weights with key mapping, saves
+3. **ComfyUI Export**: Converts PyTorch weights using `convert_pytorch_to_comfyui.py` utilities
+
+#### Key Mapping for PyTorch Export
+
+LoRA weights use MLX naming conventions and must be mapped to PyTorch:
+- MLX `qkv_proj` → PyTorch separate `q_proj`, `k_proj`, `v_proj` (split by thirds)
+- MLX layer names → PyTorch `model.diffusion_model.` prefix
+- ComfyUI further converts with `diffusion_` prefix and fuses Q, K, V back together
+
 ---
 
 ## Weight Key Mappings

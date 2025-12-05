@@ -13,6 +13,8 @@ Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-
 - **Bit-perfect accuracy**: MLX output matches PyTorch within 1 pixel per channel
 - **Model management**: Support for multiple models and fine-tuned variants
 - **LoRA support**: Apply style and concept customizations with adjustable weights
+- **LoRA fusion**: Permanently fuse LoRAs and export to MLX, PyTorch, or ComfyUI formats
+- **ESRGAN upscaling**: 4x resolution enhancement with RRDB-based models
 - **Gradio UI**: User-friendly web interface for image generation
 
 ## 📚 Documentation
@@ -205,6 +207,18 @@ models/loras/
 | **Live Tags** | See active LoRAs as `<lora:name:weight>` |
 
 > **Note**: Only Z-Image-Turbo compatible LoRAs work. LoRAs trained for SDXL, SD1.5, Flux, etc. are NOT compatible.
+
+### Saving Fused Models
+
+You can permanently fuse loaded LoRAs into the base model and export to multiple formats:
+
+1. Configure your LoRAs with desired weights in the LoRA Settings panel
+2. Enter a name for your fused model
+3. Select output formats:
+   - **MLX**: Ready for use in this app (`models/mlx/`)
+   - **PyTorch**: Diffusers format for sharing (`models/pytorch/`)
+   - **ComfyUI**: Single-file checkpoint (`models/comfyui/`)
+4. Click **Save Fused Model**
 
 ## Project Structure
 

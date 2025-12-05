@@ -1586,6 +1586,421 @@ def apply_loras_to_model(model, lora_configs, progress=None):
     return applied
 
 
+def save_fused_model(model_name, backend, source_model, lora_configs, save_mlx=True, save_pytorch=False, save_comfyui=False, progress=gr.Progress()):
+    """
+    Save a new model with LoRAs fused into the weights.
+    
+    Args:
+        model_name: Name for the new model
+        backend: Current backend ("MLX (Apple Silicon)" or "PyTorch")
+        source_model: Source model name/path
+        lora_configs: List of dicts with 'name' and 'scale' keys
+        save_mlx: Save in MLX format
+        save_pytorch: Save in PyTorch/Diffusers format
+        save_comfyui: Save in ComfyUI single-file format
+        progress: Gradio progress callback
+        
+    Returns:
+        Status message
+    """
+    import mlx.core as mx
+    
+    if not model_name or not model_name.strip():
+        return "❌ Please enter a model name"
+    
+    model_name = model_name.strip()
+    
+    # Validate model name (alphanumeric, hyphens, underscores)
+    import re
+    if not re.match(r'^[\w\-]+$', model_name):
+        return "❌ Model name can only contain letters, numbers, hyphens, and underscores"
+    
+    # Check if any format is selected
+    if not save_mlx and not save_pytorch and not save_comfyui:
+        return "❌ Please select at least one output format"
+    
+    # Check if any LoRAs are selected
+    if not lora_configs:
+        return "❌ No LoRAs selected. Enable at least one LoRA to fuse."
+    
+    # Filter to only enabled LoRAs with non-zero scale
+    active_loras = [c for c in lora_configs if c.get('scale', 0) > 0]
+    if not active_loras:
+        return "❌ No active LoRAs. Enable at least one LoRA with weight > 0."
+    
+    results = []
+    
+    try:
+        # Save MLX format
+        if save_mlx:
+            result = _save_fused_mlx_model(model_name, source_model, active_loras, progress, backend)
+            results.append(result)
+        
+        # Save PyTorch format
+        if save_pytorch:
+            result = _save_fused_pytorch_model(model_name, source_model, active_loras, progress, backend)
+            results.append(result)
+        
+        # Save ComfyUI format
+        if save_comfyui:
+            result = _save_fused_comfyui_model(model_name, source_model, active_loras, progress, backend)
+            results.append(result)
+        
+        return "\n".join(results)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"❌ Error saving model: {str(e)}"
+
+
+def _save_fused_mlx_model(model_name, source_model, lora_configs, progress, backend="MLX (Apple Silicon)"):
+    """Save an MLX model with fused LoRAs."""
+    import mlx.core as mx
+    from safetensors.numpy import save_file
+    from lora import load_lora, apply_lora_to_model
+    
+    # Determine source model path based on backend
+    if backend == "MLX (Apple Silicon)":
+        if source_model and source_model != "Z-Image-Turbo-MLX":
+            source_path = Path(MLX_MODELS_DIR) / source_model
+        else:
+            source_path = Path(MLX_MODEL_PATH)
+    else:
+        # For PyTorch backend, we need to convert from PyTorch to MLX first
+        # For now, use the MLX model path as fallback
+        source_path = Path(MLX_MODEL_PATH)
+    
+    if not source_path.exists():
+        return f"❌ Source model not found: {source_path}"
+    
+    # Create output directory
+    output_path = Path(MLX_MODELS_DIR) / model_name
+    if output_path.exists():
+        return f"❌ Model '{model_name}' already exists. Choose a different name."
+    
+    progress(0.1, desc="Loading source model...")
+    
+    # Load fresh model (don't use cached to avoid modifying it)
+    from z_image_mlx import ZImageTransformer2DModel
+    with open(f"{source_path}/config.json", "r") as f:
+        config = json.load(f)
+    
+    model = ZImageTransformer2DModel(config)
+    weights = mx.load(f"{source_path}/weights.safetensors")
+    
+    # Process weights
+    processed_weights = {}
+    for key, value in weights.items():
+        new_key = map_transformer_key(key)
+        if new_key is None or "pad_token" in (new_key or ""):
+            continue
+        processed_weights[new_key] = value
+    
+    model.load_weights(list(processed_weights.items()), strict=False)
+    
+    progress(0.3, desc="Applying LoRAs...")
+    
+    # Apply each LoRA
+    lora_names = []
+    for i, config_item in enumerate(lora_configs):
+        lora_path = Path(LORAS_DIR) / config_item['name']
+        scale = config_item.get('scale', 1.0)
+        lora_names.append(f"{config_item['name']} ({scale})")
+        
+        progress(0.3 + (0.4 * i / len(lora_configs)), desc=f"Applying: {config_item['name']}...")
+        
+        lora_weights = load_lora(lora_path)
+        apply_lora_to_model(model, lora_weights, scale=scale, verbose=False)
+    
+    progress(0.7, desc="Saving fused weights...")
+    
+    # Create output directory
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Extract and save fused weights
+    fused_weights = {}
+    for name, param in model.named_modules():
+        if hasattr(param, 'weight'):
+            weight = param.weight
+            fused_weights[f"{name}.weight"] = np.array(weight)
+        if hasattr(param, 'bias') and param.bias is not None:
+            bias = param.bias
+            fused_weights[f"{name}.bias"] = np.array(bias)
+    
+    # Save weights
+    save_file(fused_weights, str(output_path / "weights.safetensors"))
+    
+    progress(0.85, desc="Copying config files...")
+    
+    # Copy config files
+    shutil.copy(source_path / "config.json", output_path / "config.json")
+    shutil.copy(source_path / "vae_config.json", output_path / "vae_config.json")
+    shutil.copy(source_path / "vae.safetensors", output_path / "vae.safetensors")
+    shutil.copy(source_path / "text_encoder_config.json", output_path / "text_encoder_config.json")
+    shutil.copy(source_path / "text_encoder.safetensors", output_path / "text_encoder.safetensors")
+    
+    # Copy directories
+    shutil.copytree(source_path / "tokenizer", output_path / "tokenizer")
+    shutil.copytree(source_path / "scheduler", output_path / "scheduler")
+    
+    # Create a metadata file noting the fused LoRAs
+    metadata = {
+        "base_model": str(source_path.name),
+        "fused_loras": lora_names,
+        "created": datetime.now().isoformat(),
+    }
+    with open(output_path / "lora_fusion_info.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    progress(1.0, desc="Done!")
+    
+    lora_list = ", ".join(lora_names)
+    return f"✅ Saved MLX model '{model_name}' with fused LoRAs: {lora_list}"
+
+
+def _save_fused_pytorch_model(model_name, source_model, lora_configs, progress, backend="PyTorch"):
+    """Save a PyTorch model with fused LoRAs."""
+    if not PYTORCH_AVAILABLE:
+        return "❌ PyTorch backend not available"
+    
+    # Determine source model path  
+    if source_model and source_model != "Z-Image-Turbo":
+        source_path = Path(PYTORCH_MODELS_DIR) / source_model
+    else:
+        source_path = Path(PYTORCH_MODEL_PATH)
+    
+    if not source_path.exists():
+        return f"❌ Source model not found: {source_path}"
+    
+    # Create output directory
+    output_path = Path(PYTORCH_MODELS_DIR) / model_name
+    if output_path.exists():
+        return f"❌ Model '{model_name}' already exists. Choose a different name."
+    
+    progress(0.1, desc="Loading source model...")
+    
+    # Load pipeline
+    pipe = ZImagePipeline.from_pretrained(
+        str(source_path),
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=False,
+    )
+    
+    progress(0.3, desc="Applying LoRAs...")
+    
+    # Apply LoRAs to the transformer
+    from lora import load_lora
+    import mlx.core as mx
+    
+    lora_names = []
+    for i, config_item in enumerate(lora_configs):
+        lora_path = Path(LORAS_DIR) / config_item['name']
+        scale = config_item.get('scale', 1.0)
+        lora_names.append(f"{config_item['name']} ({scale})")
+        
+        progress(0.3 + (0.4 * i / len(lora_configs)), desc=f"Applying: {config_item['name']}...")
+        
+        # Load LoRA weights (MLX format)
+        lora_weights = load_lora(lora_path)
+        
+        # Apply to PyTorch model
+        _apply_lora_to_pytorch_model(pipe.transformer, lora_weights, scale)
+    
+    progress(0.7, desc="Saving fused model...")
+    
+    # Save the entire pipeline
+    pipe.save_pretrained(str(output_path))
+    
+    # Create metadata file
+    metadata = {
+        "base_model": str(source_path.name),
+        "fused_loras": lora_names,
+        "created": datetime.now().isoformat(),
+    }
+    with open(output_path / "lora_fusion_info.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    progress(1.0, desc="Done!")
+    
+    lora_list = ", ".join(lora_names)
+    return f"✅ Saved PyTorch model '{model_name}' with fused LoRAs: {lora_list}"
+
+
+def _apply_lora_to_pytorch_model(model, lora_weights, scale=1.0):
+    """Apply MLX LoRA weights to a PyTorch model."""
+    from lora import parse_lora_weights
+    import mlx.core as mx
+    
+    lora_pairs = parse_lora_weights(lora_weights)
+    
+    for model_key, (lora_a, lora_b) in lora_pairs.items():
+        layer_path = model_key.rsplit(".weight", 1)[0]
+        
+        try:
+            # Navigate to the layer in PyTorch model
+            parts = layer_path.split(".")
+            layer = model
+            for part in parts:
+                if part.isdigit():
+                    layer = layer[int(part)]
+                else:
+                    layer = getattr(layer, part)
+            
+            if not hasattr(layer, 'weight'):
+                continue
+            
+            # Convert MLX arrays to numpy then to torch
+            a_np = np.array(lora_a)
+            b_np = np.array(lora_b)
+            
+            # Compute delta: B @ A (with proper dimension handling)
+            if len(a_np.shape) == 2 and len(b_np.shape) == 2:
+                delta_np = b_np @ a_np
+            else:
+                continue
+            
+            # Apply to weight
+            with torch.no_grad():
+                delta_torch = torch.from_numpy(delta_np * scale).to(layer.weight.dtype).to(layer.weight.device)
+                if delta_torch.shape == layer.weight.shape:
+                    layer.weight.add_(delta_torch)
+                    
+        except (AttributeError, IndexError, KeyError):
+            continue
+
+
+def _save_fused_comfyui_model(model_name, source_model, lora_configs, progress, backend="MLX (Apple Silicon)"):
+    """Save a ComfyUI single-file model with fused LoRAs."""
+    if not PYTORCH_AVAILABLE:
+        return "❌ PyTorch required for ComfyUI format"
+    
+    from safetensors.torch import save_file as torch_save_safetensors
+    from convert_pytorch_to_comfyui import (
+        convert_transformer_key_to_comfyui,
+        convert_text_encoder_key_to_comfyui,
+        convert_vae_key_to_comfyui,
+    )
+    
+    # Determine source model path - need PyTorch format for ComfyUI
+    if source_model and source_model != "Z-Image-Turbo":
+        source_path = Path(PYTORCH_MODELS_DIR) / source_model
+    else:
+        source_path = Path(PYTORCH_MODEL_PATH)
+    
+    if not source_path.exists():
+        return f"❌ PyTorch source model not found: {source_path}"
+    
+    # Output to comfyui directory
+    output_dir = Path(MODELS_DIR) / "comfyui"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"{model_name}.safetensors"
+    
+    if output_file.exists():
+        return f"❌ ComfyUI model '{model_name}.safetensors' already exists"
+    
+    progress(0.05, desc="Loading PyTorch model for ComfyUI conversion...")
+    
+    # Load pipeline
+    pipe = ZImagePipeline.from_pretrained(
+        str(source_path),
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=False,
+    )
+    
+    progress(0.15, desc="Applying LoRAs...")
+    
+    # Apply LoRAs to the transformer
+    from lora import load_lora
+    
+    lora_names = []
+    for i, config_item in enumerate(lora_configs):
+        lora_path = Path(LORAS_DIR) / config_item['name']
+        scale = config_item.get('scale', 1.0)
+        lora_names.append(f"{config_item['name']} ({scale})")
+        
+        progress(0.15 + (0.25 * i / len(lora_configs)), desc=f"Applying: {config_item['name']}...")
+        
+        lora_weights = load_lora(lora_path)
+        _apply_lora_to_pytorch_model(pipe.transformer, lora_weights, scale)
+    
+    progress(0.4, desc="Converting transformer weights...")
+    
+    all_weights = {}
+    
+    # Convert transformer weights with QKV fusion
+    transformer = pipe.transformer.state_dict()
+    
+    # Identify Q/K/V groups for fusion
+    qkv_groups = {}
+    other_keys = []
+    
+    for key in transformer.keys():
+        if ".attention.to_q.weight" in key:
+            base_key = key.replace(".to_q.weight", "")
+            if base_key not in qkv_groups:
+                qkv_groups[base_key] = {}
+            qkv_groups[base_key]["q"] = key
+        elif ".attention.to_k.weight" in key:
+            base_key = key.replace(".to_k.weight", "")
+            if base_key not in qkv_groups:
+                qkv_groups[base_key] = {}
+            qkv_groups[base_key]["k"] = key
+        elif ".attention.to_v.weight" in key:
+            base_key = key.replace(".to_v.weight", "")
+            if base_key not in qkv_groups:
+                qkv_groups[base_key] = {}
+            qkv_groups[base_key]["v"] = key
+        else:
+            other_keys.append(key)
+    
+    # Fuse Q, K, V weights
+    for base_key, qkv_keys in qkv_groups.items():
+        if "q" in qkv_keys and "k" in qkv_keys and "v" in qkv_keys:
+            q = transformer[qkv_keys["q"]]
+            k = transformer[qkv_keys["k"]]
+            v = transformer[qkv_keys["v"]]
+            fused = torch.cat([q, k, v], dim=0)
+            comfyui_key = convert_transformer_key_to_comfyui(f"{base_key}.qkv.weight")
+            all_weights[comfyui_key] = fused
+    
+    # Convert other transformer weights
+    for key in other_keys:
+        comfyui_key = convert_transformer_key_to_comfyui(key)
+        all_weights[comfyui_key] = transformer[key]
+    
+    progress(0.6, desc="Converting text encoder weights...")
+    
+    # Convert text encoder weights
+    if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
+        te_state = pipe.text_encoder.state_dict()
+        for key, value in te_state.items():
+            comfyui_key = convert_text_encoder_key_to_comfyui(key)
+            all_weights[comfyui_key] = value
+    
+    progress(0.75, desc="Converting VAE weights...")
+    
+    # Convert VAE weights
+    if hasattr(pipe, 'vae') and pipe.vae is not None:
+        vae_state = pipe.vae.state_dict()
+        for key, value in vae_state.items():
+            comfyui_key = convert_vae_key_to_comfyui(key)
+            all_weights[comfyui_key] = value
+    
+    progress(0.9, desc="Saving ComfyUI checkpoint...")
+    
+    # Save combined checkpoint
+    torch_save_safetensors(all_weights, str(output_file))
+    
+    # Calculate file size
+    file_size = output_file.stat().st_size / (1024 * 1024 * 1024)
+    
+    progress(1.0, desc="Done!")
+    
+    lora_list = ", ".join(lora_names)
+    return f"✅ Saved ComfyUI model '{model_name}.safetensors' ({file_size:.2f}GB) with fused LoRAs: {lora_list}"
+
+
 # --- Upscaler Functions ---
 
 def get_upscaler_choices():
@@ -2443,6 +2858,43 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         )
                         
                         refresh_loras_btn = gr.Button("🔄 Refresh LoRA List", size="sm")
+                        
+                        gr.Markdown("---")
+                        gr.Markdown("**💾 Save Model with Fused LoRAs**")
+                        gr.Markdown("*Create a new model with selected LoRAs permanently baked in.*")
+                        
+                        with gr.Row():
+                            fused_model_name = gr.Textbox(
+                                label="New Model Name",
+                                placeholder="e.g., my-custom-model",
+                                info="Alphanumeric, hyphens, underscores only",
+                                scale=3,
+                            )
+                        
+                        with gr.Row():
+                            save_mlx_checkbox = gr.Checkbox(
+                                label="MLX",
+                                value=True,
+                                info="Apple Silicon",
+                            )
+                            save_pytorch_checkbox = gr.Checkbox(
+                                label="PyTorch",
+                                value=False,
+                                info="Diffusers format",
+                            )
+                            save_comfyui_checkbox = gr.Checkbox(
+                                label="ComfyUI",
+                                value=False,
+                                info="Single .safetensors",
+                            )
+                            save_fused_btn = gr.Button("💾 Save Fused Model", variant="secondary", scale=1)
+                        
+                        fused_model_status = gr.Textbox(
+                            label="Status",
+                            value="",
+                            interactive=False,
+                            visible=True,
+                        )
                     
                     # Upscaler Section
                     with gr.Accordion("🔍 Upscaling", open=False) as upscaler_accordion:
@@ -2742,6 +3194,35 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         fn=lambda: "Refresh the page to see new LoRAs",
         inputs=None,
         outputs=[lora_tags_display],
+    )
+    
+    # Save fused model button
+    def save_fused_with_loras(model_name, backend, source_model, save_mlx, save_pytorch, save_comfyui, *lora_args):
+        """Wrapper that collects LoRA states and saves fused model"""
+        # lora_args are: enabled1, lora1, trigger1, weight1, enabled2, lora2, trigger2, weight2, ...
+        lora_states = []
+        for i in range(0, len(lora_args), 4):
+            if i + 3 < len(lora_args):
+                enabled = lora_args[i]
+                lora_path = lora_args[i + 1]
+                trigger = lora_args[i + 2]
+                weight = lora_args[i + 3]
+                lora_states.append((enabled, lora_path, trigger, weight))
+        
+        # Get enabled LoRA configs
+        lora_configs = get_enabled_loras_from_components(lora_states)
+        
+        return save_fused_model(model_name, backend, source_model, lora_configs, save_mlx, save_pytorch, save_comfyui)
+    
+    save_fused_btn.click(
+        fn=save_fused_with_loras,
+        inputs=[fused_model_name, backend, active_model_dropdown, save_mlx_checkbox, save_pytorch_checkbox, save_comfyui_checkbox] + all_lora_components,
+        outputs=[fused_model_status],
+    ).then(
+        # Refresh model dropdown after saving
+        fn=lambda be: gr.update(choices=get_available_mlx_models()) if be == "MLX (Apple Silicon)" else gr.update(choices=get_available_pytorch_models()),
+        inputs=[backend],
+        outputs=[active_model_dropdown],
     )
     
     # Wrapper function to collect LoRA states and generate
