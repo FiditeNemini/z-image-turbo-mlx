@@ -5,6 +5,8 @@ Supports both MLX (Apple Silicon) and PyTorch backends
 import os
 # Prevent tokenizer parallelism warnings/crashes when forking
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Disable Gradio telemetry/analytics
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "false"
 
 import logging
 from datetime import datetime
