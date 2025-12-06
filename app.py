@@ -3552,8 +3552,46 @@ def _convert_merged_to_comfyui(model_name, mlx_model_path, progress=None):
     return f"✅ ComfyUI: models/comfyui/{model_name}.safetensors ({file_size:.2f}GB)"
 
 
+# Custom CSS for scrollable LoRA list (injected via gr.HTML)
+CUSTOM_CSS = """
+<style>
+#lora-scroll-container {
+    max-height: 400px;
+    overflow-y: auto;
+    border: 1px solid var(--border-color-primary);
+    border-radius: 8px;
+    padding: 8px;
+    margin-bottom: 12px;
+}
+/* Compact checkbox styling */
+.lora-checkbox {
+    min-width: 32px !important;
+    max-width: 32px !important;
+    flex: 0 0 32px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+.lora-checkbox > label {
+    padding: 0 !important;
+    margin: 0 !important;
+    justify-content: center !important;
+}
+.lora-checkbox span.svelte-1w6vloh {
+    display: none !important;
+}
+/* Align row items vertically centered */
+#lora-scroll-container > div > div {
+    display: flex !important;
+    align-items: center !important;
+}
+</style>
+"""
+
 # Create Gradio interface
 with gr.Blocks(title="Z-Image-Turbo") as demo:
+    # Inject custom CSS
+    gr.HTML(CUSTOM_CSS)
     gr.Markdown(
         """
         # 🎨 Z-Image-Turbo
@@ -3639,54 +3677,57 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         # Get initial LoRA data
                         initial_lora_choices = get_lora_choices()
                         
-                        # Create individual LoRA slot rows
+                        # Create individual LoRA slot rows inside a scrollable container
                         lora_rows = []  # Will store (checkbox, lora_path, trigger_textbox, weight) tuples
                         
                         if not initial_lora_choices:
                             gr.Markdown("*No LoRAs found. Place `.safetensors` files in `models/loras/`*")
                         
-                        for i, (display_name, lora_path) in enumerate(initial_lora_choices):
-                            # Get trigger words for this LoRA
-                            trigger = get_lora_trigger_for_path(lora_path)
-                            
-                            with gr.Row():
-                                enabled = gr.Checkbox(
-                                    label="",
-                                    show_label=False,
-                                    value=False,
-                                    min_width=30,
-                                    scale=0,
-                                )
-                                # Hidden state to store the lora path
-                                lora_path_state = gr.State(value=lora_path)
-                                # Display name as static text
-                                gr.Textbox(
-                                    value=display_name,
-                                    label="",
-                                    show_label=False,
-                                    interactive=False,
-                                    scale=3,
-                                )
-                                # Editable trigger words textbox
-                                trigger_textbox = gr.Textbox(
-                                    value=trigger,
-                                    label="",
-                                    show_label=False,
-                                    placeholder="trigger words",
-                                    interactive=True,
-                                    scale=2,
-                                )
-                                weight = gr.Number(
-                                    label="",
-                                    show_label=False,
-                                    value=1.0,
-                                    minimum=0.0,
-                                    maximum=2.0,
-                                    step=0.05,
-                                    scale=1,
-                                    min_width=80,
-                                )
-                                lora_rows.append((enabled, lora_path_state, trigger_textbox, weight))
+                        # Scrollable container for LoRA list (max height with overflow scroll)
+                        with gr.Column(elem_id="lora-scroll-container"):
+                            for i, (display_name, lora_path) in enumerate(initial_lora_choices):
+                                # Get trigger words for this LoRA
+                                trigger = get_lora_trigger_for_path(lora_path)
+                                
+                                with gr.Row():
+                                    enabled = gr.Checkbox(
+                                        label="",
+                                        show_label=False,
+                                        value=False,
+                                        min_width=32,
+                                        scale=0,
+                                        elem_classes=["lora-checkbox"],
+                                    )
+                                    # Hidden state to store the lora path
+                                    lora_path_state = gr.State(value=lora_path)
+                                    # Display name as static text
+                                    gr.Textbox(
+                                        value=display_name,
+                                        label="",
+                                        show_label=False,
+                                        interactive=False,
+                                        scale=3,
+                                    )
+                                    # Editable trigger words textbox
+                                    trigger_textbox = gr.Textbox(
+                                        value=trigger,
+                                        label="",
+                                        show_label=False,
+                                        placeholder="trigger words",
+                                        interactive=True,
+                                        scale=2,
+                                    )
+                                    weight = gr.Number(
+                                        label="",
+                                        show_label=False,
+                                        value=1.0,
+                                        minimum=0.0,
+                                        maximum=2.0,
+                                        step=0.05,
+                                        scale=1,
+                                        min_width=80,
+                                    )
+                                    lora_rows.append((enabled, lora_path_state, trigger_textbox, weight))
                         
                         lora_tags_display = gr.Textbox(
                             label="Applied LoRAs (auto-appended to prompt)",

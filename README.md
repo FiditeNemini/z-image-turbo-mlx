@@ -18,6 +18,9 @@ Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-
 - **Model merging**: Combine multiple models using Weighted Sum or Add Difference methods
 - **Latent upscaling**: Upscale in latent space for enhanced detail before decoding
 - **ESRGAN upscaling**: 4× pixel-space resolution enhancement with RRDB-based models
+- **Random prompt generation**: Auto-generates creative prompts when input is empty
+- **Comprehensive logging**: Detailed logs in `./logs/` for troubleshooting
+- **Scrollable LoRA list**: Browse all installed LoRAs with improved UI
 - **Gradio UI**: User-friendly web interface for image generation
 
 ## 📚 Documentation
@@ -333,6 +336,7 @@ z-image-turbo-mlx/
 │   ├── loras/              # LoRA files (.safetensors)
 │   └── upscalers/          # ESRGAN upscaler models
 ├── debugging/              # Debug & diagnostic tools
+│   └── check_loras_import.py  # Scan and validate LoRA files
 └── requirements.txt
 ```
 
