@@ -156,3 +156,46 @@ Training-free acceleration using residual caching between denoising steps.
 Based on [LeMiCa: Lexicographic Minimax Path Caching](https://github.com/UnicomAI/LeMiCa) (NeurIPS 2025 Spotlight).
 
 ### Status: ✅ Completed
+
+---
+
+## Model Merging
+
+✅ **COMPLETED** - Model merge functionality implemented!
+
+Combine multiple Z-Image-Turbo models using various algorithms.
+
+### Implemented Features
+
+#### Merge Methods
+- **Weighted Sum**: `(1-α)A + αB` for proportional blending
+- **Add Difference**: `A + α(B-C)` for extracting fine-tune changes
+- **Sequential merging** for 3+ models: `((A⊕B)⊕C)⊕D...`
+
+#### Memory Management
+- Auto-detection of available RAM via psutil
+- Chunked processing for systems with <32GB RAM
+- Safe fallback mode when psutil unavailable
+
+#### Model Compatibility
+- FP8 quantized models automatically excluded
+- Base model from Generate tab (with fused LoRAs) as Model A
+- Merged models saved as FP16 precision
+
+### UI Components
+
+| Component | Description |
+|-----------|-------------|
+| Memory Status | Shows RAM and processing mode |
+| Method Dropdown | Weighted Sum / Add Difference |
+| Model Rows | Checkbox + weight slider per model |
+| Model C Selector | For Add Difference (original model) |
+| Output Name | Name for merged model |
+| Progress | Real-time merge status |
+
+### Files
+
+- `src/merge.py`: Core merge algorithms and utilities
+- `app.py`: Merge tab UI and event handlers
+
+### Status: ✅ Completed

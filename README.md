@@ -15,8 +15,12 @@ Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-
 - **Model management**: Support for multiple models and fine-tuned variants
 - **LoRA support**: Apply style and concept customizations with adjustable weights
 - **LoRA fusion**: Permanently fuse LoRAs and export to MLX, PyTorch, or ComfyUI formats
+- **Model merging**: Combine multiple models using Weighted Sum or Add Difference methods
 - **Latent upscaling**: Upscale in latent space for enhanced detail before decoding
 - **ESRGAN upscaling**: 4× pixel-space resolution enhancement with RRDB-based models
+- **Random prompt generation**: Auto-generates creative prompts when input is empty
+- **Comprehensive logging**: Detailed logs in `./logs/` for troubleshooting
+- **Scrollable LoRA list**: Browse all installed LoRAs with improved UI
 - **Gradio UI**: User-friendly web interface for image generation
 
 ## 📚 Documentation
@@ -277,6 +281,40 @@ You can permanently fuse loaded LoRAs into the base model and export to multiple
    - **ComfyUI**: Single-file checkpoint (`models/comfyui/`)
 4. Click **Save Fused Model**
 
+## Model Merging
+
+Combine multiple Z-Image-Turbo models to create novel blends using the **Merge** tab.
+
+### Merge Methods
+
+| Method | Formula | Use Case |
+|--------|---------|----------|
+| **Weighted Sum** | `(1-α)A + αB` | Blend two models proportionally |
+| **Add Difference** | `A + α(B-C)` | Extract fine-tune changes from B relative to C, apply to A |
+
+### Features
+
+- **Sequential merging** for 3+ models: `((A⊕B)⊕C)⊕D...`
+- **Memory-safe mode**: Auto-chunked processing for systems with <32GB RAM
+- **Base model integration**: Uses Generate tab's selected model (with fused LoRAs) as Model A
+- **FP16+ only**: Excludes FP8 quantized models from merging
+
+### Usage
+
+1. Select your base model in the **Generate** tab
+2. Go to the **Merge** tab
+3. Choose a merge method (Weighted Sum or Add Difference)
+4. Enable models to merge and set their weights (0.0-1.0)
+5. For Add Difference: Also select Model C (the original model B was fine-tuned from)
+6. Enter an output model name
+7. Select output formats:
+   - **MLX**: Ready for use in this app (`models/mlx/`)
+   - **PyTorch**: Diffusers format for sharing (`models/pytorch/`)
+   - **ComfyUI**: Single-file checkpoint (`models/comfyui/`)
+8. Click **Merge Models**
+
+The merged model will be saved in the selected format directories and can be used immediately.
+
 ## Project Structure
 
 ```
@@ -290,6 +328,7 @@ z-image-turbo-mlx/
 │   ├── text_encoder.py     # MLX Qwen3-4B encoder
 │   ├── vae.py              # MLX VAE decoder
 │   ├── lora.py             # LoRA loading and application
+│   ├── merge.py            # Model merging algorithms
 │   └── convert_to_mlx.py   # Weight converter
 ├── models/                 # Model weights
 │   ├── mlx/                # MLX-converted models
@@ -297,6 +336,7 @@ z-image-turbo-mlx/
 │   ├── loras/              # LoRA files (.safetensors)
 │   └── upscalers/          # ESRGAN upscaler models
 ├── debugging/              # Debug & diagnostic tools
+│   └── check_loras_import.py  # Scan and validate LoRA files
 └── requirements.txt
 ```
 

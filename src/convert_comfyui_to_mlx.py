@@ -311,7 +311,8 @@ def convert_checkpoint(
         mx.save_safetensors(str(output_dir / "weights.safetensors"), transformer_weights)
         
         # Convert text encoder weights
-        if len(components["text_encoder"]) > 0:
+        has_text_encoder_in_checkpoint = len(components["text_encoder"]) > 0
+        if has_text_encoder_in_checkpoint:
             print("\nConverting text encoder weights...")
             te_weights = {}
             for key in tqdm(components["text_encoder"], desc="Text Encoder"):
@@ -324,6 +325,9 @@ def convert_checkpoint(
             
             print(f"  Converted {len(te_weights)} text encoder weights")
             mx.save_safetensors(str(output_dir / "text_encoder.safetensors"), te_weights)
+        else:
+            # No text encoder in checkpoint - copy from reference model
+            print("\nNo text encoder found in checkpoint, will copy from reference model...")
         
         # NOTE: ComfyUI VAE format uses completely different key naming than MLX
         # (e.g., decoder.mid.block_1 vs decoder.mid_block.layers.0)
@@ -378,6 +382,21 @@ def convert_checkpoint(
     else:
         print("  WARNING: No reference model specified!")
         print("  You'll need to copy vae.safetensors from another MLX model.")
+    
+    # Copy text encoder from reference if not in checkpoint
+    if not has_text_encoder_in_checkpoint:
+        print("\nCopying text encoder from reference model...")
+        if reference_model_path:
+            ref_te = Path(reference_model_path) / "text_encoder.safetensors"
+            if ref_te.exists():
+                shutil.copy(ref_te, output_dir / "text_encoder.safetensors")
+                print(f"  Copied text encoder weights from {ref_te}")
+            else:
+                print("  WARNING: Reference text encoder not found at", ref_te)
+                print("  You'll need to copy text_encoder.safetensors from another MLX model.")
+        else:
+            print("  WARNING: No reference model specified!")
+            print("  You'll need to copy text_encoder.safetensors from another MLX model.")
     
     # Copy tokenizer and scheduler from reference
     if reference_model_path:

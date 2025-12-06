@@ -2,6 +2,32 @@
 Z-Image-Turbo - Gradio Web Interface
 Supports both MLX (Apple Silicon) and PyTorch backends
 """
+import os
+# Prevent tokenizer parallelism warnings/crashes when forking
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import logging
+from datetime import datetime
+from pathlib import Path
+
+# Set up logging
+LOG_DIR = Path("./logs")
+LOG_DIR.mkdir(exist_ok=True)
+log_filename = LOG_DIR / f"z-image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+# Configure logging format
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()  # Also output to console
+    ]
+)
+logger = logging.getLogger("z-image")
+logger.info(f"Z-Image-Turbo starting - log file: {log_filename}")
+
 import gradio as gr
 import torch
 import numpy as np
@@ -12,17 +38,15 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 try:
     from diffusers import ZImagePipeline
     PYTORCH_AVAILABLE = True
+    logger.info("PyTorch/Diffusers backend available")
 except ImportError:
     ZImagePipeline = None
     PYTORCH_AVAILABLE = False
-    print("Warning: ZImagePipeline not available. PyTorch backend disabled.")
-    print("To enable PyTorch, install diffusers >= 0.36.0 or the dev version.")
+    logger.warning("ZImagePipeline not available. PyTorch backend disabled.")
+    logger.warning("To enable PyTorch, install diffusers >= 0.36.0 or the dev version.")
 import json
 import random
 import sys
-import os
-from pathlib import Path
-from datetime import datetime
 import shutil
 
 # Add src to path for imports
@@ -32,9 +56,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 try:
     from upscaler import get_available_upscalers, load_upscaler, upscale_image as upscale_image_esrgan
     UPSCALER_AVAILABLE = True
+    logger.info("ESRGAN upscaler module available")
 except ImportError:
     UPSCALER_AVAILABLE = False
-    print("Warning: Upscaler module not available. Install torch to enable upscaling.")
+    logger.warning("Upscaler module not available. Install torch to enable upscaling.")
 
 # Global model cache
 _mlx_models = None
@@ -1075,12 +1100,16 @@ def load_mlx_models(model_path=None):
         else:
             model_path = MLX_MODEL_PATH
     
+    logger.info(f"LOAD_MLX_MODELS: Requested model path: {model_path}")
+    
     # Check if we need to reload (different model selected)
     if _mlx_models is not None and _current_mlx_model_path == model_path:
+        logger.debug("Using cached MLX models")
         return _mlx_models
     
     # Clear cache if switching models
     if _current_mlx_model_path != model_path:
+        logger.info(f"Switching models: {_current_mlx_model_path} -> {model_path}")
         _mlx_models = None
         _current_mlx_model_path = model_path
         global _current_applied_lora
@@ -1092,6 +1121,7 @@ def load_mlx_models(model_path=None):
     from vae import AutoencoderKL
     from text_encoder import TextEncoder
     
+    logger.info("Loading Transformer model...")
     # Load Transformer
     with open(f"{model_path}/config.json", "r") as f:
         config = json.load(f)
@@ -1101,7 +1131,10 @@ def load_mlx_models(model_path=None):
     # Check if weights are quantized and apply quantization to model if needed
     is_quantized = _is_quantized_weights(weights)
     if is_quantized:
+        logger.info("Model weights are quantized (FP8)")
         nn.quantize(model, group_size=64, bits=8)
+    else:
+        logger.debug("Model weights are FP16")
     
     # Process weights: handle prefixes and key mappings
     # The weights may have:
@@ -1181,8 +1214,10 @@ def load_mlx_models(model_path=None):
     
     text_encoder.load_weights(processed_te_weights, strict=False)
     text_encoder.eval()
+    logger.info("Text encoder loaded")
     
     # Load Tokenizer and Scheduler
+    logger.debug("Loading tokenizer and scheduler...")
     tokenizer = AutoTokenizer.from_pretrained(f"{model_path}/tokenizer", trust_remote_code=True)
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(f"{model_path}/scheduler")
     
@@ -1195,6 +1230,7 @@ def load_mlx_models(model_path=None):
         "scheduler": scheduler,
     }
     
+    logger.info(f"MLX models loaded successfully from {model_path}")
     return _mlx_models
 
 
@@ -2260,10 +2296,14 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
     import mlx.core as mx
     import mlx.nn as nn
     
+    logger.info(f"LATENT_UPSCALE: Starting with scale={scale_factor}, denoise={denoise_strength}")
+    
     if scale_factor <= 1.0 or denoise_strength <= 0.0:
+        logger.debug("Latent upscale skipped (scale <= 1.0 or denoise <= 0.0)")
         return latents
     
     batch_size, h, w, channels = latents.shape
+    logger.debug(f"Input latents shape: {latents.shape}")
     
     # Calculate target dimensions, ensuring divisibility by 2 (patch size)
     # This is required for the transformer's patchify operation
@@ -2273,6 +2313,7 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
     # Round up to nearest multiple of patch_size
     new_h = ((new_h + patch_size - 1) // patch_size) * patch_size
     new_w = ((new_w + patch_size - 1) // patch_size) * patch_size
+    logger.info(f"Upscaling latents: {h}x{w} → {new_h}x{new_w}")
     
     if progress:
         progress(progress_start, desc=f"Latent upscale: {h}×{w} → {new_h}×{new_w}...")
@@ -2281,12 +2322,15 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
     # Calculate exact scale factors needed for the target dimensions
     h_scale = new_h / h
     w_scale = new_w / w
+    logger.debug(f"Upscale factors: h={h_scale:.2f}, w={w_scale:.2f}")
     
     # Use nn.Upsample with tuple scale factors for asymmetric scaling if needed
     mode = "cubic" if interp_mode == "cubic" else ("linear" if interp_mode == "linear" else "nearest")
+    logger.debug(f"Upsampling with mode={mode}")
     upsampler = nn.Upsample(scale_factor=(h_scale, w_scale), mode=mode, align_corners=True)
     upscaled = upsampler(latents)
     mx.eval(upscaled)
+    logger.debug(f"Upsampled latents shape: {upscaled.shape}")
     
     if progress:
         progress(progress_start + 0.02, desc="Adding noise for refinement...")
@@ -2297,6 +2341,8 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
         # At strength 1.0, use full steps; at 0.5, use half
         hires_steps = max(1, int(9 * denoise_strength))  # Base on typical 9 steps
     
+    logger.info(f"Hires refinement: {hires_steps} steps, denoise strength={denoise_strength}")
+    
     # Step 3: Calculate start step based on denoise strength
     # strength 1.0 = start from full noise (step 0)
     # strength 0.0 = no denoising (would skip entirely)
@@ -2306,15 +2352,18 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
     # Start step: strength=1.0 → step 0; strength=0.5 → step halfway
     start_step = int((1.0 - denoise_strength) * len(timesteps))
     start_step = max(0, min(start_step, len(timesteps) - 1))
+    logger.debug(f"Start step: {start_step}, total timesteps: {len(timesteps)}")
     
     # Get timestep for noise level
     t_start = timesteps[start_step]
+    logger.debug(f"Start timestep value: {t_start.item()}")
     
     # Step 4: Generate noise and add to upscaled latents
     if seed is not None:
         torch.manual_seed(seed + 1000)  # Offset seed for variety
     
     # Generate noise in PyTorch for reproducibility, then convert
+    logger.debug("Generating noise for refinement...")
     noise_pt = torch.randn(batch_size, channels, 1, new_h, new_w)
     noise = mx.array(noise_pt.numpy())
     noise = noise.squeeze(2).transpose(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
@@ -2324,21 +2373,25 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
     t_normalized = t_start.item() / 1000.0  # Normalize to [0, 1]
     noisy_latents = (1.0 - t_normalized) * upscaled + t_normalized * noise
     mx.eval(noisy_latents)
+    logger.debug(f"Noisy latents created, t_normalized={t_normalized:.4f}")
     
     # Step 5: Check if tiling is needed
     tile_size, overlap = calculate_optimal_tile_size(new_h, new_w, 1.0)  # Already upscaled
     
     use_tiling = tile_size is not None and (new_h > tile_size or new_w > tile_size)
+    logger.info(f"Tiling: {'enabled' if use_tiling else 'disabled'} (tile_size={tile_size}, overlap={overlap})")
     
     if use_tiling:
         if progress:
             progress(progress_start + 0.05, desc=f"Using tiled processing ({tile_size}×{tile_size} tiles)...")
+        logger.info(f"Starting tiled denoising with {tile_size}x{tile_size} tiles")
         return _latent_upscale_tiled(
             noisy_latents, prompt_embeds, model, scheduler, timesteps,
             start_step, new_h, new_w, tile_size, overlap, progress, progress_start
         )
     else:
         # Process full resolution
+        logger.info("Starting full-resolution denoising")
         return _latent_denoise_steps(
             noisy_latents, prompt_embeds, model, scheduler, timesteps,
             start_step, progress, progress_start
@@ -2365,6 +2418,11 @@ def _latent_denoise_steps(latents, prompt_embeds, model, scheduler, timesteps,
     import mlx.core as mx
     
     remaining_steps = len(timesteps) - start_step
+    logger.info(f"DENOISE_STEPS: Starting {remaining_steps} hires steps from step {start_step}")
+    logger.debug(f"Input latents shape: {latents.shape}")
+    
+    # Ensure LeMiCa is fully disabled for hires pass
+    model.reset_lemica_state()
     
     for i, t in enumerate(timesteps[start_step:]):
         step_num = i + 1
@@ -2374,6 +2432,8 @@ def _latent_denoise_steps(latents, prompt_embeds, model, scheduler, timesteps,
             step_progress = progress_start + 0.1 + (0.08 * (step_num / total_steps))
             progress(step_progress, desc=f"Hires step {step_num}/{total_steps}...")
         
+        logger.debug(f"Hires step {step_num}/{total_steps} (t={t.item():.1f})")
+        
         # Convert latents to model format: [B, H, W, C] -> [B, C, 1, H, W]
         latents_5d = latents.transpose(0, 3, 1, 2)[:, :, None, :, :]
         
@@ -2381,9 +2441,11 @@ def _latent_denoise_steps(latents, prompt_embeds, model, scheduler, timesteps,
         t_mx = mx.array([(1000.0 - t.item()) / 1000.0])
         
         # Forward pass
+        logger.debug(f"  Forward pass starting...")
         noise_pred = model(latents_5d, t_mx, prompt_embeds)
         noise_pred = -noise_pred  # Negate as in main pipeline
         mx.eval(noise_pred)
+        logger.debug(f"  Forward pass completed")
         
         # Scheduler step (via PyTorch)
         noise_pred_sq = noise_pred.squeeze(2)  # [B, C, H, W]
@@ -2397,6 +2459,8 @@ def _latent_denoise_steps(latents, prompt_embeds, model, scheduler, timesteps,
         # Convert back to MLX NHWC format
         latents = mx.array(step_output.prev_sample.numpy())
         latents = latents.transpose(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+    
+    logger.info("DENOISE_STEPS: Completed all hires steps")
     
     return latents
 
@@ -2538,7 +2602,10 @@ def load_prompt_enhancer():
     global _prompt_enhancer
     
     if _prompt_enhancer is not None:
+        logger.debug("Using cached prompt enhancer model")
         return _prompt_enhancer
+    
+    logger.info("Loading prompt enhancer model...")
     
     try:
         from mlx_lm import load
@@ -2549,9 +2616,11 @@ def load_prompt_enhancer():
     
     # Check if local model exists
     if enhancer_path.exists() and (enhancer_path / "config.json").exists():
+        logger.debug(f"Loading from local path: {enhancer_path}")
         model, tokenizer = load(str(enhancer_path))
     else:
         # Download and save locally
+        logger.info(f"Downloading prompt enhancer: {PROMPT_ENHANCER_MODEL}")
         from huggingface_hub import snapshot_download
         
         # Download to local path
@@ -2565,14 +2634,31 @@ def load_prompt_enhancer():
         model, tokenizer = load(str(enhancer_path))
     
     _prompt_enhancer = (model, tokenizer)
+    logger.info("Prompt enhancer model loaded")
     return _prompt_enhancer
+
+
+def unload_prompt_enhancer():
+    """Unload prompt enhancer model to free memory for image generation."""
+    global _prompt_enhancer
+    import gc
+    import mlx.core as mx
+    
+    if _prompt_enhancer is not None:
+        logger.info("Unloading prompt enhancer model to free memory")
+        _prompt_enhancer = None
+        gc.collect()
+        mx.metal.clear_cache()
+        logger.debug("Prompt enhancer unloaded and memory cleared")
 
 
 def enhance_prompt(prompt, progress=gr.Progress()):
     """Use MLX-LM to enhance the user's prompt with a small local model"""
+    logger.info(f"ENHANCE_PROMPT: Starting with prompt: {prompt[:50]}..." if len(prompt) > 50 else f"ENHANCE_PROMPT: Starting with prompt: {prompt}")
     
+    # If no prompt provided, generate a random one first
     if not prompt.strip():
-        raise gr.Error("Please enter a prompt to enhance")
+        prompt = generate_random_prompt(progress)
     
     progress(0.1, desc="Loading language model...")
     
@@ -2627,10 +2713,77 @@ Respond ONLY with the enhanced prompt, no explanations or preamble."""
     
     progress(1.0, desc="Done!")
     
-    # Clean up
+    # Clean up and unload model to free memory
     enhanced = enhanced.strip()
+    unload_prompt_enhancer()
     
     return enhanced
+
+
+def generate_random_prompt(progress=gr.Progress()):
+    """Generate a random creative image prompt using the prompt enhancer model"""
+    
+    progress(0.1, desc="Loading language model...")
+    
+    try:
+        from mlx_lm import generate
+    except ImportError:
+        raise gr.Error("mlx-lm not installed. Run: pip install mlx-lm")
+    
+    progress(0.2, desc="Loading prompt enhancer...")
+    
+    model, tokenizer = load_prompt_enhancer()
+    
+    progress(0.4, desc="Generating random prompt idea...")
+    
+    # System prompt for random generation
+    system_prompt = """You are a creative artist who generates unique and interesting image prompts.
+Generate a single, detailed image prompt that would make a visually striking photograph or artwork.
+Be creative and varied - include subjects like landscapes, portraits, still life, abstract art, 
+sci-fi scenes, fantasy, architecture, nature, or anything visually interesting.
+
+Include specific details about:
+- The main subject
+- Lighting and atmosphere  
+- Colors and mood
+- Composition or style
+
+Keep it under 80 words. Respond ONLY with the prompt, no explanations."""
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Generate a unique and creative image prompt for me."}
+    ]
+    
+    prompt_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    
+    progress(0.6, desc="Creating prompt...")
+    
+    # Create sampler with higher temperature for creativity
+    from mlx_lm.sample_utils import make_sampler
+    sampler = make_sampler(temp=0.9)
+    
+    # Generate
+    random_prompt = generate(
+        model,
+        tokenizer,
+        prompt=prompt_text,
+        max_tokens=150,
+        sampler=sampler,
+        verbose=False,
+    )
+    
+    progress(1.0, desc="Done!")
+    
+    # Clean up and unload model to free memory for image generation
+    random_prompt = random_prompt.strip()
+    unload_prompt_enhancer()
+    
+    return random_prompt
 
 
 def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_configs=None,
@@ -2649,8 +2802,17 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     import mlx.core as mx
     global _mlx_models, _current_applied_lora
     
+    logger.info("=" * 60)
+    logger.info("GENERATE_MLX: Starting image generation")
+    logger.info(f"  Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
+    logger.info(f"  Size: {width}x{height}, Steps: {steps}, Time shift: {time_shift}, Seed: {seed}")
+    logger.info(f"  Cache mode: {cache_mode}")
+    logger.info(f"  Latent upscale: {latent_scale}x, denoise: {latent_denoise}, steps: {latent_steps}, interp: {latent_interp}")
+    logger.info(f"  LoRA configs: {lora_configs}")
+    
     # Determine if latent upscaling is enabled
     do_latent_upscale = latent_scale > 1.0 and latent_denoise > 0.0
+    logger.debug(f"  Latent upscale enabled: {do_latent_upscale}")
     
     # Normalize lora_configs to empty list if None
     if lora_configs is None:
@@ -2721,8 +2883,10 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     attention_mask = mx.array(text_inputs["attention_mask"])
     
     # Text encoder forward
+    logger.debug("Running text encoder forward pass...")
     prompt_embeds = text_encoder(input_ids, attention_mask=attention_mask)
     prompt_embeds_list = [prompt_embeds[i] for i in range(len(prompt_embeds))]
+    logger.debug(f"Text embeddings shape: {prompt_embeds.shape}")
     
     progress(0.2, desc="Preparing latents...")
     
@@ -2732,6 +2896,7 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     vae_scale_factor = 8
     latent_height = 2 * (height // (vae_scale_factor * 2))
     latent_width = 2 * (width // (vae_scale_factor * 2))
+    logger.debug(f"Latent dimensions: {latent_height}x{latent_width}")
     
     # Use PyTorch for reproducible random
     torch.manual_seed(seed)
@@ -2741,8 +2906,10 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     # Configure LeMiCa caching if enabled
     if cache_mode and cache_mode.lower() != "none":
         model.configure_lemica(cache_mode, steps)
+        logger.info(f"LeMiCa caching enabled: {cache_mode} mode")
     else:
         model.configure_lemica(None)
+        logger.debug("LeMiCa caching disabled")
     
     # Reset LeMiCa state for this generation (ensures counter starts at 0)
     model.reset_lemica_state()
@@ -2750,9 +2917,11 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     # Denoising loop
     scheduler.set_timesteps(steps)
     timesteps = scheduler.timesteps
+    logger.info(f"Starting denoising loop: {steps} steps")
     
     for i, t in enumerate(timesteps):
         progress(0.2 + 0.6 * (i / len(timesteps)), desc=f"Denoising step {i+1}/{steps}...")
+        logger.debug(f"Denoising step {i+1}/{steps}, timestep={t.item():.2f}")
         
         # Timestep
         t_mx = mx.array([(1000.0 - t.item()) / 1000.0])
@@ -2775,6 +2944,8 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
         latents = mx.array(step_output.prev_sample.numpy())
         latents = latents[:, :, None, :, :]
     
+    logger.info("Denoising loop completed")
+    
     # Convert latents to NHWC format for potential latent upscaling and VAE decode
     latents = latents.squeeze(2)  # [B, C, H, W]
     latents = latents.transpose(0, 2, 3, 1)  # [B, H, W, C]
@@ -2783,7 +2954,10 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     if do_latent_upscale:
         # Disable LeMiCa during hires refinement - the cached residuals from base generation
         # are not valid for the upscaled latent space
+        logger.info(f"Starting latent upscale: {latent_scale}x, denoise={latent_denoise}, interp={latent_interp}")
         model.configure_lemica(None)
+        model.reset_lemica_state()  # Extra reset to ensure clean state
+        logger.debug("LeMiCa disabled and state reset for latent upscale")
         
         progress(0.80, desc=f"Latent upscale {latent_scale}× ({latent_interp})...")
         latents = latent_upscale_mlx(
@@ -3139,8 +3313,21 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
         cache_mode: LeMiCa cache mode ('slow', 'medium', 'fast') or None for no caching
     """
     
+    logger.info("=" * 60)
+    logger.info("GENERATE_IMAGE: New generation request")
+    logger.info(f"  Backend: {backend}, Model: {model_name}")
+    logger.info(f"  Resolution: {base_resolution}, Aspect: {aspect_ratio}")
+    logger.info(f"  Steps: {steps}, Time shift: {time_shift}, Seed: {seed}")
+    logger.info(f"  Cache mode: {cache_mode}")
+    logger.info(f"  Latent upscale: {latent_scale}x, steps={latent_steps}, denoise={latent_denoise}")
+    logger.info(f"  ESRGAN upscaler: {upscaler_name}, factor={upscale_factor}")
+    
+    # If no prompt provided, generate a random one using the prompt enhancer
     if not prompt.strip():
-        raise gr.Error("Please enter a prompt")
+        logger.info("No prompt provided - generating random prompt...")
+        progress(0, desc="No prompt provided - generating a random idea...")
+        prompt = generate_random_prompt(progress)
+        logger.info(f"Generated random prompt: {prompt}")
     
     if not model_name:
         raise gr.Error(f"No model selected for {backend}")
@@ -3196,11 +3383,12 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     
     # Apply ESRGAN upscaling if enabled
     if will_upscale:
+        logger.info(f"Applying ESRGAN upscale: {upscaler_name} at {upscale_factor}x")
         progress(0.93, desc=f"ESRGAN {upscale_factor}× with {upscaler_name}...")
         original_size = pil_image.size
         pil_image = apply_upscaler(pil_image, upscaler_name, upscale_factor, progress)
         new_size = pil_image.size
-        print(f"ESRGAN: {original_size[0]}×{original_size[1]} → {new_size[0]}×{new_size[1]}")
+        logger.info(f"ESRGAN complete: {original_size[0]}×{original_size[1]} → {new_size[0]}×{new_size[1]}")
     
     progress(0.97, desc="Saving temporary files...")
     
@@ -3223,15 +3411,187 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor, actual_latent_scale, actual_latent_denoise, actual_latent_interp)
     
     progress(1.0, desc="Done!")
+    logger.info(f"Generation complete! Final size: {final_width}x{final_height}")
+    logger.info(f"Saved to: {png_path}")
+    logger.info("=" * 60)
     
     # Add to gallery with all generation parameters
     gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor, actual_latent_scale, actual_latent_denoise, actual_latent_interp)
     
-    return gallery_images, png_path, jpg_path, prompt, seed
+    # Return: gallery, png_path, jpg_path, stored_prompt, stored_seed, prompt_textbox
+    return gallery_images, png_path, jpg_path, prompt, seed, prompt
 
+
+# --- Merge Tab Helper Functions ---
+
+def get_merge_model_choices(backend="MLX (Apple Silicon)"):
+    """Get list of models available for merging (excluding FP8 quantized).
+    
+    Args:
+        backend: "MLX (Apple Silicon)" or "PyTorch"
+        
+    Returns:
+        List of model names compatible with merging
+    """
+    if backend == "MLX (Apple Silicon)":
+        from merge import get_available_merge_models
+        models = get_available_merge_models(Path(MLX_MODELS_DIR), exclude_quantized=True)
+        return [name for name, is_compat in models if is_compat]
+    else:
+        # PyTorch models - return all available (no quantization check needed)
+        return get_available_pytorch_models()
+
+
+def _convert_merged_to_pytorch(model_name, mlx_model_path, progress=None):
+    """Convert a merged MLX model to PyTorch/Diffusers format."""
+    from convert_mlx_to_pytorch import convert_mlx_to_pytorch
+    
+    mlx_model_path = Path(mlx_model_path)
+    pytorch_output_path = Path(PYTORCH_MODELS_DIR) / model_name
+    
+    if pytorch_output_path.exists():
+        return f"❌ PyTorch model '{model_name}' already exists"
+    
+    try:
+        convert_mlx_to_pytorch(str(mlx_model_path), str(pytorch_output_path))
+        return f"✅ PyTorch: models/pytorch/{model_name}/"
+    except Exception as e:
+        return f"❌ PyTorch conversion failed: {str(e)}"
+
+
+def _convert_merged_to_comfyui(model_name, mlx_model_path, progress=None):
+    """Convert a merged MLX model to ComfyUI single-file format."""
+    from safetensors.torch import save_file as torch_save_safetensors
+    from convert_pytorch_to_comfyui import (
+        convert_transformer_key_to_comfyui,
+        convert_text_encoder_key_to_comfyui,
+        convert_vae_key_to_comfyui,
+    )
+    import mlx.core as mx
+    import torch
+    import numpy as np
+    
+    mlx_model_path = Path(mlx_model_path)
+    comfyui_dir = Path(MODELS_DIR) / "comfyui"
+    comfyui_dir.mkdir(parents=True, exist_ok=True)
+    output_file = comfyui_dir / f"{model_name}.safetensors"
+    
+    if output_file.exists():
+        return f"❌ ComfyUI model '{model_name}.safetensors' already exists"
+    
+    all_weights = {}
+    
+    # Load and convert transformer weights
+    transformer_weights = mx.load(str(mlx_model_path / "weights.safetensors"))
+    
+    # Identify Q/K/V groups for fusion
+    qkv_groups = {}
+    other_keys = []
+    
+    for key in transformer_weights.keys():
+        # Skip quantization artifacts
+        if key.endswith('.scales') or key.endswith('.biases'):
+            continue
+            
+        if '.attention.to_q.' in key:
+            base = key.replace('.attention.to_q.', '.attention.')
+            if base not in qkv_groups:
+                qkv_groups[base] = {}
+            qkv_groups[base]['q'] = key
+        elif '.attention.to_k.' in key:
+            base = key.replace('.attention.to_k.', '.attention.')
+            if base not in qkv_groups:
+                qkv_groups[base] = {}
+            qkv_groups[base]['k'] = key
+        elif '.attention.to_v.' in key:
+            base = key.replace('.attention.to_v.', '.attention.')
+            if base not in qkv_groups:
+                qkv_groups[base] = {}
+            qkv_groups[base]['v'] = key
+        else:
+            other_keys.append(key)
+    
+    # Fuse Q, K, V weights
+    for base_key, qkv_keys in qkv_groups.items():
+        if 'q' in qkv_keys and 'k' in qkv_keys and 'v' in qkv_keys:
+            q = np.array(transformer_weights[qkv_keys['q']])
+            k = np.array(transformer_weights[qkv_keys['k']])
+            v = np.array(transformer_weights[qkv_keys['v']])
+            fused = np.concatenate([q, k, v], axis=0)
+            
+            comfyui_key = convert_transformer_key_to_comfyui(base_key.replace('.attention.', '.attention.qkv.'))
+            all_weights[comfyui_key] = torch.from_numpy(fused)
+    
+    # Convert other transformer weights
+    for key in other_keys:
+        comfyui_key = convert_transformer_key_to_comfyui(key)
+        all_weights[comfyui_key] = torch.from_numpy(np.array(transformer_weights[key]))
+    
+    # Load and convert text encoder weights
+    te_weights_path = mlx_model_path / "text_encoder.safetensors"
+    if te_weights_path.exists():
+        te_weights = mx.load(str(te_weights_path))
+        for key, value in te_weights.items():
+            comfyui_key = convert_text_encoder_key_to_comfyui(key)
+            all_weights[comfyui_key] = torch.from_numpy(np.array(value))
+    
+    # Load and convert VAE weights
+    vae_weights_path = mlx_model_path / "vae.safetensors"
+    if vae_weights_path.exists():
+        vae_weights = mx.load(str(vae_weights_path))
+        for key, value in vae_weights.items():
+            comfyui_key = convert_vae_key_to_comfyui(key)
+            all_weights[comfyui_key] = torch.from_numpy(np.array(value))
+    
+    # Save combined checkpoint
+    torch_save_safetensors(all_weights, str(output_file))
+    
+    # Calculate file size
+    file_size = output_file.stat().st_size / (1024 * 1024 * 1024)
+    
+    return f"✅ ComfyUI: models/comfyui/{model_name}.safetensors ({file_size:.2f}GB)"
+
+
+# Custom CSS for scrollable LoRA list (injected via gr.HTML)
+CUSTOM_CSS = """
+<style>
+#lora-scroll-container {
+    max-height: 400px;
+    overflow-y: auto;
+    border: 1px solid var(--border-color-primary);
+    border-radius: 8px;
+    padding: 8px;
+    margin-bottom: 12px;
+}
+/* Compact checkbox styling */
+.lora-checkbox {
+    min-width: 32px !important;
+    max-width: 32px !important;
+    flex: 0 0 32px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+.lora-checkbox > label {
+    padding: 0 !important;
+    margin: 0 !important;
+    justify-content: center !important;
+}
+.lora-checkbox span.svelte-1w6vloh {
+    display: none !important;
+}
+/* Align row items vertically centered */
+#lora-scroll-container > div > div {
+    display: flex !important;
+    align-items: center !important;
+}
+</style>
+"""
 
 # Create Gradio interface
 with gr.Blocks(title="Z-Image-Turbo") as demo:
+    # Inject custom CSS
+    gr.HTML(CUSTOM_CSS)
     gr.Markdown(
         """
         # 🎨 Z-Image-Turbo
@@ -3246,7 +3606,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                 with gr.Column(scale=1):
                     prompt = gr.Textbox(
                         label="Prompt",
-                        placeholder="Describe the image you want to generate...",
+                        placeholder="Describe the image you want to generate... (leave empty for a random idea!)",
                         lines=5,
                         max_lines=10,
                     )
@@ -3317,54 +3677,57 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         # Get initial LoRA data
                         initial_lora_choices = get_lora_choices()
                         
-                        # Create individual LoRA slot rows
+                        # Create individual LoRA slot rows inside a scrollable container
                         lora_rows = []  # Will store (checkbox, lora_path, trigger_textbox, weight) tuples
                         
                         if not initial_lora_choices:
                             gr.Markdown("*No LoRAs found. Place `.safetensors` files in `models/loras/`*")
                         
-                        for i, (display_name, lora_path) in enumerate(initial_lora_choices):
-                            # Get trigger words for this LoRA
-                            trigger = get_lora_trigger_for_path(lora_path)
-                            
-                            with gr.Row():
-                                enabled = gr.Checkbox(
-                                    label="",
-                                    show_label=False,
-                                    value=False,
-                                    min_width=30,
-                                    scale=0,
-                                )
-                                # Hidden state to store the lora path
-                                lora_path_state = gr.State(value=lora_path)
-                                # Display name as static text
-                                gr.Textbox(
-                                    value=display_name,
-                                    label="",
-                                    show_label=False,
-                                    interactive=False,
-                                    scale=3,
-                                )
-                                # Editable trigger words textbox
-                                trigger_textbox = gr.Textbox(
-                                    value=trigger,
-                                    label="",
-                                    show_label=False,
-                                    placeholder="trigger words",
-                                    interactive=True,
-                                    scale=2,
-                                )
-                                weight = gr.Number(
-                                    label="",
-                                    show_label=False,
-                                    value=1.0,
-                                    minimum=0.0,
-                                    maximum=2.0,
-                                    step=0.05,
-                                    scale=1,
-                                    min_width=80,
-                                )
-                                lora_rows.append((enabled, lora_path_state, trigger_textbox, weight))
+                        # Scrollable container for LoRA list (max height with overflow scroll)
+                        with gr.Column(elem_id="lora-scroll-container"):
+                            for i, (display_name, lora_path) in enumerate(initial_lora_choices):
+                                # Get trigger words for this LoRA
+                                trigger = get_lora_trigger_for_path(lora_path)
+                                
+                                with gr.Row():
+                                    enabled = gr.Checkbox(
+                                        label="",
+                                        show_label=False,
+                                        value=False,
+                                        min_width=32,
+                                        scale=0,
+                                        elem_classes=["lora-checkbox"],
+                                    )
+                                    # Hidden state to store the lora path
+                                    lora_path_state = gr.State(value=lora_path)
+                                    # Display name as static text
+                                    gr.Textbox(
+                                        value=display_name,
+                                        label="",
+                                        show_label=False,
+                                        interactive=False,
+                                        scale=3,
+                                    )
+                                    # Editable trigger words textbox
+                                    trigger_textbox = gr.Textbox(
+                                        value=trigger,
+                                        label="",
+                                        show_label=False,
+                                        placeholder="trigger words",
+                                        interactive=True,
+                                        scale=2,
+                                    )
+                                    weight = gr.Number(
+                                        label="",
+                                        show_label=False,
+                                        value=1.0,
+                                        minimum=0.0,
+                                        maximum=2.0,
+                                        step=0.05,
+                                        scale=1,
+                                        min_width=80,
+                                    )
+                                    lora_rows.append((enabled, lora_path_state, trigger_textbox, weight))
                         
                         lora_tags_display = gr.Textbox(
                             label="Applied LoRAs (auto-appended to prompt)",
@@ -3491,23 +3854,6 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         )
                     
                     generate_btn = gr.Button("🚀 Generate", variant="primary", size="lg")
-                    
-                    with gr.Column(visible=False) as dataset_section:
-                        gr.Markdown("---\n### 💾 Save to Dataset")
-                        
-                        dataset_location = gr.Textbox(
-                            label="Dataset Save Location",
-                            placeholder="e.g., ~/Documents/datasets/z-image or /Users/you/datasets/z-image",
-                            info="Images and prompts will be saved here for training datasets (you can drag a folder here)",
-                        )
-                        
-                        with gr.Row():
-                            save_png_btn = gr.Button("💾 Save to Dataset (PNG)", variant="secondary")
-                            save_jpg_btn = gr.Button("💾 Save to Dataset (JPG)", variant="secondary")
-                        
-                        gr.Markdown("*Tip: Select an image to save just that one, or save all if none selected*")
-                        
-                        save_status = gr.Textbox(label="Save Status", interactive=False, lines=3, max_lines=10)
                 
                 with gr.Column(scale=1):
                     output_gallery = gr.Gallery(
@@ -3528,6 +3874,24 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                     with gr.Accordion("Selected Image Info", open=True):
                         selected_info_display = gr.Textbox(label="Generation Details", interactive=False, lines=5)
                         selected_prompt_display = gr.Textbox(label="Prompt", interactive=False, lines=4)
+                    
+                    with gr.Column(visible=False) as dataset_section:
+                        gr.Markdown("### 💾 Save to Dataset")
+                        
+                        dataset_location = gr.Textbox(
+                            label="Dataset Save Location",
+                            value="./dataset/",
+                            placeholder="e.g., ~/Documents/datasets/z-image or /Users/you/datasets/z-image",
+                            info="Images and prompts will be saved here for training datasets (you can drag a folder here)",
+                        )
+                        
+                        with gr.Row():
+                            save_png_btn = gr.Button("💾 Save to Dataset (PNG)", variant="secondary")
+                            save_jpg_btn = gr.Button("💾 Save to Dataset (JPG)", variant="secondary")
+                        
+                        gr.Markdown("*Tip: Select an image to save just that one, or save all if none selected*")
+                        
+                        save_status = gr.Textbox(label="Save Status", interactive=False, lines=3, max_lines=10)
             
             # Example prompts
             gr.Examples(
@@ -3541,6 +3905,141 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                 inputs=[prompt],
                 label="Example Prompts",
             )
+        
+        with gr.Tab("🔀 Merge"):
+            gr.Markdown(
+                """
+                ### Model Merging
+                
+                Combine multiple Z-Image-Turbo models to create novel blends.
+                The base model (with any fused LoRAs from Generate tab) serves as Model A.
+                
+                **Merge Methods:**
+                - **Weighted Sum**: `(1-α)A + αB` — Blend models proportionally
+                - **Add Difference**: `A + α(B-C)` — Extract what B learned from C, apply to A
+                
+                *Note: Only FP16+ models can be merged. FP8 quantized models are excluded.*
+                """
+            )
+            
+            gr.Markdown("---")
+            
+            # Memory status indicator
+            merge_memory_status = gr.Textbox(
+                label="Memory Status",
+                value="Checking available memory...",
+                interactive=False,
+                lines=1,
+            )
+            
+            with gr.Row():
+                merge_method = gr.Dropdown(
+                    choices=["Weighted Sum", "Add Difference"],
+                    value="Weighted Sum",
+                    label="Merge Method",
+                    info="Weighted Sum for blending, Add Difference for extracting fine-tune changes",
+                )
+            
+            gr.Markdown("#### Models to Merge")
+            gr.Markdown("*Select models and set their merge weight (0.0-1.0). The base model from Generate tab is Model A.*")
+            
+            # Create merge model rows with dropdowns
+            merge_model_rows = []  # Will store (checkbox, model_dropdown, weight) tuples
+            
+            # Get initial list of mergeable models (default to MLX)
+            initial_merge_models = get_merge_model_choices("MLX (Apple Silicon)")
+            
+            if not initial_merge_models:
+                gr.Markdown("*No compatible models found. Import FP16 models in Model Settings.*")
+            
+            # Create up to 5 merge model slots
+            MAX_MERGE_SLOTS = 5
+            for i in range(MAX_MERGE_SLOTS):
+                with gr.Row():
+                    merge_enabled = gr.Checkbox(
+                        label="",
+                        show_label=False,
+                        value=False,
+                        min_width=30,
+                        scale=0,
+                    )
+                    merge_model_dropdown = gr.Dropdown(
+                        choices=initial_merge_models,
+                        value=initial_merge_models[0] if initial_merge_models else None,
+                        label="",
+                        show_label=False,
+                        scale=3,
+                    )
+                    merge_weight = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=0.5,
+                        step=0.05,
+                        label="Weight",
+                        show_label=False,
+                        scale=2,
+                    )
+                    merge_model_rows.append((merge_enabled, merge_model_dropdown, merge_weight))
+            
+            # Add Difference specific: Model C selector
+            with gr.Row(visible=False) as model_c_row:
+                gr.Markdown("**Model C (Original)** — The model that Model B was fine-tuned from:")
+            
+            with gr.Row(visible=False) as model_c_selector_row:
+                model_c_dropdown = gr.Dropdown(
+                    choices=initial_merge_models,
+                    value=initial_merge_models[0] if initial_merge_models else None,
+                    label="Model C",
+                    info="Original/base model that the fine-tune was trained from",
+                    scale=3,
+                )
+                add_diff_alpha = gr.Slider(
+                    minimum=0.0,
+                    maximum=2.0,
+                    value=1.0,
+                    step=0.05,
+                    label="Difference Strength (α)",
+                    info="How strongly to apply the difference",
+                    scale=2,
+                )
+            
+            gr.Markdown("---")
+            
+            gr.Markdown("#### Output Formats")
+            with gr.Row():
+                merge_save_mlx = gr.Checkbox(
+                    label="MLX",
+                    value=True,
+                    info="Save to models/mlx/",
+                )
+                merge_save_pytorch = gr.Checkbox(
+                    label="PyTorch",
+                    value=False,
+                    info="Save to models/pytorch/",
+                )
+                merge_save_comfyui = gr.Checkbox(
+                    label="ComfyUI",
+                    value=False,
+                    info="Save to models/comfyui/",
+                )
+            
+            with gr.Row():
+                merge_output_name = gr.Textbox(
+                    label="Output Model Name",
+                    placeholder="e.g., my-merged-model",
+                    info="Name for the new merged model (alphanumeric, hyphens, underscores)",
+                    scale=2,
+                )
+                merge_btn = gr.Button("🔀 Merge Models", variant="primary", scale=1)
+            
+            merge_status = gr.Textbox(
+                label="Merge Status",
+                value="",
+                interactive=False,
+                lines=4,
+            )
+            
+            refresh_merge_models_btn = gr.Button("🔄 Refresh Model List", size="sm")
         
         with gr.Tab("⚙️ Model Settings"):
             gr.Markdown(
@@ -3798,7 +4297,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown, 
                 latent_scale, latent_interp, latent_steps, latent_denoise,
                 upscaler_dropdown, upscale_factor, cache_mode] + all_lora_components,
-        outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed],
+        outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed, prompt],
     ).then(
         fn=lambda: (gr.update(visible=True), None, "", "", "", "", 0, ""),
         inputs=None,
@@ -4197,6 +4696,220 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         fn=check_model_status,
         inputs=None,
         outputs=[model_status],
+    )
+    
+    # --- Merge Tab Event Handlers ---
+    
+    def check_merge_memory_status():
+        """Check memory status for merging."""
+        from merge import get_available_ram_gb, should_use_chunked_mode
+        available = get_available_ram_gb()
+        if available is None:
+            return "⚠️ Memory detection unavailable — using memory-safe mode"
+        use_chunked, msg = should_use_chunked_mode(3)
+        if use_chunked:
+            return f"💾 {msg}"
+        return f"✅ {msg}"
+    
+    def update_merge_method_visibility(method):
+        """Show/hide Model C row based on merge method."""
+        is_add_diff = method == "Add Difference"
+        return (
+            gr.update(visible=is_add_diff),  # model_c_row
+            gr.update(visible=is_add_diff),  # model_c_selector_row
+        )
+    
+    merge_method.change(
+        fn=update_merge_method_visibility,
+        inputs=[merge_method],
+        outputs=[model_c_row, model_c_selector_row],
+    )
+    
+    def refresh_merge_model_list(backend_choice):
+        """Refresh the list of available merge models based on backend."""
+        models = get_merge_model_choices(backend_choice)
+        
+        updates = []
+        for _ in merge_model_rows:
+            updates.append(gr.update(choices=models, value=models[0] if models else None))
+        
+        # Also update Model C dropdown
+        updates.append(gr.update(choices=models, value=models[0] if models else None))
+        
+        return updates
+    
+    def perform_model_merge(
+        method, output_name, base_model, model_c, add_alpha, backend_choice,
+        save_mlx, save_pytorch, save_comfyui,
+        *merge_args, progress=gr.Progress()
+    ):
+        """Perform the model merge operation."""
+        from merge import perform_merge, get_available_ram_gb
+        
+        # Validate output name
+        if not output_name or not output_name.strip():
+            return "❌ Please enter an output model name"
+        
+        output_name = output_name.strip().replace(" ", "_")
+        
+        # Validate output name characters
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', output_name):
+            return "❌ Model name must be alphanumeric with hyphens/underscores only"
+        
+        # Check at least one format is selected
+        if not save_mlx and not save_pytorch and not save_comfyui:
+            return "❌ Please select at least one output format"
+        
+        # Determine model directory based on backend
+        if backend_choice == "MLX (Apple Silicon)":
+            models_dir = Path(MLX_MODELS_DIR)
+        else:
+            models_dir = Path(PYTORCH_MODELS_DIR)
+        
+        # Get base model path (from Generate tab's selected model)
+        if not base_model:
+            return "❌ No base model selected. Select a model in the Generate tab."
+        
+        base_model_path = models_dir / base_model
+        if not base_model_path.exists():
+            return f"❌ Base model not found: {base_model}"
+        
+        # Parse merge model selections
+        # merge_args: enabled1, dropdown1, weight1, enabled2, dropdown2, weight2, ...
+        merge_models_to_use = []
+        for i in range(0, len(merge_args), 3):
+            if i + 2 < len(merge_args):
+                enabled = merge_args[i]
+                model_name = merge_args[i + 1]
+                weight = merge_args[i + 2]
+                
+                if enabled and model_name:
+                    model_path = models_dir / model_name
+                    if model_path.exists():
+                        merge_models_to_use.append((str(model_path), float(weight)))
+        
+        if not merge_models_to_use:
+            return "❌ Please select at least one model to merge"
+        
+        # For Add Difference, we need exactly 1 model and Model C
+        if method == "Add Difference":
+            if len(merge_models_to_use) != 1:
+                return "❌ Add Difference requires exactly one model selected (Model B)"
+            if not model_c:
+                return "❌ Add Difference requires Model C (the original model)"
+            
+            model_c_path = str(models_dir / model_c)
+        else:
+            model_c_path = None
+            add_alpha = None
+        
+        # Always merge to MLX first (our merge algorithms use MLX)
+        mlx_output_path = Path(MLX_MODELS_DIR) / output_name
+        
+        # Check if any output already exists
+        if save_mlx and mlx_output_path.exists():
+            return f"❌ MLX model '{output_name}' already exists"
+        if save_pytorch and (Path(PYTORCH_MODELS_DIR) / output_name).exists():
+            return f"❌ PyTorch model '{output_name}' already exists"
+        if save_comfyui and (Path(MODELS_DIR) / "comfyui" / f"{output_name}.safetensors").exists():
+            return f"❌ ComfyUI model '{output_name}.safetensors' already exists"
+        
+        # Create progress callback
+        def progress_callback(pct, desc):
+            if pct is not None:
+                progress(pct, desc=desc)
+            else:
+                progress(desc=desc)
+        
+        progress(0.01, desc="Starting merge...")
+        
+        # Perform merge to MLX format first
+        result = perform_merge(
+            base_model_path=str(base_model_path),
+            merge_models=merge_models_to_use,
+            output_path=str(mlx_output_path),
+            method="weighted_sum" if method == "Weighted Sum" else "add_difference",
+            model_c_path=model_c_path,
+            add_diff_alpha=float(add_alpha) if add_alpha else 1.0,
+            progress_callback=progress_callback,
+        )
+        
+        # Check if merge succeeded
+        if not result.startswith("✅"):
+            return result
+        
+        results = []
+        
+        # Handle MLX output
+        if save_mlx:
+            results.append(f"✅ MLX: models/mlx/{output_name}/")
+        else:
+            # Remove the MLX output if not wanted
+            if mlx_output_path.exists():
+                import shutil
+                shutil.rmtree(mlx_output_path)
+        
+        # Convert to PyTorch if requested
+        if save_pytorch:
+            progress(0.85, desc="Converting to PyTorch format...")
+            try:
+                pytorch_result = _convert_merged_to_pytorch(output_name, mlx_output_path, progress)
+                results.append(pytorch_result)
+            except Exception as e:
+                results.append(f"❌ PyTorch conversion failed: {str(e)}")
+        
+        # Convert to ComfyUI if requested
+        if save_comfyui:
+            progress(0.92, desc="Converting to ComfyUI format...")
+            try:
+                comfyui_result = _convert_merged_to_comfyui(output_name, mlx_output_path, progress)
+                results.append(comfyui_result)
+            except Exception as e:
+                results.append(f"❌ ComfyUI conversion failed: {str(e)}")
+        
+        progress(1.0, desc="Done!")
+        
+        return "\n".join(results)
+    
+    # Collect all merge model components for event binding
+    all_merge_components = []
+    merge_dropdown_outputs = []
+    for enabled, dropdown, weight in merge_model_rows:
+        all_merge_components.extend([enabled, dropdown, weight])
+        merge_dropdown_outputs.append(dropdown)
+    
+    merge_btn.click(
+        fn=perform_model_merge,
+        inputs=[merge_method, merge_output_name, active_model_dropdown, 
+                model_c_dropdown, add_diff_alpha, backend,
+                merge_save_mlx, merge_save_pytorch, merge_save_comfyui] + all_merge_components,
+        outputs=[merge_status],
+    ).then(
+        # Refresh model dropdown after merge based on backend
+        fn=lambda be: gr.update(choices=get_available_mlx_models()) if be == "MLX (Apple Silicon)" else gr.update(choices=get_available_pytorch_models()),
+        inputs=[backend],
+        outputs=[active_model_dropdown],
+    )
+    
+    refresh_merge_models_btn.click(
+        fn=refresh_merge_model_list,
+        inputs=[backend],
+        outputs=merge_dropdown_outputs + [model_c_dropdown],
+    )
+    
+    # Update merge model dropdowns when backend changes
+    backend.change(
+        fn=refresh_merge_model_list,
+        inputs=[backend],
+        outputs=merge_dropdown_outputs + [model_c_dropdown],
+    )
+    
+    # Initialize memory status on load
+    demo.load(
+        fn=check_merge_memory_status,
+        inputs=None,
+        outputs=[merge_memory_status],
     )
     
     # Initialize model status on load
