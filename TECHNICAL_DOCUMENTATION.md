@@ -815,21 +815,38 @@ def reset_lemica_state(self):
 # In __call__ method, main layers section:
 if self.enable_lemica and self.lemica_bool_list is not None:
     step_idx = self.lemica_step_counter
-    should_compute = self.lemica_bool_list[step_idx]
+    should_compute = self.lemica_bool_list[step_idx] if step_idx < len(self.lemica_bool_list) else True
     
-    if should_compute:
-        # Full computation - store residual
-        unified_input = unified
-        for layer in self.layers:
-            unified = layer(unified, unified_cos, unified_sin, mask=None, adaln_input=t_emb)
-        self.lemica_previous_residual = unified - unified_input
-    else:
-        # Use cached residual
+    # Increment counter BEFORE computation (critical for correct behavior)
+    self.lemica_step_counter += 1
+    
+    if not should_compute:
+        # Use cached residual - skip main layers entirely
         if self.lemica_previous_residual is not None:
             unified = unified + self.lemica_previous_residual
+        else:
+            should_compute = True  # Force computation if no cache
     
-    self.lemica_step_counter += 1
+    if should_compute:
+        # Full computation - run through all main layers
+        # Clone input using multiplication to force copy in MLX
+        ori_unified = unified * 1.0
+        mx.eval(ori_unified)  # Materialize before layer loop
+        
+        for layer in self.layers:
+            unified = layer(unified, unified_cos, unified_sin, mask=None, adaln_input=t_emb)
+        
+        # Store residual for future cache reuse
+        self.lemica_previous_residual = unified - ori_unified
+        mx.eval(self.lemica_previous_residual)  # Materialize for reuse
 ```
+
+#### MLX-Specific Implementation Notes
+
+1. **Tensor Copying**: Use `tensor * 1.0` followed by `mx.eval()` to create a proper copy. Simple assignment or `+ 0.0` may not work due to MLX's lazy evaluation.
+2. **Materialization**: Always call `mx.eval()` on residuals before storing to ensure they're computed.
+3. **Counter Order**: Increment the step counter BEFORE the compute/cache decision (matching official PyTorch implementation).
+4. **Latent Upscale**: LeMiCa is automatically disabled during latent upscale refinement since cached residuals are not valid for the upscaled latent space.
 
 ### Speed Modes
 
