@@ -3690,23 +3690,6 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         )
                     
                     generate_btn = gr.Button("🚀 Generate", variant="primary", size="lg")
-                    
-                    with gr.Column(visible=False) as dataset_section:
-                        gr.Markdown("---\n### 💾 Save to Dataset")
-                        
-                        dataset_location = gr.Textbox(
-                            label="Dataset Save Location",
-                            placeholder="e.g., ~/Documents/datasets/z-image or /Users/you/datasets/z-image",
-                            info="Images and prompts will be saved here for training datasets (you can drag a folder here)",
-                        )
-                        
-                        with gr.Row():
-                            save_png_btn = gr.Button("💾 Save to Dataset (PNG)", variant="secondary")
-                            save_jpg_btn = gr.Button("💾 Save to Dataset (JPG)", variant="secondary")
-                        
-                        gr.Markdown("*Tip: Select an image to save just that one, or save all if none selected*")
-                        
-                        save_status = gr.Textbox(label="Save Status", interactive=False, lines=3, max_lines=10)
                 
                 with gr.Column(scale=1):
                     output_gallery = gr.Gallery(
@@ -3727,6 +3710,24 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                     with gr.Accordion("Selected Image Info", open=True):
                         selected_info_display = gr.Textbox(label="Generation Details", interactive=False, lines=5)
                         selected_prompt_display = gr.Textbox(label="Prompt", interactive=False, lines=4)
+                    
+                    with gr.Column(visible=False) as dataset_section:
+                        gr.Markdown("### 💾 Save to Dataset")
+                        
+                        dataset_location = gr.Textbox(
+                            label="Dataset Save Location",
+                            value="./dataset/",
+                            placeholder="e.g., ~/Documents/datasets/z-image or /Users/you/datasets/z-image",
+                            info="Images and prompts will be saved here for training datasets (you can drag a folder here)",
+                        )
+                        
+                        with gr.Row():
+                            save_png_btn = gr.Button("💾 Save to Dataset (PNG)", variant="secondary")
+                            save_jpg_btn = gr.Button("💾 Save to Dataset (JPG)", variant="secondary")
+                        
+                        gr.Markdown("*Tip: Select an image to save just that one, or save all if none selected*")
+                        
+                        save_status = gr.Textbox(label="Save Status", interactive=False, lines=3, max_lines=10)
             
             # Example prompts
             gr.Examples(
