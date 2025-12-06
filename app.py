@@ -3250,6 +3250,116 @@ def get_merge_model_choices(backend="MLX (Apple Silicon)"):
         return get_available_pytorch_models()
 
 
+def _convert_merged_to_pytorch(model_name, mlx_model_path, progress=None):
+    """Convert a merged MLX model to PyTorch/Diffusers format."""
+    from convert_mlx_to_pytorch import convert_mlx_to_pytorch
+    
+    mlx_model_path = Path(mlx_model_path)
+    pytorch_output_path = Path(PYTORCH_MODELS_DIR) / model_name
+    
+    if pytorch_output_path.exists():
+        return f"❌ PyTorch model '{model_name}' already exists"
+    
+    try:
+        convert_mlx_to_pytorch(str(mlx_model_path), str(pytorch_output_path))
+        return f"✅ PyTorch: models/pytorch/{model_name}/"
+    except Exception as e:
+        return f"❌ PyTorch conversion failed: {str(e)}"
+
+
+def _convert_merged_to_comfyui(model_name, mlx_model_path, progress=None):
+    """Convert a merged MLX model to ComfyUI single-file format."""
+    from safetensors.torch import save_file as torch_save_safetensors
+    from convert_pytorch_to_comfyui import (
+        convert_transformer_key_to_comfyui,
+        convert_text_encoder_key_to_comfyui,
+        convert_vae_key_to_comfyui,
+    )
+    import mlx.core as mx
+    import torch
+    import numpy as np
+    
+    mlx_model_path = Path(mlx_model_path)
+    comfyui_dir = Path(MODELS_DIR) / "comfyui"
+    comfyui_dir.mkdir(parents=True, exist_ok=True)
+    output_file = comfyui_dir / f"{model_name}.safetensors"
+    
+    if output_file.exists():
+        return f"❌ ComfyUI model '{model_name}.safetensors' already exists"
+    
+    all_weights = {}
+    
+    # Load and convert transformer weights
+    transformer_weights = mx.load(str(mlx_model_path / "weights.safetensors"))
+    
+    # Identify Q/K/V groups for fusion
+    qkv_groups = {}
+    other_keys = []
+    
+    for key in transformer_weights.keys():
+        # Skip quantization artifacts
+        if key.endswith('.scales') or key.endswith('.biases'):
+            continue
+            
+        if '.attention.to_q.' in key:
+            base = key.replace('.attention.to_q.', '.attention.')
+            if base not in qkv_groups:
+                qkv_groups[base] = {}
+            qkv_groups[base]['q'] = key
+        elif '.attention.to_k.' in key:
+            base = key.replace('.attention.to_k.', '.attention.')
+            if base not in qkv_groups:
+                qkv_groups[base] = {}
+            qkv_groups[base]['k'] = key
+        elif '.attention.to_v.' in key:
+            base = key.replace('.attention.to_v.', '.attention.')
+            if base not in qkv_groups:
+                qkv_groups[base] = {}
+            qkv_groups[base]['v'] = key
+        else:
+            other_keys.append(key)
+    
+    # Fuse Q, K, V weights
+    for base_key, qkv_keys in qkv_groups.items():
+        if 'q' in qkv_keys and 'k' in qkv_keys and 'v' in qkv_keys:
+            q = np.array(transformer_weights[qkv_keys['q']])
+            k = np.array(transformer_weights[qkv_keys['k']])
+            v = np.array(transformer_weights[qkv_keys['v']])
+            fused = np.concatenate([q, k, v], axis=0)
+            
+            comfyui_key = convert_transformer_key_to_comfyui(base_key.replace('.attention.', '.attention.qkv.'))
+            all_weights[comfyui_key] = torch.from_numpy(fused)
+    
+    # Convert other transformer weights
+    for key in other_keys:
+        comfyui_key = convert_transformer_key_to_comfyui(key)
+        all_weights[comfyui_key] = torch.from_numpy(np.array(transformer_weights[key]))
+    
+    # Load and convert text encoder weights
+    te_weights_path = mlx_model_path / "text_encoder.safetensors"
+    if te_weights_path.exists():
+        te_weights = mx.load(str(te_weights_path))
+        for key, value in te_weights.items():
+            comfyui_key = convert_text_encoder_key_to_comfyui(key)
+            all_weights[comfyui_key] = torch.from_numpy(np.array(value))
+    
+    # Load and convert VAE weights
+    vae_weights_path = mlx_model_path / "vae.safetensors"
+    if vae_weights_path.exists():
+        vae_weights = mx.load(str(vae_weights_path))
+        for key, value in vae_weights.items():
+            comfyui_key = convert_vae_key_to_comfyui(key)
+            all_weights[comfyui_key] = torch.from_numpy(np.array(value))
+    
+    # Save combined checkpoint
+    torch_save_safetensors(all_weights, str(output_file))
+    
+    # Calculate file size
+    file_size = output_file.stat().st_size / (1024 * 1024 * 1024)
+    
+    return f"✅ ComfyUI: models/comfyui/{model_name}.safetensors ({file_size:.2f}GB)"
+
+
 # Create Gradio interface
 with gr.Blocks(title="Z-Image-Turbo") as demo:
     gr.Markdown(
@@ -3660,6 +3770,24 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                 )
             
             gr.Markdown("---")
+            
+            gr.Markdown("#### Output Formats")
+            with gr.Row():
+                merge_save_mlx = gr.Checkbox(
+                    label="MLX",
+                    value=True,
+                    info="Save to models/mlx/",
+                )
+                merge_save_pytorch = gr.Checkbox(
+                    label="PyTorch",
+                    value=False,
+                    info="Save to models/pytorch/",
+                )
+                merge_save_comfyui = gr.Checkbox(
+                    label="ComfyUI",
+                    value=False,
+                    info="Save to models/comfyui/",
+                )
             
             with gr.Row():
                 merge_output_name = gr.Textbox(
@@ -4378,6 +4506,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     
     def perform_model_merge(
         method, output_name, base_model, model_c, add_alpha, backend_choice,
+        save_mlx, save_pytorch, save_comfyui,
         *merge_args, progress=gr.Progress()
     ):
         """Perform the model merge operation."""
@@ -4393,6 +4522,10 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         import re
         if not re.match(r'^[a-zA-Z0-9_-]+$', output_name):
             return "❌ Model name must be alphanumeric with hyphens/underscores only"
+        
+        # Check at least one format is selected
+        if not save_mlx and not save_pytorch and not save_comfyui:
+            return "❌ Please select at least one output format"
         
         # Determine model directory based on backend
         if backend_choice == "MLX (Apple Silicon)":
@@ -4437,7 +4570,16 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             model_c_path = None
             add_alpha = None
         
-        output_path = models_dir / output_name
+        # Always merge to MLX first (our merge algorithms use MLX)
+        mlx_output_path = Path(MLX_MODELS_DIR) / output_name
+        
+        # Check if any output already exists
+        if save_mlx and mlx_output_path.exists():
+            return f"❌ MLX model '{output_name}' already exists"
+        if save_pytorch and (Path(PYTORCH_MODELS_DIR) / output_name).exists():
+            return f"❌ PyTorch model '{output_name}' already exists"
+        if save_comfyui and (Path(MODELS_DIR) / "comfyui" / f"{output_name}.safetensors").exists():
+            return f"❌ ComfyUI model '{output_name}.safetensors' already exists"
         
         # Create progress callback
         def progress_callback(pct, desc):
@@ -4448,17 +4590,53 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         
         progress(0.01, desc="Starting merge...")
         
+        # Perform merge to MLX format first
         result = perform_merge(
             base_model_path=str(base_model_path),
             merge_models=merge_models_to_use,
-            output_path=str(output_path),
+            output_path=str(mlx_output_path),
             method="weighted_sum" if method == "Weighted Sum" else "add_difference",
             model_c_path=model_c_path,
             add_diff_alpha=float(add_alpha) if add_alpha else 1.0,
             progress_callback=progress_callback,
         )
         
-        return result
+        # Check if merge succeeded
+        if not result.startswith("✅"):
+            return result
+        
+        results = []
+        
+        # Handle MLX output
+        if save_mlx:
+            results.append(f"✅ MLX: models/mlx/{output_name}/")
+        else:
+            # Remove the MLX output if not wanted
+            if mlx_output_path.exists():
+                import shutil
+                shutil.rmtree(mlx_output_path)
+        
+        # Convert to PyTorch if requested
+        if save_pytorch:
+            progress(0.85, desc="Converting to PyTorch format...")
+            try:
+                pytorch_result = _convert_merged_to_pytorch(output_name, mlx_output_path, progress)
+                results.append(pytorch_result)
+            except Exception as e:
+                results.append(f"❌ PyTorch conversion failed: {str(e)}")
+        
+        # Convert to ComfyUI if requested
+        if save_comfyui:
+            progress(0.92, desc="Converting to ComfyUI format...")
+            try:
+                comfyui_result = _convert_merged_to_comfyui(output_name, mlx_output_path, progress)
+                results.append(comfyui_result)
+            except Exception as e:
+                results.append(f"❌ ComfyUI conversion failed: {str(e)}")
+        
+        progress(1.0, desc="Done!")
+        
+        return "\n".join(results)
     
     # Collect all merge model components for event binding
     all_merge_components = []
@@ -4470,7 +4648,8 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     merge_btn.click(
         fn=perform_model_merge,
         inputs=[merge_method, merge_output_name, active_model_dropdown, 
-                model_c_dropdown, add_diff_alpha, backend] + all_merge_components,
+                model_c_dropdown, add_diff_alpha, backend,
+                merge_save_mlx, merge_save_pytorch, merge_save_comfyui] + all_merge_components,
         outputs=[merge_status],
     ).then(
         # Refresh model dropdown after merge based on backend
