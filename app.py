@@ -2633,6 +2633,71 @@ Respond ONLY with the enhanced prompt, no explanations or preamble."""
     return enhanced
 
 
+def generate_random_prompt(progress=gr.Progress()):
+    """Generate a random creative image prompt using the prompt enhancer model"""
+    
+    progress(0.1, desc="Loading language model...")
+    
+    try:
+        from mlx_lm import generate
+    except ImportError:
+        raise gr.Error("mlx-lm not installed. Run: pip install mlx-lm")
+    
+    progress(0.2, desc="Loading prompt enhancer...")
+    
+    model, tokenizer = load_prompt_enhancer()
+    
+    progress(0.4, desc="Generating random prompt idea...")
+    
+    # System prompt for random generation
+    system_prompt = """You are a creative artist who generates unique and interesting image prompts.
+Generate a single, detailed image prompt that would make a visually striking photograph or artwork.
+Be creative and varied - include subjects like landscapes, portraits, still life, abstract art, 
+sci-fi scenes, fantasy, architecture, nature, or anything visually interesting.
+
+Include specific details about:
+- The main subject
+- Lighting and atmosphere  
+- Colors and mood
+- Composition or style
+
+Keep it under 80 words. Respond ONLY with the prompt, no explanations."""
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Generate a unique and creative image prompt for me."}
+    ]
+    
+    prompt_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    
+    progress(0.6, desc="Creating prompt...")
+    
+    # Create sampler with higher temperature for creativity
+    from mlx_lm.sample_utils import make_sampler
+    sampler = make_sampler(temp=0.9)
+    
+    # Generate
+    random_prompt = generate(
+        model,
+        tokenizer,
+        prompt=prompt_text,
+        max_tokens=150,
+        sampler=sampler,
+        verbose=False,
+    )
+    
+    progress(1.0, desc="Done!")
+    
+    # Clean up
+    random_prompt = random_prompt.strip()
+    
+    return random_prompt
+
+
 def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_configs=None,
                  latent_scale=1.0, latent_steps=0, latent_denoise=0.55, latent_interp='cubic',
                  cache_mode=None):
@@ -3139,8 +3204,11 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
         cache_mode: LeMiCa cache mode ('slow', 'medium', 'fast') or None for no caching
     """
     
+    # If no prompt provided, generate a random one using the prompt enhancer
     if not prompt.strip():
-        raise gr.Error("Please enter a prompt")
+        progress(0, desc="No prompt provided - generating a random idea...")
+        prompt = generate_random_prompt(progress)
+        print(f"Generated random prompt: {prompt}")
     
     if not model_name:
         raise gr.Error(f"No model selected for {backend}")
@@ -3227,7 +3295,8 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     # Add to gallery with all generation parameters
     gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor, actual_latent_scale, actual_latent_denoise, actual_latent_interp)
     
-    return gallery_images, png_path, jpg_path, prompt, seed
+    # Return: gallery, png_path, jpg_path, stored_prompt, stored_seed, prompt_textbox
+    return gallery_images, png_path, jpg_path, prompt, seed, prompt
 
 
 # --- Merge Tab Helper Functions ---
@@ -3376,7 +3445,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                 with gr.Column(scale=1):
                     prompt = gr.Textbox(
                         label="Prompt",
-                        placeholder="Describe the image you want to generate...",
+                        placeholder="Describe the image you want to generate... (leave empty for a random idea!)",
                         lines=5,
                         max_lines=10,
                     )
@@ -4063,7 +4132,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown, 
                 latent_scale, latent_interp, latent_steps, latent_denoise,
                 upscaler_dropdown, upscale_factor, cache_mode] + all_lora_components,
-        outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed],
+        outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed, prompt],
     ).then(
         fn=lambda: (gr.update(visible=True), None, "", "", "", "", 0, ""),
         inputs=None,
