@@ -3230,6 +3230,19 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     return gallery_images, png_path, jpg_path, prompt, seed
 
 
+# --- Merge Tab Helper Functions ---
+
+def get_merge_model_choices():
+    """Get list of MLX models available for merging (excluding FP8 quantized).
+    
+    Returns:
+        List of (model_name, is_compatible) tuples for compatible models
+    """
+    from merge import get_available_merge_models
+    models = get_available_merge_models(Path(MLX_MODELS_DIR), exclude_quantized=True)
+    return [(name, is_compat) for name, is_compat in models if is_compat]
+
+
 # Create Gradio interface
 with gr.Blocks(title="Z-Image-Turbo") as demo:
     gr.Markdown(
@@ -3541,6 +3554,125 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                 inputs=[prompt],
                 label="Example Prompts",
             )
+        
+        with gr.Tab("🔀 Merge"):
+            gr.Markdown(
+                """
+                ### Model Merging
+                
+                Combine multiple Z-Image-Turbo models to create novel blends.
+                The base model (with any fused LoRAs from Generate tab) serves as Model A.
+                
+                **Merge Methods:**
+                - **Weighted Sum**: `(1-α)A + αB` — Blend models proportionally
+                - **Add Difference**: `A + α(B-C)` — Extract what B learned from C, apply to A
+                
+                *Note: Only FP16+ models can be merged. FP8 quantized models are excluded.*
+                """
+            )
+            
+            gr.Markdown("---")
+            
+            # Memory status indicator
+            merge_memory_status = gr.Textbox(
+                label="Memory Status",
+                value="Checking available memory...",
+                interactive=False,
+                lines=1,
+            )
+            
+            with gr.Row():
+                merge_method = gr.Dropdown(
+                    choices=["Weighted Sum", "Add Difference"],
+                    value="Weighted Sum",
+                    label="Merge Method",
+                    info="Weighted Sum for blending, Add Difference for extracting fine-tune changes",
+                )
+            
+            gr.Markdown("#### Models to Merge")
+            gr.Markdown("*Select models and set their merge weight (0.0-1.0). The base model from Generate tab is Model A.*")
+            
+            # Create merge model rows (similar to LoRA table pattern)
+            merge_model_rows = []  # Will store (checkbox, model_name_state, weight) tuples
+            
+            # Get initial list of mergeable models
+            initial_merge_models = get_merge_model_choices()
+            
+            if not initial_merge_models:
+                gr.Markdown("*No compatible models found. Import FP16 models in Model Settings.*")
+            
+            # Create up to 5 merge model slots
+            MAX_MERGE_SLOTS = 5
+            for i in range(min(MAX_MERGE_SLOTS, max(len(initial_merge_models), 3))):
+                model_name = initial_merge_models[i][0] if i < len(initial_merge_models) else ""
+                with gr.Row():
+                    merge_enabled = gr.Checkbox(
+                        label="",
+                        show_label=False,
+                        value=False,
+                        min_width=30,
+                        scale=0,
+                    )
+                    merge_model_state = gr.State(value=model_name)
+                    merge_model_display = gr.Textbox(
+                        value=model_name if model_name else "(no model)",
+                        label="",
+                        show_label=False,
+                        interactive=False,
+                        scale=3,
+                    )
+                    merge_weight = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=0.5,
+                        step=0.05,
+                        label="Weight",
+                        show_label=False,
+                        scale=2,
+                    )
+                    merge_model_rows.append((merge_enabled, merge_model_state, merge_model_display, merge_weight))
+            
+            # Add Difference specific: Model C selector
+            with gr.Row(visible=False) as model_c_row:
+                gr.Markdown("**Model C (Original)** — The model that Model B was fine-tuned from:")
+            
+            with gr.Row(visible=False) as model_c_selector_row:
+                model_c_dropdown = gr.Dropdown(
+                    choices=[m[0] for m in initial_merge_models],
+                    value=initial_merge_models[0][0] if initial_merge_models else None,
+                    label="Model C",
+                    info="Original/base model that the fine-tune was trained from",
+                    scale=3,
+                )
+                add_diff_alpha = gr.Slider(
+                    minimum=0.0,
+                    maximum=2.0,
+                    value=1.0,
+                    step=0.05,
+                    label="Difference Strength (α)",
+                    info="How strongly to apply the difference",
+                    scale=2,
+                )
+            
+            gr.Markdown("---")
+            
+            with gr.Row():
+                merge_output_name = gr.Textbox(
+                    label="Output Model Name",
+                    placeholder="e.g., my-merged-model",
+                    info="Name for the new merged model (alphanumeric, hyphens, underscores)",
+                    scale=2,
+                )
+                merge_btn = gr.Button("🔀 Merge Models", variant="primary", scale=1)
+            
+            merge_status = gr.Textbox(
+                label="Merge Status",
+                value="",
+                interactive=False,
+                lines=4,
+            )
+            
+            refresh_merge_models_btn = gr.Button("🔄 Refresh Model List", size="sm")
         
         with gr.Tab("⚙️ Model Settings"):
             gr.Markdown(
@@ -4197,6 +4329,157 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         fn=check_model_status,
         inputs=None,
         outputs=[model_status],
+    )
+    
+    # --- Merge Tab Event Handlers ---
+    
+    def check_merge_memory_status():
+        """Check memory status for merging."""
+        from merge import get_available_ram_gb, should_use_chunked_mode
+        available = get_available_ram_gb()
+        if available is None:
+            return "⚠️ Memory detection unavailable — using memory-safe mode"
+        use_chunked, msg = should_use_chunked_mode(3)
+        if use_chunked:
+            return f"💾 {msg}"
+        return f"✅ {msg}"
+    
+    def update_merge_method_visibility(method):
+        """Show/hide Model C row based on merge method."""
+        is_add_diff = method == "Add Difference"
+        return (
+            gr.update(visible=is_add_diff),  # model_c_row
+            gr.update(visible=is_add_diff),  # model_c_selector_row
+        )
+    
+    merge_method.change(
+        fn=update_merge_method_visibility,
+        inputs=[merge_method],
+        outputs=[model_c_row, model_c_selector_row],
+    )
+    
+    def refresh_merge_model_list():
+        """Refresh the list of available merge models."""
+        models = get_merge_model_choices()
+        if not models:
+            return [gr.update(value="(no compatible models)") for _ in merge_model_rows]
+        
+        updates = []
+        for i, (_, _, display, _) in enumerate(merge_model_rows):
+            if i < len(models):
+                updates.append(gr.update(value=models[i][0]))
+            else:
+                updates.append(gr.update(value="(no model)"))
+        
+        return updates
+    
+    def perform_model_merge(
+        method, output_name, base_model, model_c, add_alpha,
+        *merge_args, progress=gr.Progress()
+    ):
+        """Perform the model merge operation."""
+        from merge import perform_merge, get_available_ram_gb
+        
+        # Validate output name
+        if not output_name or not output_name.strip():
+            return "❌ Please enter an output model name"
+        
+        output_name = output_name.strip().replace(" ", "_")
+        
+        # Validate output name characters
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', output_name):
+            return "❌ Model name must be alphanumeric with hyphens/underscores only"
+        
+        # Get base model path (from Generate tab's selected model)
+        if not base_model:
+            return "❌ No base model selected. Select a model in the Generate tab."
+        
+        base_model_path = Path(MLX_MODELS_DIR) / base_model
+        if not base_model_path.exists():
+            return f"❌ Base model not found: {base_model}"
+        
+        # Parse merge model selections
+        # merge_args: enabled1, state1, display1, weight1, enabled2, state2, display2, weight2, ...
+        merge_models_to_use = []
+        for i in range(0, len(merge_args), 4):
+            if i + 3 < len(merge_args):
+                enabled = merge_args[i]
+                model_name = merge_args[i + 1]
+                weight = merge_args[i + 3]
+                
+                if enabled and model_name and model_name != "(no model)":
+                    model_path = Path(MLX_MODELS_DIR) / model_name
+                    if model_path.exists():
+                        merge_models_to_use.append((str(model_path), float(weight)))
+        
+        if not merge_models_to_use:
+            return "❌ Please select at least one model to merge"
+        
+        # For Add Difference, we need exactly 1 model and Model C
+        if method == "Add Difference":
+            if len(merge_models_to_use) != 1:
+                return "❌ Add Difference requires exactly one model selected (Model B)"
+            if not model_c:
+                return "❌ Add Difference requires Model C (the original model)"
+            
+            model_c_path = str(Path(MLX_MODELS_DIR) / model_c)
+        else:
+            model_c_path = None
+            add_alpha = None
+        
+        output_path = Path(MLX_MODELS_DIR) / output_name
+        
+        # Create progress callback
+        def progress_callback(pct, desc):
+            if pct is not None:
+                progress(pct, desc=desc)
+            else:
+                progress(desc=desc)
+        
+        progress(0.01, desc="Starting merge...")
+        
+        result = perform_merge(
+            base_model_path=str(base_model_path),
+            merge_models=merge_models_to_use,
+            output_path=str(output_path),
+            method="weighted_sum" if method == "Weighted Sum" else "add_difference",
+            model_c_path=model_c_path,
+            add_diff_alpha=float(add_alpha) if add_alpha else 1.0,
+            progress_callback=progress_callback,
+        )
+        
+        return result
+    
+    # Collect all merge model components for event binding
+    all_merge_components = []
+    merge_display_outputs = []
+    for enabled, state, display, weight in merge_model_rows:
+        all_merge_components.extend([enabled, state, display, weight])
+        merge_display_outputs.append(display)
+    
+    merge_btn.click(
+        fn=perform_model_merge,
+        inputs=[merge_method, merge_output_name, active_model_dropdown, 
+                model_c_dropdown, add_diff_alpha] + all_merge_components,
+        outputs=[merge_status],
+    ).then(
+        # Refresh model dropdown after merge
+        fn=lambda: gr.update(choices=get_available_mlx_models()),
+        outputs=[active_model_dropdown],
+    )
+    
+    refresh_merge_models_btn.click(
+        fn=refresh_merge_model_list,
+        inputs=None,
+        outputs=merge_display_outputs,
+    )
+    
+    # Initialize memory status on load
+    demo.load(
+        fn=check_merge_memory_status,
+        inputs=None,
+        outputs=[merge_memory_status],
     )
     
     # Initialize model status on load
