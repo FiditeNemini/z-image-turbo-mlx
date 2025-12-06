@@ -3592,19 +3592,19 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             gr.Markdown("#### Models to Merge")
             gr.Markdown("*Select models and set their merge weight (0.0-1.0). The base model from Generate tab is Model A.*")
             
-            # Create merge model rows (similar to LoRA table pattern)
-            merge_model_rows = []  # Will store (checkbox, model_name_state, weight) tuples
+            # Create merge model rows with dropdowns
+            merge_model_rows = []  # Will store (checkbox, model_dropdown, weight) tuples
             
             # Get initial list of mergeable models
             initial_merge_models = get_merge_model_choices()
+            model_choices = [m[0] for m in initial_merge_models] if initial_merge_models else []
             
             if not initial_merge_models:
                 gr.Markdown("*No compatible models found. Import FP16 models in Model Settings.*")
             
             # Create up to 5 merge model slots
             MAX_MERGE_SLOTS = 5
-            for i in range(min(MAX_MERGE_SLOTS, max(len(initial_merge_models), 3))):
-                model_name = initial_merge_models[i][0] if i < len(initial_merge_models) else ""
+            for i in range(MAX_MERGE_SLOTS):
                 with gr.Row():
                     merge_enabled = gr.Checkbox(
                         label="",
@@ -3613,12 +3613,11 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         min_width=30,
                         scale=0,
                     )
-                    merge_model_state = gr.State(value=model_name)
-                    merge_model_display = gr.Textbox(
-                        value=model_name if model_name else "(no model)",
+                    merge_model_dropdown = gr.Dropdown(
+                        choices=model_choices,
+                        value=model_choices[0] if model_choices else None,
                         label="",
                         show_label=False,
-                        interactive=False,
                         scale=3,
                     )
                     merge_weight = gr.Slider(
@@ -3630,7 +3629,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         show_label=False,
                         scale=2,
                     )
-                    merge_model_rows.append((merge_enabled, merge_model_state, merge_model_display, merge_weight))
+                    merge_model_rows.append((merge_enabled, merge_model_dropdown, merge_weight))
             
             # Add Difference specific: Model C selector
             with gr.Row(visible=False) as model_c_row:
@@ -4361,15 +4360,14 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     def refresh_merge_model_list():
         """Refresh the list of available merge models."""
         models = get_merge_model_choices()
-        if not models:
-            return [gr.update(value="(no compatible models)") for _ in merge_model_rows]
+        choices = [m[0] for m in models] if models else []
         
         updates = []
-        for i, (_, _, display, _) in enumerate(merge_model_rows):
-            if i < len(models):
-                updates.append(gr.update(value=models[i][0]))
-            else:
-                updates.append(gr.update(value="(no model)"))
+        for _ in merge_model_rows:
+            updates.append(gr.update(choices=choices, value=choices[0] if choices else None))
+        
+        # Also update Model C dropdown
+        updates.append(gr.update(choices=choices, value=choices[0] if choices else None))
         
         return updates
     
@@ -4400,15 +4398,15 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             return f"❌ Base model not found: {base_model}"
         
         # Parse merge model selections
-        # merge_args: enabled1, state1, display1, weight1, enabled2, state2, display2, weight2, ...
+        # merge_args: enabled1, dropdown1, weight1, enabled2, dropdown2, weight2, ...
         merge_models_to_use = []
-        for i in range(0, len(merge_args), 4):
-            if i + 3 < len(merge_args):
+        for i in range(0, len(merge_args), 3):
+            if i + 2 < len(merge_args):
                 enabled = merge_args[i]
                 model_name = merge_args[i + 1]
-                weight = merge_args[i + 3]
+                weight = merge_args[i + 2]
                 
-                if enabled and model_name and model_name != "(no model)":
+                if enabled and model_name:
                     model_path = Path(MLX_MODELS_DIR) / model_name
                     if model_path.exists():
                         merge_models_to_use.append((str(model_path), float(weight)))
@@ -4453,10 +4451,10 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     
     # Collect all merge model components for event binding
     all_merge_components = []
-    merge_display_outputs = []
-    for enabled, state, display, weight in merge_model_rows:
-        all_merge_components.extend([enabled, state, display, weight])
-        merge_display_outputs.append(display)
+    merge_dropdown_outputs = []
+    for enabled, dropdown, weight in merge_model_rows:
+        all_merge_components.extend([enabled, dropdown, weight])
+        merge_dropdown_outputs.append(dropdown)
     
     merge_btn.click(
         fn=perform_model_merge,
@@ -4472,7 +4470,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     refresh_merge_models_btn.click(
         fn=refresh_merge_model_list,
         inputs=None,
-        outputs=merge_display_outputs,
+        outputs=merge_dropdown_outputs + [model_c_dropdown],
     )
     
     # Initialize memory status on load
