@@ -436,6 +436,16 @@ class ZImageTransformer2DModel(nn.Module):
         pW = self.patch_size
         
         C, F, H, W = x.shape[1:]
+        
+        # Validate dimensions are divisible by patch size
+        if H % pH != 0 or W % pW != 0:
+            raise ValueError(
+                f"Latent dimensions must be divisible by patch_size={pH}. "
+                f"Got H={H}, W={W}. Expected H to be divisible by {pH} and W by {pW}. "
+                f"This can happen with non-standard upscale factors. "
+                f"Try adjusting the latent upscale factor to produce even dimensions."
+            )
+        
         F_tokens = F // pF
         H_tokens = H // pH
         W_tokens = W // pW

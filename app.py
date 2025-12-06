@@ -158,12 +158,14 @@ DIMENSION_PRESETS = {
         # Square
         "1:1 — 1024×1024": (1024, 1024),
         # Landscape (width is larger)
+        "7:5 — 1432×1024 (Landscape)": (1432, 1024),
         "3:2 — 1536×1024 (Landscape)": (1536, 1024),
         "4:3 — 1368×1024 (Landscape)": (1368, 1024),
         "5:4 — 1280×1024 (Landscape)": (1280, 1024),
         "16:9 — 1824×1024 (Landscape)": (1824, 1024),
         "21:9 — 2392×1024 (Landscape)": (2392, 1024),
         # Portrait (height is larger)
+        "5:7 — 1024×1432 (Portrait)": (1024, 1432),
         "2:3 — 1024×1536 (Portrait)": (1024, 1536),
         "3:4 — 1024×1368 (Portrait)": (1024, 1368),
         "4:5 — 1024×1280 (Portrait)": (1024, 1280),
@@ -174,12 +176,14 @@ DIMENSION_PRESETS = {
         # Square
         "1:1 — 1280×1280": (1280, 1280),
         # Landscape (width is larger)
+        "7:5 — 1792×1280 (Landscape)": (1792, 1280),
         "3:2 — 1920×1280 (Landscape)": (1920, 1280),
         "4:3 — 1712×1280 (Landscape)": (1712, 1280),
         "5:4 — 1600×1280 (Landscape)": (1600, 1280),
         "16:9 — 2280×1280 (Landscape)": (2280, 1280),
         "21:9 — 2992×1280 (Landscape)": (2992, 1280),
         # Portrait (height is larger)
+        "5:7 — 1280×1792 (Portrait)": (1280, 1792),
         "2:3 — 1280×1920 (Portrait)": (1280, 1920),
         "3:4 — 1280×1712 (Portrait)": (1280, 1712),
         "4:5 — 1280×1600 (Portrait)": (1280, 1600),
@@ -2260,15 +2264,27 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
         return latents
     
     batch_size, h, w, channels = latents.shape
+    
+    # Calculate target dimensions, ensuring divisibility by 2 (patch size)
+    # This is required for the transformer's patchify operation
+    patch_size = 2
     new_h = int(h * scale_factor)
     new_w = int(w * scale_factor)
+    # Round up to nearest multiple of patch_size
+    new_h = ((new_h + patch_size - 1) // patch_size) * patch_size
+    new_w = ((new_w + patch_size - 1) // patch_size) * patch_size
     
     if progress:
         progress(progress_start, desc=f"Latent upscale: {h}×{w} → {new_h}×{new_w}...")
     
-    # Step 1: Spatially upscale latents
-    # MLX Upsample expects NHWC format which we already have
-    upsampler = nn.Upsample(scale_factor=scale_factor, mode=interp_mode, align_corners=True)
+    # Step 1: Spatially upscale latents to exact target dimensions
+    # Calculate exact scale factors needed for the target dimensions
+    h_scale = new_h / h
+    w_scale = new_w / w
+    
+    # Use nn.Upsample with tuple scale factors for asymmetric scaling if needed
+    mode = "cubic" if interp_mode == "cubic" else ("linear" if interp_mode == "linear" else "nearest")
+    upsampler = nn.Upsample(scale_factor=(h_scale, w_scale), mode=mode, align_corners=True)
     upscaled = upsampler(latents)
     mx.eval(upscaled)
     
