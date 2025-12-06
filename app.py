@@ -28,9 +28,19 @@ import shutil
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
+# Upscaler imports
+try:
+    from upscaler import get_available_upscalers, load_upscaler, upscale_image as upscale_image_esrgan
+    UPSCALER_AVAILABLE = True
+except ImportError:
+    UPSCALER_AVAILABLE = False
+    print("Warning: Upscaler module not available. Install torch to enable upscaling.")
+
 # Global model cache
 _mlx_models = None
 _pytorch_pipe = None
+_upscaler_model = None  # Cached upscaler model
+_current_upscaler_name = None  # Track which upscaler is loaded
 _current_mlx_model_path = None  # Track which MLX model is currently loaded
 _current_pytorch_model_path = None  # Track which PyTorch model is currently loaded
 _current_applied_lora = None  # Track which LoRA is currently applied to the cached model
@@ -52,6 +62,7 @@ PYTORCH_MODEL_PATH = "./models/pytorch/Z-Image-Turbo"  # Default PyTorch model
 MLX_MODEL_PATH = "./models/mlx/Z-Image-Turbo-MLX"  # Default MLX model
 SINGLE_FILE_MODEL_PATH = "./models/single_file"  # For single-file .safetensors models
 LORAS_DIR = "./models/loras"  # LoRA models directory (supports subfolders)
+UPSCALERS_DIR = "./models/upscalers"  # ESRGAN upscaler models directory
 
 # Z-Image-Turbo architecture signature keys
 # These patterns identify Z-Image-Turbo compatible models
@@ -1575,6 +1586,930 @@ def apply_loras_to_model(model, lora_configs, progress=None):
     return applied
 
 
+def save_fused_model(model_name, backend, source_model, lora_configs, save_mlx=True, save_pytorch=False, save_comfyui=False, progress=gr.Progress()):
+    """
+    Save a new model with LoRAs fused into the weights.
+    
+    Args:
+        model_name: Name for the new model
+        backend: Current backend ("MLX (Apple Silicon)" or "PyTorch")
+        source_model: Source model name/path
+        lora_configs: List of dicts with 'name' and 'scale' keys
+        save_mlx: Save in MLX format
+        save_pytorch: Save in PyTorch/Diffusers format
+        save_comfyui: Save in ComfyUI single-file format
+        progress: Gradio progress callback
+        
+    Returns:
+        Status message
+    """
+    import mlx.core as mx
+    
+    if not model_name or not model_name.strip():
+        return "❌ Please enter a model name"
+    
+    model_name = model_name.strip()
+    
+    # Validate model name (alphanumeric, hyphens, underscores)
+    import re
+    if not re.match(r'^[\w\-]+$', model_name):
+        return "❌ Model name can only contain letters, numbers, hyphens, and underscores"
+    
+    # Check if any format is selected
+    if not save_mlx and not save_pytorch and not save_comfyui:
+        return "❌ Please select at least one output format"
+    
+    # Check if any LoRAs are selected
+    if not lora_configs:
+        return "❌ No LoRAs selected. Enable at least one LoRA to fuse."
+    
+    # Filter to only enabled LoRAs with non-zero scale
+    active_loras = [c for c in lora_configs if c.get('scale', 0) > 0]
+    if not active_loras:
+        return "❌ No active LoRAs. Enable at least one LoRA with weight > 0."
+    
+    results = []
+    
+    try:
+        # Save MLX format
+        if save_mlx:
+            result = _save_fused_mlx_model(model_name, source_model, active_loras, progress, backend)
+            results.append(result)
+        
+        # Save PyTorch format
+        if save_pytorch:
+            result = _save_fused_pytorch_model(model_name, source_model, active_loras, progress, backend)
+            results.append(result)
+        
+        # Save ComfyUI format
+        if save_comfyui:
+            result = _save_fused_comfyui_model(model_name, source_model, active_loras, progress, backend)
+            results.append(result)
+        
+        return "\n".join(results)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"❌ Error saving model: {str(e)}"
+
+
+def _save_fused_mlx_model(model_name, source_model, lora_configs, progress, backend="MLX (Apple Silicon)"):
+    """Save an MLX model with fused LoRAs."""
+    import mlx.core as mx
+    from safetensors.numpy import save_file
+    from lora import load_lora, apply_lora_to_model
+    
+    # Determine source model path based on backend
+    if backend == "MLX (Apple Silicon)":
+        if source_model and source_model != "Z-Image-Turbo-MLX":
+            source_path = Path(MLX_MODELS_DIR) / source_model
+        else:
+            source_path = Path(MLX_MODEL_PATH)
+    else:
+        # For PyTorch backend, we need to convert from PyTorch to MLX first
+        # For now, use the MLX model path as fallback
+        source_path = Path(MLX_MODEL_PATH)
+    
+    if not source_path.exists():
+        return f"❌ Source model not found: {source_path}"
+    
+    # Create output directory
+    output_path = Path(MLX_MODELS_DIR) / model_name
+    if output_path.exists():
+        return f"❌ Model '{model_name}' already exists. Choose a different name."
+    
+    progress(0.1, desc="Loading source model...")
+    
+    # Load fresh model (don't use cached to avoid modifying it)
+    from z_image_mlx import ZImageTransformer2DModel
+    with open(f"{source_path}/config.json", "r") as f:
+        config = json.load(f)
+    
+    model = ZImageTransformer2DModel(config)
+    weights = mx.load(f"{source_path}/weights.safetensors")
+    
+    # Process weights
+    processed_weights = {}
+    for key, value in weights.items():
+        new_key = map_transformer_key(key)
+        if new_key is None or "pad_token" in (new_key or ""):
+            continue
+        processed_weights[new_key] = value
+    
+    model.load_weights(list(processed_weights.items()), strict=False)
+    
+    progress(0.3, desc="Applying LoRAs...")
+    
+    # Apply each LoRA
+    lora_names = []
+    for i, config_item in enumerate(lora_configs):
+        lora_path = Path(LORAS_DIR) / config_item['name']
+        scale = config_item.get('scale', 1.0)
+        lora_names.append(f"{config_item['name']} ({scale})")
+        
+        progress(0.3 + (0.4 * i / len(lora_configs)), desc=f"Applying: {config_item['name']}...")
+        
+        lora_weights = load_lora(lora_path)
+        apply_lora_to_model(model, lora_weights, scale=scale, verbose=False)
+    
+    progress(0.7, desc="Saving fused weights...")
+    
+    # Create output directory
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Extract and save fused weights
+    fused_weights = {}
+    for name, param in model.named_modules():
+        if hasattr(param, 'weight'):
+            weight = param.weight
+            fused_weights[f"{name}.weight"] = np.array(weight)
+        if hasattr(param, 'bias') and param.bias is not None:
+            bias = param.bias
+            fused_weights[f"{name}.bias"] = np.array(bias)
+    
+    # Save weights
+    save_file(fused_weights, str(output_path / "weights.safetensors"))
+    
+    progress(0.85, desc="Copying config files...")
+    
+    # Copy config files
+    shutil.copy(source_path / "config.json", output_path / "config.json")
+    shutil.copy(source_path / "vae_config.json", output_path / "vae_config.json")
+    shutil.copy(source_path / "vae.safetensors", output_path / "vae.safetensors")
+    shutil.copy(source_path / "text_encoder_config.json", output_path / "text_encoder_config.json")
+    shutil.copy(source_path / "text_encoder.safetensors", output_path / "text_encoder.safetensors")
+    
+    # Copy directories
+    shutil.copytree(source_path / "tokenizer", output_path / "tokenizer")
+    shutil.copytree(source_path / "scheduler", output_path / "scheduler")
+    
+    # Create a metadata file noting the fused LoRAs
+    metadata = {
+        "base_model": str(source_path.name),
+        "fused_loras": lora_names,
+        "created": datetime.now().isoformat(),
+    }
+    with open(output_path / "lora_fusion_info.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    progress(1.0, desc="Done!")
+    
+    lora_list = ", ".join(lora_names)
+    return f"✅ Saved MLX model '{model_name}' with fused LoRAs: {lora_list}"
+
+
+def _save_fused_pytorch_model(model_name, source_model, lora_configs, progress, backend="PyTorch"):
+    """Save a PyTorch model with fused LoRAs."""
+    if not PYTORCH_AVAILABLE:
+        return "❌ PyTorch backend not available"
+    
+    # Determine source model path  
+    if source_model and source_model != "Z-Image-Turbo":
+        source_path = Path(PYTORCH_MODELS_DIR) / source_model
+    else:
+        source_path = Path(PYTORCH_MODEL_PATH)
+    
+    if not source_path.exists():
+        return f"❌ Source model not found: {source_path}"
+    
+    # Create output directory
+    output_path = Path(PYTORCH_MODELS_DIR) / model_name
+    if output_path.exists():
+        return f"❌ Model '{model_name}' already exists. Choose a different name."
+    
+    progress(0.1, desc="Loading source model...")
+    
+    # Load pipeline
+    pipe = ZImagePipeline.from_pretrained(
+        str(source_path),
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=False,
+    )
+    
+    progress(0.3, desc="Applying LoRAs...")
+    
+    # Apply LoRAs to the transformer
+    from lora import load_lora
+    import mlx.core as mx
+    
+    lora_names = []
+    for i, config_item in enumerate(lora_configs):
+        lora_path = Path(LORAS_DIR) / config_item['name']
+        scale = config_item.get('scale', 1.0)
+        lora_names.append(f"{config_item['name']} ({scale})")
+        
+        progress(0.3 + (0.4 * i / len(lora_configs)), desc=f"Applying: {config_item['name']}...")
+        
+        # Load LoRA weights (MLX format)
+        lora_weights = load_lora(lora_path)
+        
+        # Apply to PyTorch model
+        _apply_lora_to_pytorch_model(pipe.transformer, lora_weights, scale)
+    
+    progress(0.7, desc="Saving fused model...")
+    
+    # Save the entire pipeline
+    pipe.save_pretrained(str(output_path))
+    
+    # Create metadata file
+    metadata = {
+        "base_model": str(source_path.name),
+        "fused_loras": lora_names,
+        "created": datetime.now().isoformat(),
+    }
+    with open(output_path / "lora_fusion_info.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    progress(1.0, desc="Done!")
+    
+    lora_list = ", ".join(lora_names)
+    return f"✅ Saved PyTorch model '{model_name}' with fused LoRAs: {lora_list}"
+
+
+def _apply_lora_to_pytorch_model(model, lora_weights, scale=1.0):
+    """Apply MLX LoRA weights to a PyTorch model."""
+    from lora import parse_lora_weights
+    import mlx.core as mx
+    
+    lora_pairs = parse_lora_weights(lora_weights)
+    
+    for model_key, (lora_a, lora_b) in lora_pairs.items():
+        layer_path = model_key.rsplit(".weight", 1)[0]
+        
+        try:
+            # Navigate to the layer in PyTorch model
+            parts = layer_path.split(".")
+            layer = model
+            for part in parts:
+                if part.isdigit():
+                    layer = layer[int(part)]
+                else:
+                    layer = getattr(layer, part)
+            
+            if not hasattr(layer, 'weight'):
+                continue
+            
+            # Convert MLX arrays to numpy then to torch
+            a_np = np.array(lora_a)
+            b_np = np.array(lora_b)
+            
+            # Compute delta: B @ A (with proper dimension handling)
+            if len(a_np.shape) == 2 and len(b_np.shape) == 2:
+                delta_np = b_np @ a_np
+            else:
+                continue
+            
+            # Apply to weight
+            with torch.no_grad():
+                delta_torch = torch.from_numpy(delta_np * scale).to(layer.weight.dtype).to(layer.weight.device)
+                if delta_torch.shape == layer.weight.shape:
+                    layer.weight.add_(delta_torch)
+                    
+        except (AttributeError, IndexError, KeyError):
+            continue
+
+
+def _save_fused_comfyui_model(model_name, source_model, lora_configs, progress, backend="MLX (Apple Silicon)"):
+    """Save a ComfyUI single-file model with fused LoRAs."""
+    if not PYTORCH_AVAILABLE:
+        return "❌ PyTorch required for ComfyUI format"
+    
+    from safetensors.torch import save_file as torch_save_safetensors
+    from convert_pytorch_to_comfyui import (
+        convert_transformer_key_to_comfyui,
+        convert_text_encoder_key_to_comfyui,
+        convert_vae_key_to_comfyui,
+    )
+    
+    # Determine source model path - need PyTorch format for ComfyUI
+    if source_model and source_model != "Z-Image-Turbo":
+        source_path = Path(PYTORCH_MODELS_DIR) / source_model
+    else:
+        source_path = Path(PYTORCH_MODEL_PATH)
+    
+    if not source_path.exists():
+        return f"❌ PyTorch source model not found: {source_path}"
+    
+    # Output to comfyui directory
+    output_dir = Path(MODELS_DIR) / "comfyui"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"{model_name}.safetensors"
+    
+    if output_file.exists():
+        return f"❌ ComfyUI model '{model_name}.safetensors' already exists"
+    
+    progress(0.05, desc="Loading PyTorch model for ComfyUI conversion...")
+    
+    # Load pipeline
+    pipe = ZImagePipeline.from_pretrained(
+        str(source_path),
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=False,
+    )
+    
+    progress(0.15, desc="Applying LoRAs...")
+    
+    # Apply LoRAs to the transformer
+    from lora import load_lora
+    
+    lora_names = []
+    for i, config_item in enumerate(lora_configs):
+        lora_path = Path(LORAS_DIR) / config_item['name']
+        scale = config_item.get('scale', 1.0)
+        lora_names.append(f"{config_item['name']} ({scale})")
+        
+        progress(0.15 + (0.25 * i / len(lora_configs)), desc=f"Applying: {config_item['name']}...")
+        
+        lora_weights = load_lora(lora_path)
+        _apply_lora_to_pytorch_model(pipe.transformer, lora_weights, scale)
+    
+    progress(0.4, desc="Converting transformer weights...")
+    
+    all_weights = {}
+    
+    # Convert transformer weights with QKV fusion
+    transformer = pipe.transformer.state_dict()
+    
+    # Identify Q/K/V groups for fusion
+    qkv_groups = {}
+    other_keys = []
+    
+    for key in transformer.keys():
+        if ".attention.to_q.weight" in key:
+            base_key = key.replace(".to_q.weight", "")
+            if base_key not in qkv_groups:
+                qkv_groups[base_key] = {}
+            qkv_groups[base_key]["q"] = key
+        elif ".attention.to_k.weight" in key:
+            base_key = key.replace(".to_k.weight", "")
+            if base_key not in qkv_groups:
+                qkv_groups[base_key] = {}
+            qkv_groups[base_key]["k"] = key
+        elif ".attention.to_v.weight" in key:
+            base_key = key.replace(".to_v.weight", "")
+            if base_key not in qkv_groups:
+                qkv_groups[base_key] = {}
+            qkv_groups[base_key]["v"] = key
+        else:
+            other_keys.append(key)
+    
+    # Fuse Q, K, V weights
+    for base_key, qkv_keys in qkv_groups.items():
+        if "q" in qkv_keys and "k" in qkv_keys and "v" in qkv_keys:
+            q = transformer[qkv_keys["q"]]
+            k = transformer[qkv_keys["k"]]
+            v = transformer[qkv_keys["v"]]
+            fused = torch.cat([q, k, v], dim=0)
+            comfyui_key = convert_transformer_key_to_comfyui(f"{base_key}.qkv.weight")
+            all_weights[comfyui_key] = fused
+    
+    # Convert other transformer weights
+    for key in other_keys:
+        comfyui_key = convert_transformer_key_to_comfyui(key)
+        all_weights[comfyui_key] = transformer[key]
+    
+    progress(0.6, desc="Converting text encoder weights...")
+    
+    # Convert text encoder weights
+    if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
+        te_state = pipe.text_encoder.state_dict()
+        for key, value in te_state.items():
+            comfyui_key = convert_text_encoder_key_to_comfyui(key)
+            all_weights[comfyui_key] = value
+    
+    progress(0.75, desc="Converting VAE weights...")
+    
+    # Convert VAE weights
+    if hasattr(pipe, 'vae') and pipe.vae is not None:
+        vae_state = pipe.vae.state_dict()
+        for key, value in vae_state.items():
+            comfyui_key = convert_vae_key_to_comfyui(key)
+            all_weights[comfyui_key] = value
+    
+    progress(0.9, desc="Saving ComfyUI checkpoint...")
+    
+    # Save combined checkpoint
+    torch_save_safetensors(all_weights, str(output_file))
+    
+    # Calculate file size
+    file_size = output_file.stat().st_size / (1024 * 1024 * 1024)
+    
+    progress(1.0, desc="Done!")
+    
+    lora_list = ", ".join(lora_names)
+    return f"✅ Saved ComfyUI model '{model_name}.safetensors' ({file_size:.2f}GB) with fused LoRAs: {lora_list}"
+
+
+# --- Upscaler Functions ---
+
+def get_upscaler_choices():
+    """Get list of available upscalers for dropdown.
+    Returns ["None"] plus all supported (ESRGAN/RRDB) upscaler names.
+    """
+    if not UPSCALER_AVAILABLE:
+        return ["None (upscaler not available)"]
+    
+    # Only show supported upscalers (ESRGAN/RRDB architecture)
+    upscalers = get_available_upscalers(Path(UPSCALERS_DIR), filter_supported=True)
+    if not upscalers:
+        return ["None (no supported upscalers found)"]
+    return ["None"] + upscalers
+
+
+def load_cached_upscaler(upscaler_name):
+    """Load and cache an upscaler model.
+    Returns None if upscaler_name is "None" or invalid.
+    """
+    global _upscaler_model, _current_upscaler_name
+    
+    if not UPSCALER_AVAILABLE:
+        return None
+    
+    if upscaler_name == "None" or not upscaler_name or upscaler_name.startswith("None"):
+        _upscaler_model = None
+        _current_upscaler_name = None
+        return None
+    
+    # Check if already loaded
+    if _upscaler_model is not None and _current_upscaler_name == upscaler_name:
+        return _upscaler_model
+    
+    # Load new upscaler
+    try:
+        _upscaler_model = load_upscaler(upscaler_name, Path(UPSCALERS_DIR))
+        _current_upscaler_name = upscaler_name
+        return _upscaler_model
+    except ValueError as e:
+        # Unsupported architecture (e.g., SPAN models)
+        print(f"Warning: {e}")
+        _upscaler_model = None
+        _current_upscaler_name = None
+        return None
+    except Exception as e:
+        print(f"Error loading upscaler {upscaler_name}: {e}")
+        _upscaler_model = None
+        _current_upscaler_name = None
+        return None
+
+
+def apply_upscaler(image, upscaler_name, scale_factor=2.0, progress=None):
+    """Apply upscaler to an image.
+    
+    Args:
+        image: PIL Image to upscale
+        upscaler_name: Name of the upscaler to use (or "None" to skip)
+        scale_factor: Target scale factor (1.0-4.0). ESRGAN does 4x then resizes down.
+        progress: Optional Gradio progress callback
+        
+    Returns:
+        Upscaled PIL Image (or original if upscaler_name is "None" or scale_factor <= 1)
+    """
+    if not UPSCALER_AVAILABLE:
+        return image
+    
+    if upscaler_name == "None" or not upscaler_name or upscaler_name.startswith("None"):
+        return image
+    
+    if scale_factor <= 1.0:
+        return image
+    
+    if progress:
+        progress(desc=f"Loading upscaler: {upscaler_name}...")
+    
+    model = load_cached_upscaler(upscaler_name)
+    if model is None:
+        print(f"Warning: Could not load upscaler {upscaler_name}")
+        return image
+    
+    if progress:
+        progress(desc=f"Upscaling image ({scale_factor}×)...")
+    
+    try:
+        # ESRGAN always does 4x, then we resize to target scale
+        upscaled = upscale_image_esrgan(model, image)
+        
+        # If scale_factor < 4.0, resize down to target
+        if scale_factor < 4.0:
+            orig_w, orig_h = image.size
+            target_w = int(orig_w * scale_factor)
+            target_h = int(orig_h * scale_factor)
+            upscaled = upscaled.resize((target_w, target_h), Image.LANCZOS)
+        
+        return upscaled
+    except Exception as e:
+        print(f"Error upscaling image: {e}")
+        return image
+
+
+# --- Latent Upscaling Functions ---
+
+def get_available_memory_gb():
+    """Estimate available GPU memory in GB for tile size calculation.
+    
+    Returns conservative estimate based on system memory and Metal limits.
+    """
+    import subprocess
+    try:
+        # Get total system memory (proxy for unified memory on Apple Silicon)
+        result = subprocess.run(['sysctl', '-n', 'hw.memsize'], capture_output=True, text=True)
+        total_bytes = int(result.stdout.strip())
+        total_gb = total_bytes / (1024 ** 3)
+        
+        # Conservative estimate: assume 50% available for GPU, minus overhead
+        # This accounts for system usage, other apps, and MLX overhead
+        available_gb = (total_gb * 0.5) - 4.0  # Reserve 4GB for system
+        return max(4.0, available_gb)  # Minimum 4GB
+    except Exception:
+        return 8.0  # Default fallback
+
+
+def calculate_optimal_tile_size(latent_height, latent_width, scale_factor, available_memory_gb=None):
+    """Calculate optimal tile size based on available memory.
+    
+    Args:
+        latent_height: Height of latent tensor
+        latent_width: Width of latent tensor
+        scale_factor: Upscale multiplier (1.0-4.0)
+        available_memory_gb: Override for available memory (auto-detect if None)
+        
+    Returns:
+        Tuple of (tile_size, overlap) in latent pixels
+    """
+    if available_memory_gb is None:
+        available_memory_gb = get_available_memory_gb()
+    
+    # Estimate memory per latent pixel (empirically determined)
+    # Transformer forward pass is ~0.5MB per latent pixel at 1x scale
+    # Scale quadratically with upscale factor
+    memory_per_pixel_mb = 0.5 * (scale_factor ** 2)
+    
+    # Calculate max tile area that fits in memory
+    # Reserve 30% for overhead (attention, intermediates, etc.)
+    usable_memory_mb = available_memory_gb * 1024 * 0.7
+    max_tile_area = usable_memory_mb / memory_per_pixel_mb
+    
+    # Calculate tile size (square tiles)
+    max_tile_size = int(max_tile_area ** 0.5)
+    
+    # Clamp to reasonable range and ensure divisible by 8
+    tile_size = max(32, min(256, max_tile_size))
+    tile_size = (tile_size // 8) * 8
+    
+    # Overlap should be ~12.5% of tile size for smooth blending
+    overlap = max(8, tile_size // 8)
+    
+    # If the full latent fits in memory, use no tiling
+    total_area = latent_height * latent_width * (scale_factor ** 2)
+    if total_area <= max_tile_area * 0.8:  # 80% threshold for safety
+        return None, None  # No tiling needed
+    
+    return tile_size, overlap
+
+
+def blend_tiles(output, tile, y_start, x_start, tile_h, tile_w, overlap, full_h, full_w):
+    """Blend a tile into the output with linear gradient at overlapping edges.
+    
+    Args:
+        output: Full output tensor [B, H, W, C]
+        tile: Tile to blend [B, tile_h, tile_w, C]
+        y_start, x_start: Position of tile in output
+        tile_h, tile_w: Size of tile
+        overlap: Overlap size in pixels
+        full_h, full_w: Full output dimensions
+        
+    Returns:
+        Updated output tensor
+    """
+    import mlx.core as mx
+    
+    # Create weight mask for blending
+    weight = mx.ones((tile_h, tile_w))
+    
+    # Apply linear gradient at edges that overlap with other tiles
+    # Top edge
+    if y_start > 0:
+        for i in range(min(overlap, tile_h)):
+            weight = weight.at[i, :].set(weight[i, :] * (i / overlap))
+    
+    # Left edge
+    if x_start > 0:
+        for j in range(min(overlap, tile_w)):
+            weight = weight.at[:, j].set(weight[:, j] * (j / overlap))
+    
+    # Bottom edge
+    if y_start + tile_h < full_h:
+        for i in range(min(overlap, tile_h)):
+            idx = tile_h - 1 - i
+            weight = weight.at[idx, :].set(weight[idx, :] * (i / overlap))
+    
+    # Right edge
+    if x_start + tile_w < full_w:
+        for j in range(min(overlap, tile_w)):
+            idx = tile_w - 1 - j
+            weight = weight.at[:, idx].set(weight[:, idx] * (j / overlap))
+    
+    # Expand weight to match tile shape [B, H, W, C]
+    weight = weight[None, :, :, None]
+    
+    # Blend into output
+    y_end = y_start + tile_h
+    x_end = x_start + tile_w
+    
+    current = output[:, y_start:y_end, x_start:x_end, :]
+    blended = current + (tile - current) * weight
+    output = output.at[:, y_start:y_end, x_start:x_end, :].set(blended)
+    
+    return output
+
+
+def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler, 
+                       scale_factor=2.0, denoise_strength=0.55, hires_steps=None,
+                       seed=None, interp_mode='cubic', progress=None, progress_start=0.8):
+    """Upscale latents in latent space with refinement denoising.
+    
+    This adds detail at higher resolution by:
+    1. Spatially upscaling the denoised latents
+    2. Adding noise at specified strength
+    3. Running partial denoising to generate new detail
+    
+    Uses tiled processing for memory efficiency on large upscales.
+    
+    Args:
+        latents: Denoised latents [B, H, W, C] in NHWC format
+        prompt_embeds: Text embeddings (list of tensors)
+        model: Transformer model
+        vae: VAE (not used directly, for future encode/decode cycle)
+        vae_config: VAE configuration dict
+        scheduler: FlowMatchEulerDiscreteScheduler
+        scale_factor: Upscale multiplier (1.0-4.0)
+        denoise_strength: How much to re-noise (0.0-1.0, higher = more change)
+        hires_steps: Refinement steps (None = auto based on denoise_strength)
+        seed: Random seed for noise
+        interp_mode: Interpolation mode ('nearest', 'linear', 'cubic')
+        progress: Optional Gradio progress callback
+        progress_start: Progress percentage where latent upscale starts
+        
+    Returns:
+        Upscaled and refined latents [B, H*scale, W*scale, C]
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+    
+    if scale_factor <= 1.0 or denoise_strength <= 0.0:
+        return latents
+    
+    batch_size, h, w, channels = latents.shape
+    new_h = int(h * scale_factor)
+    new_w = int(w * scale_factor)
+    
+    if progress:
+        progress(progress_start, desc=f"Latent upscale: {h}×{w} → {new_h}×{new_w}...")
+    
+    # Step 1: Spatially upscale latents
+    # MLX Upsample expects NHWC format which we already have
+    upsampler = nn.Upsample(scale_factor=scale_factor, mode=interp_mode, align_corners=True)
+    upscaled = upsampler(latents)
+    mx.eval(upscaled)
+    
+    if progress:
+        progress(progress_start + 0.02, desc="Adding noise for refinement...")
+    
+    # Step 2: Determine number of refinement steps
+    if hires_steps is None or hires_steps == 0:
+        # Auto: scale steps based on denoise strength
+        # At strength 1.0, use full steps; at 0.5, use half
+        hires_steps = max(1, int(9 * denoise_strength))  # Base on typical 9 steps
+    
+    # Step 3: Calculate start step based on denoise strength
+    # strength 1.0 = start from full noise (step 0)
+    # strength 0.0 = no denoising (would skip entirely)
+    scheduler.set_timesteps(hires_steps)
+    timesteps = scheduler.timesteps
+    
+    # Start step: strength=1.0 → step 0; strength=0.5 → step halfway
+    start_step = int((1.0 - denoise_strength) * len(timesteps))
+    start_step = max(0, min(start_step, len(timesteps) - 1))
+    
+    # Get timestep for noise level
+    t_start = timesteps[start_step]
+    
+    # Step 4: Generate noise and add to upscaled latents
+    if seed is not None:
+        torch.manual_seed(seed + 1000)  # Offset seed for variety
+    
+    # Generate noise in PyTorch for reproducibility, then convert
+    noise_pt = torch.randn(batch_size, channels, 1, new_h, new_w)
+    noise = mx.array(noise_pt.numpy())
+    noise = noise.squeeze(2).transpose(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+    
+    # Add noise at the calculated timestep
+    # For flow matching: noisy = (1 - t) * clean + t * noise, where t is normalized
+    t_normalized = t_start.item() / 1000.0  # Normalize to [0, 1]
+    noisy_latents = (1.0 - t_normalized) * upscaled + t_normalized * noise
+    mx.eval(noisy_latents)
+    
+    # Step 5: Check if tiling is needed
+    tile_size, overlap = calculate_optimal_tile_size(new_h, new_w, 1.0)  # Already upscaled
+    
+    use_tiling = tile_size is not None and (new_h > tile_size or new_w > tile_size)
+    
+    if use_tiling:
+        if progress:
+            progress(progress_start + 0.05, desc=f"Using tiled processing ({tile_size}×{tile_size} tiles)...")
+        return _latent_upscale_tiled(
+            noisy_latents, prompt_embeds, model, scheduler, timesteps,
+            start_step, new_h, new_w, tile_size, overlap, progress, progress_start
+        )
+    else:
+        # Process full resolution
+        return _latent_denoise_steps(
+            noisy_latents, prompt_embeds, model, scheduler, timesteps,
+            start_step, progress, progress_start
+        )
+
+
+def _latent_denoise_steps(latents, prompt_embeds, model, scheduler, timesteps,
+                          start_step, progress=None, progress_start=0.8):
+    """Run denoising steps on latents.
+    
+    Args:
+        latents: Noisy latents [B, H, W, C] in NHWC format
+        prompt_embeds: Text embeddings
+        model: Transformer model
+        scheduler: Scheduler with timesteps set
+        timesteps: Full timestep schedule
+        start_step: Index to start denoising from
+        progress: Optional progress callback
+        progress_start: Base progress percentage
+        
+    Returns:
+        Denoised latents [B, H, W, C]
+    """
+    import mlx.core as mx
+    
+    remaining_steps = len(timesteps) - start_step
+    
+    for i, t in enumerate(timesteps[start_step:]):
+        step_num = i + 1
+        total_steps = remaining_steps
+        
+        if progress:
+            step_progress = progress_start + 0.1 + (0.08 * (step_num / total_steps))
+            progress(step_progress, desc=f"Hires step {step_num}/{total_steps}...")
+        
+        # Convert latents to model format: [B, H, W, C] -> [B, C, 1, H, W]
+        latents_5d = latents.transpose(0, 3, 1, 2)[:, :, None, :, :]
+        
+        # Timestep in model format
+        t_mx = mx.array([(1000.0 - t.item()) / 1000.0])
+        
+        # Forward pass
+        noise_pred = model(latents_5d, t_mx, prompt_embeds)
+        noise_pred = -noise_pred  # Negate as in main pipeline
+        mx.eval(noise_pred)
+        
+        # Scheduler step (via PyTorch)
+        noise_pred_sq = noise_pred.squeeze(2)  # [B, C, H, W]
+        latents_sq = latents.transpose(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        
+        noise_pred_pt = torch.from_numpy(np.array(noise_pred_sq))
+        latents_pt = torch.from_numpy(np.array(latents_sq))
+        
+        step_output = scheduler.step(noise_pred_pt, t, latents_pt, return_dict=True)
+        
+        # Convert back to MLX NHWC format
+        latents = mx.array(step_output.prev_sample.numpy())
+        latents = latents.transpose(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+    
+    return latents
+
+
+def _latent_upscale_tiled(latents, prompt_embeds, model, scheduler, timesteps,
+                          start_step, full_h, full_w, tile_size, overlap,
+                          progress=None, progress_start=0.8):
+    """Process latent denoising in tiles for memory efficiency.
+    
+    Args:
+        latents: Noisy latents [B, H, W, C]
+        prompt_embeds: Text embeddings
+        model: Transformer model
+        scheduler: Scheduler
+        timesteps: Timestep schedule
+        start_step: Index to start from
+        full_h, full_w: Full latent dimensions
+        tile_size: Size of each tile
+        overlap: Overlap between tiles
+        progress: Optional progress callback
+        progress_start: Base progress percentage
+        
+    Returns:
+        Denoised latents [B, H, W, C]
+    """
+    import mlx.core as mx
+    
+    batch_size = latents.shape[0]
+    channels = latents.shape[3]
+    remaining_steps = len(timesteps) - start_step
+    
+    # Calculate tile positions
+    stride = tile_size - overlap
+    y_positions = list(range(0, full_h - overlap, stride))
+    x_positions = list(range(0, full_w - overlap, stride))
+    
+    # Ensure we cover the full image
+    if y_positions[-1] + tile_size < full_h:
+        y_positions.append(full_h - tile_size)
+    if x_positions[-1] + tile_size < full_w:
+        x_positions.append(full_w - tile_size)
+    
+    total_tiles = len(y_positions) * len(x_positions)
+    
+    # Process each denoising step
+    for step_idx, t in enumerate(timesteps[start_step:]):
+        step_num = step_idx + 1
+        
+        if progress:
+            step_progress = progress_start + 0.1 + (0.08 * (step_num / remaining_steps))
+            progress(step_progress, desc=f"Hires step {step_num}/{remaining_steps} ({total_tiles} tiles)...")
+        
+        # Initialize output for this step
+        output = mx.zeros((batch_size, full_h, full_w, channels))
+        weight_sum = mx.zeros((1, full_h, full_w, 1))
+        
+        # Process each tile
+        for y_idx, y_start in enumerate(y_positions):
+            for x_idx, x_start in enumerate(x_positions):
+                # Calculate actual tile bounds (may be smaller at edges)
+                y_end = min(y_start + tile_size, full_h)
+                x_end = min(x_start + tile_size, full_w)
+                tile_h = y_end - y_start
+                tile_w = x_end - x_start
+                
+                # Extract tile
+                tile = latents[:, y_start:y_end, x_start:x_end, :]
+                
+                # Convert to model format: [B, H, W, C] -> [B, C, 1, H, W]
+                tile_5d = tile.transpose(0, 3, 1, 2)[:, :, None, :, :]
+                
+                # Timestep
+                t_mx = mx.array([(1000.0 - t.item()) / 1000.0])
+                
+                # Forward pass on tile
+                noise_pred = model(tile_5d, t_mx, prompt_embeds)
+                noise_pred = -noise_pred
+                mx.eval(noise_pred)
+                
+                # Scheduler step
+                noise_pred_sq = noise_pred.squeeze(2)
+                tile_sq = tile.transpose(0, 3, 1, 2)
+                
+                noise_pred_pt = torch.from_numpy(np.array(noise_pred_sq))
+                tile_pt = torch.from_numpy(np.array(tile_sq))
+                
+                step_output = scheduler.step(noise_pred_pt, t, tile_pt, return_dict=True)
+                
+                # Convert back to NHWC
+                denoised_tile = mx.array(step_output.prev_sample.numpy())
+                denoised_tile = denoised_tile.transpose(0, 2, 3, 1)
+                
+                # Create blending weights
+                weight = mx.ones((1, tile_h, tile_w, 1))
+                
+                # Apply gradient at overlapping edges
+                if y_start > 0:
+                    for i in range(min(overlap, tile_h)):
+                        alpha = i / overlap
+                        weight = weight.at[:, i, :, :].set(weight[:, i, :, :] * alpha)
+                
+                if x_start > 0:
+                    for j in range(min(overlap, tile_w)):
+                        alpha = j / overlap
+                        weight = weight.at[:, :, j, :].set(weight[:, :, j, :] * alpha)
+                
+                if y_end < full_h:
+                    for i in range(min(overlap, tile_h)):
+                        idx = tile_h - 1 - i
+                        alpha = i / overlap
+                        weight = weight.at[:, idx, :, :].set(weight[:, idx, :, :] * alpha)
+                
+                if x_end < full_w:
+                    for j in range(min(overlap, tile_w)):
+                        idx = tile_w - 1 - j
+                        alpha = j / overlap
+                        weight = weight.at[:, :, idx, :].set(weight[:, :, idx, :] * alpha)
+                
+                # Accumulate weighted tile
+                output = output.at[:, y_start:y_end, x_start:x_end, :].add(denoised_tile * weight)
+                weight_sum = weight_sum.at[:, y_start:y_end, x_start:x_end, :].add(weight)
+        
+        # Normalize by weight sum
+        latents = output / (weight_sum + 1e-8)
+        mx.eval(latents)
+    
+    return latents
+
+
 # Global cache for prompt enhancer model
 _prompt_enhancer = None
 
@@ -1682,14 +2617,24 @@ Respond ONLY with the enhanced prompt, no explanations or preamble."""
     return enhanced
 
 
-def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_configs=None):
+def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_configs=None,
+                 latent_scale=1.0, latent_steps=0, latent_denoise=0.55, latent_interp='cubic',
+                 cache_mode=None):
     """Generate image using MLX backend
     
     Args:
         lora_configs: Optional list of dicts with 'name' and 'scale' keys for LoRAs to apply
+        latent_scale: Latent space upscale factor (1.0-4.0, 1.0 = no upscale)
+        latent_steps: Hires refinement steps (0 = auto based on denoise strength)
+        latent_denoise: Denoising strength for latent upscale (0.0-1.0)
+        latent_interp: Interpolation mode ('nearest', 'linear', 'cubic')
+        cache_mode: LeMiCa cache mode ('slow', 'medium', 'fast') or None to disable
     """
     import mlx.core as mx
     global _mlx_models, _current_applied_lora
+    
+    # Determine if latent upscaling is enabled
+    do_latent_upscale = latent_scale > 1.0 and latent_denoise > 0.0
     
     # Normalize lora_configs to empty list if None
     if lora_configs is None:
@@ -1777,6 +2722,15 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     latents_pt = torch.randn(batch_size, num_channels_latents, 1, latent_height, latent_width)
     latents = mx.array(latents_pt.numpy())
     
+    # Configure LeMiCa caching if enabled
+    if cache_mode and cache_mode.lower() != "none":
+        model.configure_lemica(cache_mode, steps)
+    else:
+        model.configure_lemica(None)
+    
+    # Reset LeMiCa state for this generation (ensures counter starts at 0)
+    model.reset_lemica_state()
+    
     # Denoising loop
     scheduler.set_timesteps(steps)
     timesteps = scheduler.timesteps
@@ -1805,12 +2759,37 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
         latents = mx.array(step_output.prev_sample.numpy())
         latents = latents[:, :, None, :, :]
     
-    progress(0.85, desc="Decoding image...")
+    # Convert latents to NHWC format for potential latent upscaling and VAE decode
+    latents = latents.squeeze(2)  # [B, C, H, W]
+    latents = latents.transpose(0, 2, 3, 1)  # [B, H, W, C]
     
-    # Decode latents
-    latents = latents.squeeze(2)
-    latents = latents.transpose(0, 2, 3, 1)
+    # Apply latent upscaling if enabled
+    if do_latent_upscale:
+        # Disable LeMiCa during hires refinement - the cached residuals from base generation
+        # are not valid for the upscaled latent space
+        model.configure_lemica(None)
+        
+        progress(0.80, desc=f"Latent upscale {latent_scale}× ({latent_interp})...")
+        latents = latent_upscale_mlx(
+            latents=latents,
+            prompt_embeds=prompt_embeds_list,
+            model=model,
+            vae=vae,
+            vae_config=vae_config,
+            scheduler=scheduler,
+            scale_factor=latent_scale,
+            denoise_strength=latent_denoise,
+            hires_steps=latent_steps if latent_steps > 0 else None,
+            seed=seed,
+            interp_mode=latent_interp,
+            progress=progress,
+            progress_start=0.80,
+        )
+        progress(0.92, desc="Decoding upscaled image...")
+    else:
+        progress(0.85, desc="Decoding image...")
     
+    # Decode latents (already in NHWC format)
     scaling_factor = vae_config.get("scaling_factor", 0.3611)
     shift_factor = vae_config.get("shift_factor", 0.1159)
     
@@ -1869,7 +2848,7 @@ def update_aspect_ratios(base_resolution):
     return gr.update(choices=choices, value=choices[0])
 
 
-def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name, lora_configs=None):
+def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None, latent_scale=None, latent_denoise=None, latent_interp=None):
     """Add a generated image to the gallery"""
     global _image_gallery
     _image_gallery.append({
@@ -1885,6 +2864,11 @@ def add_to_gallery(image, prompt, seed, png_path, jpg_path, steps, time_shift, b
         "height": height,
         "model_name": model_name,
         "lora_configs": lora_configs or [],
+        "upscaler": upscaler_name,
+        "upscale_factor": upscale_factor,
+        "latent_scale": latent_scale,
+        "latent_denoise": latent_denoise,
+        "latent_interp": latent_interp,
     })
     return [item["image"] for item in _image_gallery]
 
@@ -1915,6 +2899,20 @@ def get_selected_image_info(evt: gr.SelectData):
         if lora_configs:
             lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
             details_lines.append(f"LoRAs: {', '.join(lora_strs)}")
+        
+        # Add latent upscale info if used
+        latent_scale = item.get('latent_scale')
+        if latent_scale and latent_scale > 1.0:
+            latent_denoise = item.get('latent_denoise', 0.55)
+            latent_interp = item.get('latent_interp', 'cubic')
+            details_lines.append(f"Latent Upscale: {latent_scale}× (denoise: {latent_denoise}, {latent_interp})")
+        
+        # Add ESRGAN upscaler info if used
+        upscaler = item.get('upscaler')
+        if upscaler and upscaler != "None":
+            upscale_factor = item.get('upscale_factor')
+            scale_str = f"{upscale_factor}×" if upscale_factor else "4×"
+            details_lines.append(f"ESRGAN: {upscaler} ({scale_str})")
         
         details_lines.append(f"Index: {evt.index + 1} of {len(_image_gallery)}")
         details = "\n".join(details_lines)
@@ -1951,7 +2949,7 @@ def clear_gallery():
     return [], None, "", "", "", "", 0, ""
 
 
-def create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None):
+def create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None, latent_scale=None, latent_denoise=None, latent_interp=None):
     """Create a metadata string for embedding in images"""
     lines = [
         prompt,
@@ -1970,6 +2968,15 @@ def create_metadata_string(prompt, seed, steps, time_shift, backend, width, heig
         lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
         lines.append(f"LoRAs: {', '.join(lora_strs)}")
     
+    # Add latent upscale info if used
+    if latent_scale and latent_scale > 1.0:
+        lines.append(f"Latent Upscale: {latent_scale}× (denoise: {latent_denoise}, interp: {latent_interp})")
+    
+    # Add ESRGAN upscaler info if used
+    if upscaler_name and upscaler_name != "None":
+        scale_str = f"{upscale_factor}×" if upscale_factor else "4×"
+        lines.append(f"ESRGAN: {upscaler_name} ({scale_str})")
+    
     lines.extend([
         "",
         "Generated with Z-Image-Turbo-MLX",
@@ -1979,9 +2986,9 @@ def create_metadata_string(prompt, seed, steps, time_shift, backend, width, heig
     return "\n".join(lines)
 
 
-def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None):
+def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs=None, upscaler_name=None, upscale_factor=None, latent_scale=None, latent_denoise=None, latent_interp=None):
     """Save image with embedded metadata"""
-    metadata_str = create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs)
+    metadata_str = create_metadata_string(prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs, upscaler_name, upscale_factor, latent_scale, latent_denoise, latent_interp)
     
     if filepath.lower().endswith('.png'):
         # PNG metadata using PngInfo
@@ -1998,6 +3005,13 @@ def save_image_with_metadata(pil_image, filepath, prompt, seed, steps, time_shif
         if lora_configs:
             lora_strs = [f"{c['name']}: {c['scale']}" for c in lora_configs]
             png_info.add_text("loras", ", ".join(lora_strs))
+        if latent_scale and latent_scale > 1.0:
+            png_info.add_text("latent_scale", str(latent_scale))
+            png_info.add_text("latent_denoise", str(latent_denoise))
+            png_info.add_text("latent_interp", latent_interp)
+        if upscaler_name and upscaler_name != "None":
+            png_info.add_text("upscaler", upscaler_name)
+            png_info.add_text("upscale_factor", str(upscale_factor))
         png_info.add_text("generator", "Z-Image-Turbo-MLX")
         png_info.add_text("generator_url", "https://github.com/FiditeNemini/z-image-turbo-mlx")
         pil_image.save(filepath, "PNG", pnginfo=png_info)
@@ -2091,12 +3105,22 @@ def save_selected_or_all(selected_index, png_path, jpg_path, prompt, seed, datas
         return f"BATCH SAVE COMPLETE:\n{result}"
 
 
-def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, lora_configs=None, lora_tags="", progress=gr.Progress()):
+def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, 
+                   lora_configs=None, lora_tags="", 
+                   latent_scale=1.0, latent_steps=0, latent_denoise=0.55, latent_interp='cubic',
+                   upscaler_name="None", upscale_factor=2.0, cache_mode=None, progress=gr.Progress()):
     """Generate an image using selected backend and model
     
     Args:
         lora_configs: List of {"name": str, "scale": float, "trigger": str} dicts
         lora_tags: Pre-built string of LoRA tags to append to prompt
+        latent_scale: Latent upscale factor (1.0-4.0, 1.0 = disabled)
+        latent_steps: Hires refinement steps (0 = auto)
+        latent_denoise: Denoising strength for latent upscale (0.0-1.0)
+        latent_interp: Interpolation mode ('nearest', 'linear', 'cubic')
+        upscaler_name: Name of ESRGAN upscaler to use (or "None" to skip)
+        upscale_factor: ESRGAN scale factor (1.0-4.0)
+        cache_mode: LeMiCa cache mode ('slow', 'medium', 'fast') or None for no caching
     """
     
     if not prompt.strip():
@@ -2124,20 +3148,45 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     else:
         full_prompt = prompt.strip()
     
+    # Determine if ESRGAN upscaling is enabled
+    will_upscale = (upscaler_name and upscaler_name != "None" and 
+                    not upscaler_name.startswith("None") and upscale_factor > 1.0)
+    
+    # Determine if latent upscaling is enabled
+    will_latent_upscale = latent_scale > 1.0 and latent_denoise > 0.0
+    
     progress(0, desc=f"Loading {model_name}...")
     
     if backend == "MLX (Apple Silicon)":
         # Select the MLX model
         select_mlx_model(model_name)
-        pil_image = generate_mlx(full_prompt, width, height, steps, time_shift, seed, progress, lora_configs=lora_configs)
+        pil_image = generate_mlx(
+            full_prompt, width, height, steps, time_shift, seed, progress, 
+            lora_configs=lora_configs,
+            latent_scale=latent_scale if will_latent_upscale else 1.0,
+            latent_steps=latent_steps,
+            latent_denoise=latent_denoise,
+            latent_interp=latent_interp,
+            cache_mode=cache_mode
+        )
     else:
         # Select the PyTorch model
         select_pytorch_model(model_name)
         if lora_configs:
             print(f"Warning: LoRA support for PyTorch backend not yet implemented")
+        if will_latent_upscale:
+            print(f"Warning: Latent upscaling for PyTorch backend not yet implemented")
         pil_image = generate_pytorch(full_prompt, width, height, steps, time_shift, seed, progress)
     
-    progress(0.95, desc="Saving temporary files...")
+    # Apply ESRGAN upscaling if enabled
+    if will_upscale:
+        progress(0.93, desc=f"ESRGAN {upscale_factor}× with {upscaler_name}...")
+        original_size = pil_image.size
+        pil_image = apply_upscaler(pil_image, upscaler_name, upscale_factor, progress)
+        new_size = pil_image.size
+        print(f"ESRGAN: {original_size[0]}×{original_size[1]} → {new_size[0]}×{new_size[1]}")
+    
+    progress(0.97, desc="Saving temporary files...")
     
     # Generate timestamp-based filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2148,14 +3197,19 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     png_path = os.path.join(TEMP_DIR, f"{timestamp}.png")
     jpg_path = os.path.join(TEMP_DIR, f"{timestamp}.jpg")
     
-    # Save images with embedded metadata
-    save_image_with_metadata(pil_image, png_path, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs)
-    save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, width, height, model_name, lora_configs)
+    # Save images with embedded metadata (use final image size after upscaling)
+    final_width, final_height = pil_image.size
+    actual_upscale_factor = upscale_factor if will_upscale else None
+    actual_latent_scale = latent_scale if will_latent_upscale else None
+    actual_latent_denoise = latent_denoise if will_latent_upscale else None
+    actual_latent_interp = latent_interp if will_latent_upscale else None
+    save_image_with_metadata(pil_image, png_path, prompt, seed, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor, actual_latent_scale, actual_latent_denoise, actual_latent_interp)
+    save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor, actual_latent_scale, actual_latent_denoise, actual_latent_interp)
     
     progress(1.0, desc="Done!")
     
     # Add to gallery with all generation parameters
-    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, width, height, model_name, lora_configs)
+    gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor, actual_latent_scale, actual_latent_denoise, actual_latent_interp)
     
     return gallery_images, png_path, jpg_path, prompt, seed
 
@@ -2232,6 +3286,14 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                             info="Scheduler shift parameter (default: 3.0)",
                         )
                     
+                    with gr.Row():
+                        cache_mode = gr.Dropdown(
+                            choices=["None", "slow", "medium", "fast"],
+                            value="None",
+                            label="⚡ LeMiCa Speed",
+                            info="Cache mode: slow ~14%, medium ~22%, fast ~30% faster",
+                        )
+                    
                     # LoRA Section - Individual rows with spinners
                     with gr.Accordion("🎨 LoRA Settings", open=False) as lora_accordion:
                         gr.Markdown("*Enable LoRAs and adjust weights using the spinners (0.05 increments). Edit trigger words as needed.*")
@@ -2297,6 +3359,106 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         )
                         
                         refresh_loras_btn = gr.Button("🔄 Refresh LoRA List", size="sm")
+                        
+                        gr.Markdown("---")
+                        gr.Markdown("**💾 Save Model with Fused LoRAs**")
+                        gr.Markdown("*Create a new model with selected LoRAs permanently baked in.*")
+                        
+                        with gr.Row():
+                            fused_model_name = gr.Textbox(
+                                label="New Model Name",
+                                placeholder="e.g., my-custom-model",
+                                info="Alphanumeric, hyphens, underscores only",
+                                scale=3,
+                            )
+                        
+                        with gr.Row():
+                            save_mlx_checkbox = gr.Checkbox(
+                                label="MLX",
+                                value=True,
+                                info="Apple Silicon",
+                            )
+                            save_pytorch_checkbox = gr.Checkbox(
+                                label="PyTorch",
+                                value=False,
+                                info="Diffusers format",
+                            )
+                            save_comfyui_checkbox = gr.Checkbox(
+                                label="ComfyUI",
+                                value=False,
+                                info="Single .safetensors",
+                            )
+                            save_fused_btn = gr.Button("💾 Save Fused Model", variant="secondary", scale=1)
+                        
+                        fused_model_status = gr.Textbox(
+                            label="Status",
+                            value="",
+                            interactive=False,
+                            visible=True,
+                        )
+                    
+                    # Upscaler Section
+                    with gr.Accordion("🔍 Upscaling", open=False) as upscaler_accordion:
+                        gr.Markdown("**Latent Upscale** - Adds detail by upscaling in latent space before decoding")
+                        
+                        with gr.Row():
+                            latent_scale = gr.Slider(
+                                minimum=1.0,
+                                maximum=4.0,
+                                value=1.0,
+                                step=0.25,
+                                label="Latent Scale",
+                                info="1.0 = disabled, higher = more detail",
+                            )
+                            latent_interp = gr.Dropdown(
+                                choices=["nearest", "linear", "cubic"],
+                                value="cubic",
+                                label="Interpolation",
+                                info="Upscale method (cubic = smoothest)",
+                            )
+                        
+                        with gr.Row():
+                            latent_steps = gr.Slider(
+                                minimum=0,
+                                maximum=20,
+                                value=0,
+                                step=1,
+                                label="Hires Steps",
+                                info="0 = auto (based on denoise)",
+                            )
+                            latent_denoise = gr.Slider(
+                                minimum=0.0,
+                                maximum=1.0,
+                                value=0.55,
+                                step=0.05,
+                                label="Denoise Strength",
+                                info="Higher = more change/detail",
+                            )
+                        
+                        gr.Markdown("---")
+                        gr.Markdown("**ESRGAN Upscale** - Pixel-space sharpening after generation")
+                        
+                        upscaler_dropdown = gr.Dropdown(
+                            choices=get_upscaler_choices(),
+                            value="None",
+                            label="ESRGAN Model",
+                            info="Select an upscaler or 'None' to skip",
+                        )
+                        
+                        with gr.Row():
+                            upscale_factor = gr.Slider(
+                                minimum=1.0,
+                                maximum=4.0,
+                                value=2.0,
+                                step=0.25,
+                                label="ESRGAN Scale",
+                                info="Scale factor (1× = no upscale)",
+                            )
+                        
+                        if not UPSCALER_AVAILABLE:
+                            gr.Markdown("*⚠️ ESRGAN not available. Install PyTorch: `pip install torch`*")
+                        else:
+                            gr.Markdown("*💡 Combine latent upscale + ESRGAN for maximum detail.*")
                     
                     with gr.Row():
                         seed = gr.Slider(
@@ -2557,8 +3719,39 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         outputs=[lora_tags_display],
     )
     
+    # Save fused model button
+    def save_fused_with_loras(model_name, backend, source_model, save_mlx, save_pytorch, save_comfyui, *lora_args):
+        """Wrapper that collects LoRA states and saves fused model"""
+        # lora_args are: enabled1, lora1, trigger1, weight1, enabled2, lora2, trigger2, weight2, ...
+        lora_states = []
+        for i in range(0, len(lora_args), 4):
+            if i + 3 < len(lora_args):
+                enabled = lora_args[i]
+                lora_path = lora_args[i + 1]
+                trigger = lora_args[i + 2]
+                weight = lora_args[i + 3]
+                lora_states.append((enabled, lora_path, trigger, weight))
+        
+        # Get enabled LoRA configs
+        lora_configs = get_enabled_loras_from_components(lora_states)
+        
+        return save_fused_model(model_name, backend, source_model, lora_configs, save_mlx, save_pytorch, save_comfyui)
+    
+    save_fused_btn.click(
+        fn=save_fused_with_loras,
+        inputs=[fused_model_name, backend, active_model_dropdown, save_mlx_checkbox, save_pytorch_checkbox, save_comfyui_checkbox] + all_lora_components,
+        outputs=[fused_model_status],
+    ).then(
+        # Refresh model dropdown after saving
+        fn=lambda be: gr.update(choices=get_available_mlx_models()) if be == "MLX (Apple Silicon)" else gr.update(choices=get_available_pytorch_models()),
+        inputs=[backend],
+        outputs=[active_model_dropdown],
+    )
+    
     # Wrapper function to collect LoRA states and generate
-    def generate_with_loras(prompt, base_res, aspect, steps, time_shift, seed, backend, model, *lora_args):
+    def generate_with_loras(prompt, base_res, aspect, steps, time_shift, seed, backend, model, 
+                           lat_scale, lat_interp, lat_steps, lat_denoise,
+                           upscaler, upscale_by, lemica_cache, *lora_args):
         """Wrapper that collects LoRA component states and calls generate_image"""
         # lora_args are: enabled1, lora1, trigger1, weight1, enabled2, lora2, trigger2, weight2, ...
         lora_states = []
@@ -2576,11 +3769,19 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         # Build tags string
         lora_tags = build_lora_tags_from_components(lora_states)
         
-        return generate_image(prompt, base_res, aspect, steps, time_shift, seed, backend, model, lora_configs, lora_tags)
+        # Process cache mode
+        cache = lemica_cache if lemica_cache and lemica_cache.lower() != "none" else None
+        
+        return generate_image(prompt, base_res, aspect, steps, time_shift, seed, backend, model, 
+                            lora_configs, lora_tags, 
+                            lat_scale, lat_steps, lat_denoise, lat_interp,
+                            upscaler, upscale_by, cache)
     
     generate_btn.click(
         fn=generate_with_loras,
-        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown] + all_lora_components,
+        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown, 
+                latent_scale, latent_interp, latent_steps, latent_denoise,
+                upscaler_dropdown, upscale_factor, cache_mode] + all_lora_components,
         outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed],
     ).then(
         fn=lambda: (gr.update(visible=True), None, "", "", "", "", 0, ""),

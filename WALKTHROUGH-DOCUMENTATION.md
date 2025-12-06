@@ -12,11 +12,15 @@
 
 2. **Fast Generation** - Creates detailed 1024×1024 images in just 9 steps (typically 30-60 seconds depending on your Mac).
 
-3. **High Quality** - The underlying Z-Image-Turbo model has 6 billion parameters, producing professional-quality results.
+3. **Speed Acceleration** - LeMiCa caching can make generation up to 30% faster with minimal quality impact.
 
-4. **Multiple Ways to Use** - Whether you prefer clicking buttons in a web interface or typing commands in a terminal, both options are available.
+4. **High Quality** - The underlying Z-Image-Turbo model has 6 billion parameters, producing professional-quality results.
 
-5. **LoRA Support** - Customize your generations with style and concept LoRAs for unique artistic effects.
+5. **Multiple Ways to Use** - Whether you prefer clicking buttons in a web interface or typing commands in a terminal, both options are available.
+
+6. **LoRA Support** - Customize your generations with style and concept LoRAs for unique artistic effects.
+
+7. **Upscaling Options** - Enhance detail with latent upscaling and/or pixel-space ESRGAN upscaling.
 
 ### How Does It Work? (The Simple Version)
 
@@ -129,6 +133,39 @@ Open that URL in your browser (usually opens automatically).
 | **Width/Height** | Image dimensions | 1024×1024 (default) |
 | **Aspect Ratio** | Quick presets for common ratios | "1:1 Square" for standard |
 
+#### Speed Acceleration (LeMiCa)
+
+Below the Steps slider, you'll find the "⚡ LeMiCa Speed" dropdown. This enables training-free acceleration that caches computations between steps:
+
+| Mode | What It Does | When to Use |
+|------|--------------|-------------|
+| **None** | Full computation every step | Maximum quality |
+| **slow** | Caches 2/9 steps (~14% faster) | Quality-focused with slight speedup |
+| **medium** | Caches 3/9 steps (~22% faster) | Balanced speed and quality |
+| **fast** | Caches 4/9 steps (~30% faster) | Quick iterations, drafts |
+
+**Recommendation**: Use "medium" for everyday use. Use "None" for final renders where quality matters most.
+
+#### Upscaling Options
+
+Expand the "🔍 Upscaling" accordion to access two upscaling methods:
+
+**Latent Upscale** (adds detail in AI space):
+| Setting | What It Does | Recommended Value |
+|---------|--------------|-------------------|
+| **Latent Scale** | Upscale factor (1.0 = off) | 1.5-2.0 for more detail |
+| **Interpolation** | How pixels are interpolated | "cubic" (smoothest) |
+| **Hires Steps** | Refinement passes (0 = auto) | 0 (auto is usually best) |
+| **Denoise** | How much to refine | 0.5-0.6 (balance) |
+
+**ESRGAN Upscale** (pixel-space sharpening):
+| Setting | What It Does | Recommended Value |
+|---------|--------------|-------------------|
+| **ESRGAN Model** | Which upscaler to use | "4x-UltraSharp" |
+| **ESRGAN Scale** | Final scale multiplier | 2.0-4.0 |
+
+**Tip**: Combine both for maximum detail: Latent upscale adds AI-generated detail, then ESRGAN sharpens the result.
+
 #### Using the Prompt Enhancer
 
 The app includes an AI that can improve your prompts:
@@ -217,6 +254,23 @@ Include these trigger words in your prompt for best results:
 
 ⚠️ **Note**: LoRAs are applied when the model loads. Changing LoRA settings requires a model reload (happens automatically when you generate).
 
+#### Saving Fused Models
+
+You can permanently fuse your loaded LoRAs into the base model and save as a new model:
+
+1. **Configure LoRAs**: Enable your desired LoRAs and set weights
+2. **Enter a name**: In the LoRA Settings section, find "Save Fused Model" and enter a model name
+3. **Select formats**: Choose which formats to export:
+   - ☑️ **MLX**: For continued use in this application (`models/mlx/`)
+   - ☑️ **PyTorch**: Diffusers format for sharing (`models/pytorch/`)
+   - ☑️ **ComfyUI**: Single-file checkpoint for ComfyUI (`models/comfyui/`)
+4. **Click Save**: The fused model(s) will be created in the respective directories
+
+**Why fuse LoRAs?**
+- Share your custom model configurations with others
+- Slightly faster inference (no LoRA merge at load time)
+- Use your customized model in other applications (PyTorch/ComfyUI)
+
 ### The Model Settings Tab
 
 This tab lets you manage multiple models.
@@ -299,6 +353,7 @@ python generate_mlx.py \
 | `--height` | Image height in pixels | `1024` |
 | `--width` | Image width in pixels | `1024` |
 | `--model_path` | Path to MLX model directory | `../models/mlx_model` |
+| `--cache` | LeMiCa speed mode: slow/medium/fast | None (disabled) |
 
 #### Examples
 
@@ -315,6 +370,16 @@ python generate_mlx.py --prompt "A robot reading a book" --seed 12345 --output r
 **Generate a portrait-oriented image:**
 ```bash
 python generate_mlx.py --prompt "Elegant fashion model" --height 1344 --width 768 --output portrait.png
+```
+
+**Fast generation with LeMiCa caching:**
+```bash
+python generate_mlx.py --prompt "A futuristic city" --cache fast --output city.png
+```
+
+**Balanced speed/quality with medium caching:**
+```bash
+python generate_mlx.py --prompt "A serene lake at sunset" --cache medium --output lake.png
 ```
 
 **Batch generation with different seeds:**
@@ -440,10 +505,11 @@ rain-slicked streets, blade runner aesthetic, cinematic lighting
 
 **Optimization Tips**:
 1. Use FP8 or FP16 precision
-2. Reduce image dimensions
-3. Reduce step count (7 steps still produces good results)
-4. Close background applications
-5. Ensure your Mac isn't thermal throttling (check Activity Monitor)
+2. Enable LeMiCa caching ("⚡ LeMiCa Speed" → medium or fast)
+3. Reduce image dimensions
+4. Reduce step count (7 steps still produces good results)
+5. Close background applications
+6. Ensure your Mac isn't thermal throttling (check Activity Monitor)
 
 ---
 
@@ -491,6 +557,9 @@ Step 1/9 t=875.0
 # Quick generation
 cd src && python generate_mlx.py --prompt "Your prompt"
 
+# Fast generation with caching
+python generate_mlx.py --prompt "..." --cache medium
+
 # Custom output
 python generate_mlx.py --prompt "..." --output image.png --seed 123
 
@@ -503,6 +572,7 @@ python generate_mlx.py --prompt "..." --height 768 --width 1344
 models/mlx/          # MLX models (used for generation)
 models/pytorch/      # PyTorch models (for conversion)
 models/loras/        # LoRA files for customization
+models/upscalers/    # ESRGAN upscaler models
 temp/                # Session-generated images
 src/                 # Source code and CLI scripts
 ```

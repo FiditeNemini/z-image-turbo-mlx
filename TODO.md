@@ -38,6 +38,7 @@ Add the ability to load and apply LoRA (Low-Rank Adaptation) models to the MLX i
 - **Subfolder Organization**: Organize LoRAs in subfolders for better management
 - **ComfyUI Format**: Supports ComfyUI-style LoRAs with `diffusion_model.*` prefix
 - **Runtime Merge**: LoRAs merged into base weights during model reload
+- **LoRA Fusion & Export**: Permanently fuse LoRAs and save as new models in MLX, PyTorch, or ComfyUI formats
 
 ### Future Considerations
 
@@ -45,4 +46,113 @@ Add the ability to load and apply LoRA (Low-Rank Adaptation) models to the MLX i
 
 2. **Live Weight Adjustment** - Currently requires model reload to change weights. Layer injection approach would allow live adjustment. **Status: Deferred**
 
-3. **LoRA Training** - Add support for training custom LoRAs. **Status: Not planned**
+3. **LoRA Training** - Add support for training custom LoRAs. **Status: See TRAINING_TODO.md**
+
+---
+
+## Image Upscaling & Refinement
+
+✅ **FULLY IMPLEMENTED** - Both latent and ESRGAN upscaling integrated!
+
+Post-generation image enhancement using both latent-space and pixel-space upscaling methods.
+
+### Implemented Features
+
+#### Latent Upscaling (Phase 4 - COMPLETED)
+- **Latent space upscaling** before VAE decode for enhanced detail
+- **Configurable scale factor** (1.0-4.0) with 0.25 steps
+- **Interpolation modes**: nearest, linear, cubic (default)
+- **Auto-calculated hires steps** based on denoise strength
+- **Tiled processing** with automatic memory detection for large upscales
+- **Weighted gradient blending** at tile seams
+
+#### ESRGAN Image Upscaler (Phase 1-3 - COMPLETED)
+- **4× upscaling** using RRDB-Net architecture
+- **MLX-native inference** - runs efficiently on Apple Silicon
+- **Tiled processing** for large images (memory efficient)
+- **Multiple upscaler support** - choose from available ESRGAN models
+- **ESRGAN/RRDB only** - SPAN and other architectures filtered from UI
+
+### Combined Pipeline
+
+```
+Base Gen (1024²) → Latent Upscale → Denoise → VAE Decode → ESRGAN
+                         ↓              ↓           ↓          ↓
+                   256×256 latents  Refined    2048×2048   4096×4096
+                   (from 128×128)   latents     pixels      pixels
+```
+
+### UI Controls
+
+**🔍 Upscaling Accordion**:
+- **Latent Scale**: 1.0-4.0 slider (1.0 = disabled)
+- **Interpolation**: Dropdown (nearest/linear/cubic)
+- **Hires Steps**: 0-20 slider (0 = auto)
+- **Denoise Strength**: 0.0-1.0 slider
+- **ESRGAN Model**: Dropdown of available upscalers
+- **ESRGAN Scale**: 1.0-4.0 slider
+
+### Available Upscaler Models
+
+| Model | Scale | Best For |
+|-------|-------|----------|
+| 4x-UltraSharp | 4× | ⭐ General upscaling (recommended) |
+| 4x-ClearRealityV1 | 4× | Photorealistic images |
+| 4x-ClearRealityV1_Soft | 4× | Softer/artistic look |
+| 4x_NMKD-Siax_200k | 4× | Anime/illustrations |
+| 4x_NMKD-Superscale-SP_178000_G | 4× | General upscaling |
+
+### Technical Notes
+
+- Upscaler models cached for performance (single load per session)
+- Tiled processing for images larger than 512×512 (configurable)
+- Upscaled image size stored in metadata (final dimensions)
+- Memory: 4× upscale = 16× pixels (e.g., 1024² → 4096²)
+
+### Status: ✅ Completed (both methods)
+
+---
+
+## Speed Acceleration (LeMiCa)
+
+✅ **COMPLETED** - LeMiCa training-free caching implemented!
+
+Training-free acceleration using residual caching between denoising steps.
+
+### Implemented Features
+
+- **LeMiCa caching** in transformer main layers
+- **Three speed modes**: slow (~14% faster), medium (~22% faster), fast (~30% faster)
+- **CLI support**: `--cache slow/medium/fast` argument
+- **UI support**: "⚡ LeMiCa Speed" dropdown in generation settings
+
+### Implementation Details
+
+#### Added to `src/z_image_mlx.py`:
+- `LEMICA_SCHEDULES` - Precomputed step schedules for each mode
+- `get_lemica_bool_list()` - Convert mode to boolean list
+- `ZImageTransformer2DModel.configure_lemica()` - Set up caching
+- `ZImageTransformer2DModel.reset_lemica_state()` - Reset for new generation
+- Caching logic in `__call__` main layers section
+
+#### Added to `src/generate_mlx.py`:
+- `--cache` CLI argument with choices: slow, medium, fast
+
+#### Added to `app.py`:
+- `cache_mode` dropdown in UI
+- Wired through `generate_with_loras` → `generate_image` → `generate_mlx`
+
+### Speed Modes
+
+| Mode | Steps Computed | Speedup | Quality |
+|------|----------------|---------|----------|
+| None | 9/9 | Baseline | Reference |
+| slow | 7/9 | ~14% | Highest |
+| medium | 6/9 | ~22% | Excellent |
+| fast | 5/9 | ~30% | Very Good |
+
+### Technical Reference
+
+Based on [LeMiCa: Lexicographic Minimax Path Caching](https://github.com/UnicomAI/LeMiCa) (NeurIPS 2025 Spotlight).
+
+### Status: ✅ Completed

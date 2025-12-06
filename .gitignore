@@ -6,6 +6,9 @@
 !/models/loras/
 /models/loras/**/*.safetensors
 !/models/loras/.gitkeep
+!/models/upscalers/
+/models/upscalers/**/*.pth
+!/models/upscalers/.gitkeep
 /temp/
 .conda-env
 .agent/
