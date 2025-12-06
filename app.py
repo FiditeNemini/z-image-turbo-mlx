@@ -3232,15 +3232,22 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
 
 # --- Merge Tab Helper Functions ---
 
-def get_merge_model_choices():
-    """Get list of MLX models available for merging (excluding FP8 quantized).
+def get_merge_model_choices(backend="MLX (Apple Silicon)"):
+    """Get list of models available for merging (excluding FP8 quantized).
     
+    Args:
+        backend: "MLX (Apple Silicon)" or "PyTorch"
+        
     Returns:
-        List of (model_name, is_compatible) tuples for compatible models
+        List of model names compatible with merging
     """
-    from merge import get_available_merge_models
-    models = get_available_merge_models(Path(MLX_MODELS_DIR), exclude_quantized=True)
-    return [(name, is_compat) for name, is_compat in models if is_compat]
+    if backend == "MLX (Apple Silicon)":
+        from merge import get_available_merge_models
+        models = get_available_merge_models(Path(MLX_MODELS_DIR), exclude_quantized=True)
+        return [name for name, is_compat in models if is_compat]
+    else:
+        # PyTorch models - return all available (no quantization check needed)
+        return get_available_pytorch_models()
 
 
 # Create Gradio interface
@@ -3595,9 +3602,8 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             # Create merge model rows with dropdowns
             merge_model_rows = []  # Will store (checkbox, model_dropdown, weight) tuples
             
-            # Get initial list of mergeable models
-            initial_merge_models = get_merge_model_choices()
-            model_choices = [m[0] for m in initial_merge_models] if initial_merge_models else []
+            # Get initial list of mergeable models (default to MLX)
+            initial_merge_models = get_merge_model_choices("MLX (Apple Silicon)")
             
             if not initial_merge_models:
                 gr.Markdown("*No compatible models found. Import FP16 models in Model Settings.*")
@@ -3614,8 +3620,8 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         scale=0,
                     )
                     merge_model_dropdown = gr.Dropdown(
-                        choices=model_choices,
-                        value=model_choices[0] if model_choices else None,
+                        choices=initial_merge_models,
+                        value=initial_merge_models[0] if initial_merge_models else None,
                         label="",
                         show_label=False,
                         scale=3,
@@ -3637,8 +3643,8 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             
             with gr.Row(visible=False) as model_c_selector_row:
                 model_c_dropdown = gr.Dropdown(
-                    choices=[m[0] for m in initial_merge_models],
-                    value=initial_merge_models[0][0] if initial_merge_models else None,
+                    choices=initial_merge_models,
+                    value=initial_merge_models[0] if initial_merge_models else None,
                     label="Model C",
                     info="Original/base model that the fine-tune was trained from",
                     scale=3,
@@ -4357,22 +4363,21 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         outputs=[model_c_row, model_c_selector_row],
     )
     
-    def refresh_merge_model_list():
-        """Refresh the list of available merge models."""
-        models = get_merge_model_choices()
-        choices = [m[0] for m in models] if models else []
+    def refresh_merge_model_list(backend_choice):
+        """Refresh the list of available merge models based on backend."""
+        models = get_merge_model_choices(backend_choice)
         
         updates = []
         for _ in merge_model_rows:
-            updates.append(gr.update(choices=choices, value=choices[0] if choices else None))
+            updates.append(gr.update(choices=models, value=models[0] if models else None))
         
         # Also update Model C dropdown
-        updates.append(gr.update(choices=choices, value=choices[0] if choices else None))
+        updates.append(gr.update(choices=models, value=models[0] if models else None))
         
         return updates
     
     def perform_model_merge(
-        method, output_name, base_model, model_c, add_alpha,
+        method, output_name, base_model, model_c, add_alpha, backend_choice,
         *merge_args, progress=gr.Progress()
     ):
         """Perform the model merge operation."""
@@ -4389,11 +4394,17 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         if not re.match(r'^[a-zA-Z0-9_-]+$', output_name):
             return "❌ Model name must be alphanumeric with hyphens/underscores only"
         
+        # Determine model directory based on backend
+        if backend_choice == "MLX (Apple Silicon)":
+            models_dir = Path(MLX_MODELS_DIR)
+        else:
+            models_dir = Path(PYTORCH_MODELS_DIR)
+        
         # Get base model path (from Generate tab's selected model)
         if not base_model:
             return "❌ No base model selected. Select a model in the Generate tab."
         
-        base_model_path = Path(MLX_MODELS_DIR) / base_model
+        base_model_path = models_dir / base_model
         if not base_model_path.exists():
             return f"❌ Base model not found: {base_model}"
         
@@ -4407,7 +4418,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                 weight = merge_args[i + 2]
                 
                 if enabled and model_name:
-                    model_path = Path(MLX_MODELS_DIR) / model_name
+                    model_path = models_dir / model_name
                     if model_path.exists():
                         merge_models_to_use.append((str(model_path), float(weight)))
         
@@ -4421,12 +4432,12 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             if not model_c:
                 return "❌ Add Difference requires Model C (the original model)"
             
-            model_c_path = str(Path(MLX_MODELS_DIR) / model_c)
+            model_c_path = str(models_dir / model_c)
         else:
             model_c_path = None
             add_alpha = None
         
-        output_path = Path(MLX_MODELS_DIR) / output_name
+        output_path = models_dir / output_name
         
         # Create progress callback
         def progress_callback(pct, desc):
@@ -4459,17 +4470,25 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     merge_btn.click(
         fn=perform_model_merge,
         inputs=[merge_method, merge_output_name, active_model_dropdown, 
-                model_c_dropdown, add_diff_alpha] + all_merge_components,
+                model_c_dropdown, add_diff_alpha, backend] + all_merge_components,
         outputs=[merge_status],
     ).then(
-        # Refresh model dropdown after merge
-        fn=lambda: gr.update(choices=get_available_mlx_models()),
+        # Refresh model dropdown after merge based on backend
+        fn=lambda be: gr.update(choices=get_available_mlx_models()) if be == "MLX (Apple Silicon)" else gr.update(choices=get_available_pytorch_models()),
+        inputs=[backend],
         outputs=[active_model_dropdown],
     )
     
     refresh_merge_models_btn.click(
         fn=refresh_merge_model_list,
-        inputs=None,
+        inputs=[backend],
+        outputs=merge_dropdown_outputs + [model_c_dropdown],
+    )
+    
+    # Update merge model dropdowns when backend changes
+    backend.change(
+        fn=refresh_merge_model_list,
+        inputs=[backend],
         outputs=merge_dropdown_outputs + [model_c_dropdown],
     )
     
