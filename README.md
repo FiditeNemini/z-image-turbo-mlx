@@ -304,9 +304,13 @@ Combine multiple Z-Image-Turbo models to create novel blends using the **Merge**
 4. Enable models to merge and set their weights (0.0-1.0)
 5. For Add Difference: Also select Model C (the original model B was fine-tuned from)
 6. Enter an output model name
-7. Click **Merge Models**
+7. Select output formats:
+   - **MLX**: Ready for use in this app (`models/mlx/`)
+   - **PyTorch**: Diffusers format for sharing (`models/pytorch/`)
+   - **ComfyUI**: Single-file checkpoint (`models/comfyui/`)
+8. Click **Merge Models**
 
-The merged model will appear in `models/mlx/` and can be selected from the model dropdown.
+The merged model will be saved in the selected format directories and can be used immediately.
 
 ## Project Structure
 

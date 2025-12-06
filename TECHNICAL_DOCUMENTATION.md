@@ -485,13 +485,29 @@ FP8 quantized models cannot be merged because:
 
 The `get_available_merge_models()` function automatically excludes quantized models.
 
-### Output Model Structure
+### Output Formats
 
-Merged models are saved with:
+Merged models can be exported to multiple formats simultaneously:
+
+| Format | Output Location | Description |
+|--------|-----------------|-------------|
+| **MLX** | `models/mlx/<name>/` | Native Apple Silicon format, ready for inference |
+| **PyTorch** | `models/pytorch/<name>/` | Diffusers-compatible format for sharing/hosting |
+| **ComfyUI** | `models/comfyui/<name>.safetensors` | Single-file checkpoint with QKV fusion |
+
+### Output Model Structure (MLX)
+
+Merged MLX models are saved with:
 - `weights.safetensors` - Merged transformer weights
 - `config.json` - Updated with merge metadata and `"precision": "FP16"`
 - `merge_info.json` - Detailed merge operation record
 - Copied from base: VAE, text encoder, tokenizer, scheduler
+
+### Conversion Process
+
+1. **MLX Export**: Merge always happens in MLX format first
+2. **PyTorch Export**: Uses `convert_mlx_to_pytorch` module to create Diffusers format
+3. **ComfyUI Export**: Loads MLX weights, fuses Q/K/V attention weights, converts keys, saves as single safetensors
 
 ### UI Integration
 
@@ -502,7 +518,8 @@ The Merge tab in `app.py` provides:
 3. **Model Rows**: Enable checkbox + weight slider for each available model
 4. **Model C Selector**: Appears only for Add Difference method
 5. **Output Name**: Name for the merged model
-6. **Progress Feedback**: Real-time merge status
+6. **Output Formats**: Checkboxes for MLX (default), PyTorch, and ComfyUI formats
+7. **Progress Feedback**: Real-time merge status
 
 ### Merge Workflow
 
@@ -512,11 +529,15 @@ The Merge tab in `app.py` provides:
 3. User selects merge method
 4. User enables models to merge and sets weights
 5. For Add Difference: User selects Model C
-6. User enters output name and clicks Merge
-7. System detects RAM and chooses standard/chunked mode
-8. Weights are loaded and merged
-9. Result saved to models/mlx/<output_name>/
-10. Model dropdown refreshed to include new model
+6. User enters output name
+7. User selects output formats (MLX, PyTorch, ComfyUI)
+8. User clicks Merge
+9. System detects RAM and chooses standard/chunked mode
+10. Weights are loaded and merged (always in MLX first)
+11. MLX result saved to models/mlx/<output_name>/
+12. If PyTorch selected: Converted and saved to models/pytorch/<output_name>/
+13. If ComfyUI selected: Converted with QKV fusion, saved to models/comfyui/<output_name>.safetensors
+14. Model dropdown refreshed to include new model
 ```
 
 ---

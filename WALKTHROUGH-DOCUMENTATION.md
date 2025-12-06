@@ -305,7 +305,11 @@ The **Merge** tab (between Generate and Model Settings) lets you combine multipl
 6. **Set Weights**: Adjust the sliders (0.0-1.0)
 7. **For Add Difference**: Select Model C (the original the fine-tune was trained from)
 8. **Name Your Model**: Enter a name (alphanumeric, hyphens, underscores)
-9. **Click Merge**: Wait for the merge to complete
+9. **Select Output Formats**:
+   - ☑️ **MLX**: For use in this app (default, always recommended)
+   - ☐ **PyTorch**: Diffusers format for sharing or hosting
+   - ☐ **ComfyUI**: Single-file checkpoint for ComfyUI
+10. **Click Merge**: Wait for the merge to complete
 
 #### Tips for Merging
 
@@ -313,6 +317,8 @@ The **Merge** tab (between Generate and Model Settings) lets you combine multipl
 - **Lower weights for subtle effects**: Use 0.2-0.3 to add hints of another style
 - **Test with quick generates**: Use LeMiCa "fast" mode to quickly test merge results
 - **Save good blends**: Once you find a good mix, the merged model is permanent
+- **Export for sharing**: Select PyTorch format to share your merge on Hugging Face
+- **Use in ComfyUI**: Select ComfyUI format for a single-file checkpoint compatible with ComfyUI workflows
 
 #### Memory Considerations
 
