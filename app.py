@@ -2728,6 +2728,9 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     else:
         model.configure_lemica(None)
     
+    # Reset LeMiCa state for this generation (ensures counter starts at 0)
+    model.reset_lemica_state()
+    
     # Denoising loop
     scheduler.set_timesteps(steps)
     timesteps = scheduler.timesteps
@@ -2762,6 +2765,10 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     
     # Apply latent upscaling if enabled
     if do_latent_upscale:
+        # Disable LeMiCa during hires refinement - the cached residuals from base generation
+        # are not valid for the upscaled latent space
+        model.configure_lemica(None)
+        
         progress(0.80, desc=f"Latent upscale {latent_scale}× ({latent_interp})...")
         latents = latent_upscale_mlx(
             latents=latents,

@@ -157,7 +157,8 @@ def main():
     else:
         model.configure_lemica(None)  # Ensure disabled
     
-
+    # Reset LeMiCa state for this generation (ensures counter starts at 0)
+    model.reset_lemica_state()
     
     for i, t in enumerate(timesteps):
         print(f"Step {i}/{args.steps} t={t.item()}")

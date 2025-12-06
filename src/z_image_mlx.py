@@ -550,24 +550,29 @@ class ZImageTransformer2DModel(nn.Module):
             step_idx = self.lemica_step_counter
             should_compute = self.lemica_bool_list[step_idx] if step_idx < len(self.lemica_bool_list) else True
             
-            if should_compute:
-                # Full computation - store residual for future cache reuse
-                unified_input = unified
-                for i, layer in enumerate(self.layers):
-                    unified = layer(unified, unified_cos, unified_sin, mask=None, adaln_input=t_emb)
-                # Store residual
-                self.lemica_previous_residual = unified - unified_input
-            else:
-                # Use cached residual instead of full computation
+            # Increment counter BEFORE computation (matches official implementation)
+            self.lemica_step_counter += 1
+            
+            if not should_compute:
+                # Use cached residual - skip main layers entirely
                 if self.lemica_previous_residual is not None:
                     unified = unified + self.lemica_previous_residual
+                # If no cache available, fall through to compute below
                 else:
-                    # Fallback to full computation if no cache available
-                    for i, layer in enumerate(self.layers):
-                        unified = layer(unified, unified_cos, unified_sin, mask=None, adaln_input=t_emb)
+                    should_compute = True  # Force computation
             
-            # Increment step counter
-            self.lemica_step_counter += 1
+            if should_compute:
+                # Full computation - run through all main layers
+                # Clone input to compute residual later
+                ori_unified = unified * 1.0  # Multiply by 1.0 to force copy
+                mx.eval(ori_unified)
+                
+                for layer in self.layers:
+                    unified = layer(unified, unified_cos, unified_sin, mask=None, adaln_input=t_emb)
+                
+                # Store residual for future cache reuse
+                self.lemica_previous_residual = unified - ori_unified
+                mx.eval(self.lemica_previous_residual)
         else:
             # Standard computation without caching
             for i, layer in enumerate(self.layers):
