@@ -2,6 +2,32 @@
 Z-Image-Turbo - Gradio Web Interface
 Supports both MLX (Apple Silicon) and PyTorch backends
 """
+import os
+# Prevent tokenizer parallelism warnings/crashes when forking
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import logging
+from datetime import datetime
+from pathlib import Path
+
+# Set up logging
+LOG_DIR = Path("./logs")
+LOG_DIR.mkdir(exist_ok=True)
+log_filename = LOG_DIR / f"z-image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+# Configure logging format
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()  # Also output to console
+    ]
+)
+logger = logging.getLogger("z-image")
+logger.info(f"Z-Image-Turbo starting - log file: {log_filename}")
+
 import gradio as gr
 import torch
 import numpy as np
@@ -12,17 +38,15 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 try:
     from diffusers import ZImagePipeline
     PYTORCH_AVAILABLE = True
+    logger.info("PyTorch/Diffusers backend available")
 except ImportError:
     ZImagePipeline = None
     PYTORCH_AVAILABLE = False
-    print("Warning: ZImagePipeline not available. PyTorch backend disabled.")
-    print("To enable PyTorch, install diffusers >= 0.36.0 or the dev version.")
+    logger.warning("ZImagePipeline not available. PyTorch backend disabled.")
+    logger.warning("To enable PyTorch, install diffusers >= 0.36.0 or the dev version.")
 import json
 import random
 import sys
-import os
-from pathlib import Path
-from datetime import datetime
 import shutil
 
 # Add src to path for imports
@@ -32,9 +56,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 try:
     from upscaler import get_available_upscalers, load_upscaler, upscale_image as upscale_image_esrgan
     UPSCALER_AVAILABLE = True
+    logger.info("ESRGAN upscaler module available")
 except ImportError:
     UPSCALER_AVAILABLE = False
-    print("Warning: Upscaler module not available. Install torch to enable upscaling.")
+    logger.warning("Upscaler module not available. Install torch to enable upscaling.")
 
 # Global model cache
 _mlx_models = None
@@ -1075,12 +1100,16 @@ def load_mlx_models(model_path=None):
         else:
             model_path = MLX_MODEL_PATH
     
+    logger.info(f"LOAD_MLX_MODELS: Requested model path: {model_path}")
+    
     # Check if we need to reload (different model selected)
     if _mlx_models is not None and _current_mlx_model_path == model_path:
+        logger.debug("Using cached MLX models")
         return _mlx_models
     
     # Clear cache if switching models
     if _current_mlx_model_path != model_path:
+        logger.info(f"Switching models: {_current_mlx_model_path} -> {model_path}")
         _mlx_models = None
         _current_mlx_model_path = model_path
         global _current_applied_lora
@@ -1092,6 +1121,7 @@ def load_mlx_models(model_path=None):
     from vae import AutoencoderKL
     from text_encoder import TextEncoder
     
+    logger.info("Loading Transformer model...")
     # Load Transformer
     with open(f"{model_path}/config.json", "r") as f:
         config = json.load(f)
@@ -1101,7 +1131,10 @@ def load_mlx_models(model_path=None):
     # Check if weights are quantized and apply quantization to model if needed
     is_quantized = _is_quantized_weights(weights)
     if is_quantized:
+        logger.info("Model weights are quantized (FP8)")
         nn.quantize(model, group_size=64, bits=8)
+    else:
+        logger.debug("Model weights are FP16")
     
     # Process weights: handle prefixes and key mappings
     # The weights may have:
@@ -1181,8 +1214,10 @@ def load_mlx_models(model_path=None):
     
     text_encoder.load_weights(processed_te_weights, strict=False)
     text_encoder.eval()
+    logger.info("Text encoder loaded")
     
     # Load Tokenizer and Scheduler
+    logger.debug("Loading tokenizer and scheduler...")
     tokenizer = AutoTokenizer.from_pretrained(f"{model_path}/tokenizer", trust_remote_code=True)
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(f"{model_path}/scheduler")
     
@@ -1195,6 +1230,7 @@ def load_mlx_models(model_path=None):
         "scheduler": scheduler,
     }
     
+    logger.info(f"MLX models loaded successfully from {model_path}")
     return _mlx_models
 
 
@@ -2260,10 +2296,14 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
     import mlx.core as mx
     import mlx.nn as nn
     
+    logger.info(f"LATENT_UPSCALE: Starting with scale={scale_factor}, denoise={denoise_strength}")
+    
     if scale_factor <= 1.0 or denoise_strength <= 0.0:
+        logger.debug("Latent upscale skipped (scale <= 1.0 or denoise <= 0.0)")
         return latents
     
     batch_size, h, w, channels = latents.shape
+    logger.debug(f"Input latents shape: {latents.shape}")
     
     # Calculate target dimensions, ensuring divisibility by 2 (patch size)
     # This is required for the transformer's patchify operation
@@ -2273,6 +2313,7 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
     # Round up to nearest multiple of patch_size
     new_h = ((new_h + patch_size - 1) // patch_size) * patch_size
     new_w = ((new_w + patch_size - 1) // patch_size) * patch_size
+    logger.info(f"Upscaling latents: {h}x{w} → {new_h}x{new_w}")
     
     if progress:
         progress(progress_start, desc=f"Latent upscale: {h}×{w} → {new_h}×{new_w}...")
@@ -2281,12 +2322,15 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
     # Calculate exact scale factors needed for the target dimensions
     h_scale = new_h / h
     w_scale = new_w / w
+    logger.debug(f"Upscale factors: h={h_scale:.2f}, w={w_scale:.2f}")
     
     # Use nn.Upsample with tuple scale factors for asymmetric scaling if needed
     mode = "cubic" if interp_mode == "cubic" else ("linear" if interp_mode == "linear" else "nearest")
+    logger.debug(f"Upsampling with mode={mode}")
     upsampler = nn.Upsample(scale_factor=(h_scale, w_scale), mode=mode, align_corners=True)
     upscaled = upsampler(latents)
     mx.eval(upscaled)
+    logger.debug(f"Upsampled latents shape: {upscaled.shape}")
     
     if progress:
         progress(progress_start + 0.02, desc="Adding noise for refinement...")
@@ -2297,6 +2341,8 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
         # At strength 1.0, use full steps; at 0.5, use half
         hires_steps = max(1, int(9 * denoise_strength))  # Base on typical 9 steps
     
+    logger.info(f"Hires refinement: {hires_steps} steps, denoise strength={denoise_strength}")
+    
     # Step 3: Calculate start step based on denoise strength
     # strength 1.0 = start from full noise (step 0)
     # strength 0.0 = no denoising (would skip entirely)
@@ -2306,15 +2352,18 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
     # Start step: strength=1.0 → step 0; strength=0.5 → step halfway
     start_step = int((1.0 - denoise_strength) * len(timesteps))
     start_step = max(0, min(start_step, len(timesteps) - 1))
+    logger.debug(f"Start step: {start_step}, total timesteps: {len(timesteps)}")
     
     # Get timestep for noise level
     t_start = timesteps[start_step]
+    logger.debug(f"Start timestep value: {t_start.item()}")
     
     # Step 4: Generate noise and add to upscaled latents
     if seed is not None:
         torch.manual_seed(seed + 1000)  # Offset seed for variety
     
     # Generate noise in PyTorch for reproducibility, then convert
+    logger.debug("Generating noise for refinement...")
     noise_pt = torch.randn(batch_size, channels, 1, new_h, new_w)
     noise = mx.array(noise_pt.numpy())
     noise = noise.squeeze(2).transpose(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
@@ -2324,21 +2373,25 @@ def latent_upscale_mlx(latents, prompt_embeds, model, vae, vae_config, scheduler
     t_normalized = t_start.item() / 1000.0  # Normalize to [0, 1]
     noisy_latents = (1.0 - t_normalized) * upscaled + t_normalized * noise
     mx.eval(noisy_latents)
+    logger.debug(f"Noisy latents created, t_normalized={t_normalized:.4f}")
     
     # Step 5: Check if tiling is needed
     tile_size, overlap = calculate_optimal_tile_size(new_h, new_w, 1.0)  # Already upscaled
     
     use_tiling = tile_size is not None and (new_h > tile_size or new_w > tile_size)
+    logger.info(f"Tiling: {'enabled' if use_tiling else 'disabled'} (tile_size={tile_size}, overlap={overlap})")
     
     if use_tiling:
         if progress:
             progress(progress_start + 0.05, desc=f"Using tiled processing ({tile_size}×{tile_size} tiles)...")
+        logger.info(f"Starting tiled denoising with {tile_size}x{tile_size} tiles")
         return _latent_upscale_tiled(
             noisy_latents, prompt_embeds, model, scheduler, timesteps,
             start_step, new_h, new_w, tile_size, overlap, progress, progress_start
         )
     else:
         # Process full resolution
+        logger.info("Starting full-resolution denoising")
         return _latent_denoise_steps(
             noisy_latents, prompt_embeds, model, scheduler, timesteps,
             start_step, progress, progress_start
@@ -2365,6 +2418,11 @@ def _latent_denoise_steps(latents, prompt_embeds, model, scheduler, timesteps,
     import mlx.core as mx
     
     remaining_steps = len(timesteps) - start_step
+    logger.info(f"DENOISE_STEPS: Starting {remaining_steps} hires steps from step {start_step}")
+    logger.debug(f"Input latents shape: {latents.shape}")
+    
+    # Ensure LeMiCa is fully disabled for hires pass
+    model.reset_lemica_state()
     
     for i, t in enumerate(timesteps[start_step:]):
         step_num = i + 1
@@ -2374,6 +2432,8 @@ def _latent_denoise_steps(latents, prompt_embeds, model, scheduler, timesteps,
             step_progress = progress_start + 0.1 + (0.08 * (step_num / total_steps))
             progress(step_progress, desc=f"Hires step {step_num}/{total_steps}...")
         
+        logger.debug(f"Hires step {step_num}/{total_steps} (t={t.item():.1f})")
+        
         # Convert latents to model format: [B, H, W, C] -> [B, C, 1, H, W]
         latents_5d = latents.transpose(0, 3, 1, 2)[:, :, None, :, :]
         
@@ -2381,9 +2441,11 @@ def _latent_denoise_steps(latents, prompt_embeds, model, scheduler, timesteps,
         t_mx = mx.array([(1000.0 - t.item()) / 1000.0])
         
         # Forward pass
+        logger.debug(f"  Forward pass starting...")
         noise_pred = model(latents_5d, t_mx, prompt_embeds)
         noise_pred = -noise_pred  # Negate as in main pipeline
         mx.eval(noise_pred)
+        logger.debug(f"  Forward pass completed")
         
         # Scheduler step (via PyTorch)
         noise_pred_sq = noise_pred.squeeze(2)  # [B, C, H, W]
@@ -2397,6 +2459,8 @@ def _latent_denoise_steps(latents, prompt_embeds, model, scheduler, timesteps,
         # Convert back to MLX NHWC format
         latents = mx.array(step_output.prev_sample.numpy())
         latents = latents.transpose(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+    
+    logger.info("DENOISE_STEPS: Completed all hires steps")
     
     return latents
 
@@ -2538,7 +2602,10 @@ def load_prompt_enhancer():
     global _prompt_enhancer
     
     if _prompt_enhancer is not None:
+        logger.debug("Using cached prompt enhancer model")
         return _prompt_enhancer
+    
+    logger.info("Loading prompt enhancer model...")
     
     try:
         from mlx_lm import load
@@ -2549,9 +2616,11 @@ def load_prompt_enhancer():
     
     # Check if local model exists
     if enhancer_path.exists() and (enhancer_path / "config.json").exists():
+        logger.debug(f"Loading from local path: {enhancer_path}")
         model, tokenizer = load(str(enhancer_path))
     else:
         # Download and save locally
+        logger.info(f"Downloading prompt enhancer: {PROMPT_ENHANCER_MODEL}")
         from huggingface_hub import snapshot_download
         
         # Download to local path
@@ -2565,14 +2634,31 @@ def load_prompt_enhancer():
         model, tokenizer = load(str(enhancer_path))
     
     _prompt_enhancer = (model, tokenizer)
+    logger.info("Prompt enhancer model loaded")
     return _prompt_enhancer
+
+
+def unload_prompt_enhancer():
+    """Unload prompt enhancer model to free memory for image generation."""
+    global _prompt_enhancer
+    import gc
+    import mlx.core as mx
+    
+    if _prompt_enhancer is not None:
+        logger.info("Unloading prompt enhancer model to free memory")
+        _prompt_enhancer = None
+        gc.collect()
+        mx.metal.clear_cache()
+        logger.debug("Prompt enhancer unloaded and memory cleared")
 
 
 def enhance_prompt(prompt, progress=gr.Progress()):
     """Use MLX-LM to enhance the user's prompt with a small local model"""
+    logger.info(f"ENHANCE_PROMPT: Starting with prompt: {prompt[:50]}..." if len(prompt) > 50 else f"ENHANCE_PROMPT: Starting with prompt: {prompt}")
     
+    # If no prompt provided, generate a random one first
     if not prompt.strip():
-        raise gr.Error("Please enter a prompt to enhance")
+        prompt = generate_random_prompt(progress)
     
     progress(0.1, desc="Loading language model...")
     
@@ -2627,8 +2713,9 @@ Respond ONLY with the enhanced prompt, no explanations or preamble."""
     
     progress(1.0, desc="Done!")
     
-    # Clean up
+    # Clean up and unload model to free memory
     enhanced = enhanced.strip()
+    unload_prompt_enhancer()
     
     return enhanced
 
@@ -2692,8 +2779,9 @@ Keep it under 80 words. Respond ONLY with the prompt, no explanations."""
     
     progress(1.0, desc="Done!")
     
-    # Clean up
+    # Clean up and unload model to free memory for image generation
     random_prompt = random_prompt.strip()
+    unload_prompt_enhancer()
     
     return random_prompt
 
@@ -2714,8 +2802,17 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     import mlx.core as mx
     global _mlx_models, _current_applied_lora
     
+    logger.info("=" * 60)
+    logger.info("GENERATE_MLX: Starting image generation")
+    logger.info(f"  Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
+    logger.info(f"  Size: {width}x{height}, Steps: {steps}, Time shift: {time_shift}, Seed: {seed}")
+    logger.info(f"  Cache mode: {cache_mode}")
+    logger.info(f"  Latent upscale: {latent_scale}x, denoise: {latent_denoise}, steps: {latent_steps}, interp: {latent_interp}")
+    logger.info(f"  LoRA configs: {lora_configs}")
+    
     # Determine if latent upscaling is enabled
     do_latent_upscale = latent_scale > 1.0 and latent_denoise > 0.0
+    logger.debug(f"  Latent upscale enabled: {do_latent_upscale}")
     
     # Normalize lora_configs to empty list if None
     if lora_configs is None:
@@ -2786,8 +2883,10 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     attention_mask = mx.array(text_inputs["attention_mask"])
     
     # Text encoder forward
+    logger.debug("Running text encoder forward pass...")
     prompt_embeds = text_encoder(input_ids, attention_mask=attention_mask)
     prompt_embeds_list = [prompt_embeds[i] for i in range(len(prompt_embeds))]
+    logger.debug(f"Text embeddings shape: {prompt_embeds.shape}")
     
     progress(0.2, desc="Preparing latents...")
     
@@ -2797,6 +2896,7 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     vae_scale_factor = 8
     latent_height = 2 * (height // (vae_scale_factor * 2))
     latent_width = 2 * (width // (vae_scale_factor * 2))
+    logger.debug(f"Latent dimensions: {latent_height}x{latent_width}")
     
     # Use PyTorch for reproducible random
     torch.manual_seed(seed)
@@ -2806,8 +2906,10 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     # Configure LeMiCa caching if enabled
     if cache_mode and cache_mode.lower() != "none":
         model.configure_lemica(cache_mode, steps)
+        logger.info(f"LeMiCa caching enabled: {cache_mode} mode")
     else:
         model.configure_lemica(None)
+        logger.debug("LeMiCa caching disabled")
     
     # Reset LeMiCa state for this generation (ensures counter starts at 0)
     model.reset_lemica_state()
@@ -2815,9 +2917,11 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     # Denoising loop
     scheduler.set_timesteps(steps)
     timesteps = scheduler.timesteps
+    logger.info(f"Starting denoising loop: {steps} steps")
     
     for i, t in enumerate(timesteps):
         progress(0.2 + 0.6 * (i / len(timesteps)), desc=f"Denoising step {i+1}/{steps}...")
+        logger.debug(f"Denoising step {i+1}/{steps}, timestep={t.item():.2f}")
         
         # Timestep
         t_mx = mx.array([(1000.0 - t.item()) / 1000.0])
@@ -2840,6 +2944,8 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
         latents = mx.array(step_output.prev_sample.numpy())
         latents = latents[:, :, None, :, :]
     
+    logger.info("Denoising loop completed")
+    
     # Convert latents to NHWC format for potential latent upscaling and VAE decode
     latents = latents.squeeze(2)  # [B, C, H, W]
     latents = latents.transpose(0, 2, 3, 1)  # [B, H, W, C]
@@ -2848,7 +2954,10 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     if do_latent_upscale:
         # Disable LeMiCa during hires refinement - the cached residuals from base generation
         # are not valid for the upscaled latent space
+        logger.info(f"Starting latent upscale: {latent_scale}x, denoise={latent_denoise}, interp={latent_interp}")
         model.configure_lemica(None)
+        model.reset_lemica_state()  # Extra reset to ensure clean state
+        logger.debug("LeMiCa disabled and state reset for latent upscale")
         
         progress(0.80, desc=f"Latent upscale {latent_scale}× ({latent_interp})...")
         latents = latent_upscale_mlx(
@@ -3204,11 +3313,21 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
         cache_mode: LeMiCa cache mode ('slow', 'medium', 'fast') or None for no caching
     """
     
+    logger.info("=" * 60)
+    logger.info("GENERATE_IMAGE: New generation request")
+    logger.info(f"  Backend: {backend}, Model: {model_name}")
+    logger.info(f"  Resolution: {base_resolution}, Aspect: {aspect_ratio}")
+    logger.info(f"  Steps: {steps}, Time shift: {time_shift}, Seed: {seed}")
+    logger.info(f"  Cache mode: {cache_mode}")
+    logger.info(f"  Latent upscale: {latent_scale}x, steps={latent_steps}, denoise={latent_denoise}")
+    logger.info(f"  ESRGAN upscaler: {upscaler_name}, factor={upscale_factor}")
+    
     # If no prompt provided, generate a random one using the prompt enhancer
     if not prompt.strip():
+        logger.info("No prompt provided - generating random prompt...")
         progress(0, desc="No prompt provided - generating a random idea...")
         prompt = generate_random_prompt(progress)
-        print(f"Generated random prompt: {prompt}")
+        logger.info(f"Generated random prompt: {prompt}")
     
     if not model_name:
         raise gr.Error(f"No model selected for {backend}")
@@ -3264,11 +3383,12 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     
     # Apply ESRGAN upscaling if enabled
     if will_upscale:
+        logger.info(f"Applying ESRGAN upscale: {upscaler_name} at {upscale_factor}x")
         progress(0.93, desc=f"ESRGAN {upscale_factor}× with {upscaler_name}...")
         original_size = pil_image.size
         pil_image = apply_upscaler(pil_image, upscaler_name, upscale_factor, progress)
         new_size = pil_image.size
-        print(f"ESRGAN: {original_size[0]}×{original_size[1]} → {new_size[0]}×{new_size[1]}")
+        logger.info(f"ESRGAN complete: {original_size[0]}×{original_size[1]} → {new_size[0]}×{new_size[1]}")
     
     progress(0.97, desc="Saving temporary files...")
     
@@ -3291,6 +3411,9 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     save_image_with_metadata(pil_image, jpg_path, prompt, seed, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor, actual_latent_scale, actual_latent_denoise, actual_latent_interp)
     
     progress(1.0, desc="Done!")
+    logger.info(f"Generation complete! Final size: {final_width}x{final_height}")
+    logger.info(f"Saved to: {png_path}")
+    logger.info("=" * 60)
     
     # Add to gallery with all generation parameters
     gallery_images = add_to_gallery(pil_image, prompt, seed, png_path, jpg_path, steps, time_shift, backend, final_width, final_height, model_name, lora_configs, upscaler_name, actual_upscale_factor, actual_latent_scale, actual_latent_denoise, actual_latent_interp)
