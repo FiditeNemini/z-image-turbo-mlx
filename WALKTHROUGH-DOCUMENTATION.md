@@ -20,7 +20,9 @@
 
 6. **LoRA Support** - Customize your generations with style and concept LoRAs for unique artistic effects.
 
-7. **Upscaling Options** - Enhance detail with latent upscaling and/or pixel-space ESRGAN upscaling.
+7. **Model Merging** - Combine multiple models to create novel blends using Weighted Sum or Add Difference methods.
+
+8. **Upscaling Options** - Enhance detail with latent upscaling and/or pixel-space ESRGAN upscaling.
 
 ### How Does It Work? (The Simple Version)
 
@@ -270,6 +272,57 @@ You can permanently fuse your loaded LoRAs into the base model and save as a new
 - Share your custom model configurations with others
 - Slightly faster inference (no LoRA merge at load time)
 - Use your customized model in other applications (PyTorch/ComfyUI)
+
+### The Merge Tab
+
+The **Merge** tab (between Generate and Model Settings) lets you combine multiple Z-Image-Turbo models.
+
+#### When to Use Model Merging
+
+- **Blend styles**: Combine an anime model with a photorealistic one
+- **Transfer fine-tunes**: Apply what one model learned to another base
+- **Create unique models**: Mix multiple fine-tunes for novel results
+
+#### Merge Methods Explained
+
+**Weighted Sum** (`(1-α)A + αB`):
+- Blends two models proportionally
+- α = 0.5 → 50% of each model
+- Best for: Mixing two different styles
+
+**Add Difference** (`A + α(B-C)`):
+- Extracts what B learned compared to C
+- Applies that "knowledge" to A
+- Best for: Transferring a fine-tune to a different base
+
+#### How to Merge Models
+
+1. **Select Base Model**: In the Generate tab, choose your base model (this becomes Model A)
+2. **Go to Merge Tab**: Click the "🔀 Merge" tab
+3. **Check Memory Status**: The top shows your RAM and processing mode
+4. **Choose Method**: Weighted Sum or Add Difference
+5. **Enable Models**: Check the boxes for models you want to merge
+6. **Set Weights**: Adjust the sliders (0.0-1.0)
+7. **For Add Difference**: Select Model C (the original the fine-tune was trained from)
+8. **Name Your Model**: Enter a name (alphanumeric, hyphens, underscores)
+9. **Click Merge**: Wait for the merge to complete
+
+#### Tips for Merging
+
+- **Start with 0.5**: A 50/50 blend is a good starting point
+- **Lower weights for subtle effects**: Use 0.2-0.3 to add hints of another style
+- **Test with quick generates**: Use LeMiCa "fast" mode to quickly test merge results
+- **Save good blends**: Once you find a good mix, the merged model is permanent
+
+#### Memory Considerations
+
+| Your RAM | What Happens |
+|----------|-------------|
+| ≥32GB | Fast standard merge |
+| <32GB | Memory-safe chunked merge (slower but works) |
+| Unknown | Safe chunked mode (if psutil not installed) |
+
+⚠️ **Note**: FP8 quantized models cannot be merged. Only FP16 or higher precision models appear in the merge list.
 
 ### The Model Settings Tab
 

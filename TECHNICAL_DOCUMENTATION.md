@@ -6,14 +6,15 @@
 3. [Directory Structure](#directory-structure)
 4. [Model Components](#model-components)
 5. [LoRA Support](#lora-support)
-6. [Weight Key Mappings](#weight-key-mappings)
-7. [Precision Modes & Quantization](#precision-modes--quantization)
-8. [Model Loading Flow](#model-loading-flow)
-9. [Image Generation Pipeline](#image-generation-pipeline)
-10. [Model Conversion](#model-conversion)
-11. [Critical Implementation Details](#critical-implementation-details)
-12. [Known Issues & Solutions](#known-issues--solutions)
-13. [Configuration Reference](#configuration-reference)
+6. [Model Merging](#model-merging)
+7. [Weight Key Mappings](#weight-key-mappings)
+8. [Precision Modes & Quantization](#precision-modes--quantization)
+9. [Model Loading Flow](#model-loading-flow)
+10. [Image Generation Pipeline](#image-generation-pipeline)
+11. [Model Conversion](#model-conversion)
+12. [Critical Implementation Details](#critical-implementation-details)
+13. [Known Issues & Solutions](#known-issues--solutions)
+14. [Configuration Reference](#configuration-reference)
 
 ---
 
@@ -29,6 +30,7 @@ The project supports:
 - Prompt enhancement using a local LLM
 - Multiple aspect ratios and resolutions
 - **LoRA support** for style and concept customization
+- **Model merging** using Weighted Sum or Add Difference methods
 - **LeMiCa speed acceleration** for up to 30% faster generation
 - **Latent upscaling** for enhanced detail before decoding
 - **ESRGAN upscaling** for pixel-space resolution enhancement
@@ -102,6 +104,7 @@ z-image-turbo-mlx/
 │   ├── vae.py                # MLX VAE implementation
 │   ├── text_encoder.py       # MLX Qwen2 Text Encoder implementation
 │   ├── lora.py               # LoRA loading and application
+│   ├── merge.py              # Model merging algorithms
 │   ├── generate_mlx.py       # Standalone MLX generation script
 │   ├── generate_pytorch.py   # Standalone PyTorch generation script
 │   ├── convert_to_mlx.py     # HuggingFace → MLX converter
@@ -382,6 +385,139 @@ LoRA weights use MLX naming conventions and must be mapped to PyTorch:
 - MLX `qkv_proj` → PyTorch separate `q_proj`, `k_proj`, `v_proj` (split by thirds)
 - MLX layer names → PyTorch `model.diffusion_model.` prefix
 - ComfyUI further converts with `diffusion_` prefix and fuses Q, K, V back together
+
+---
+
+## Model Merging
+
+### Overview
+
+Model merging allows combining multiple Z-Image-Turbo models to create novel blends. The implementation is in `src/merge.py`.
+
+### Merge Methods
+
+#### Weighted Sum
+
+Blend two models proportionally:
+
+```
+merged = (1 - α) * A + α * B
+```
+
+Where:
+- `A`: Base model weights
+- `B`: Model to blend in
+- `α`: Blend ratio (0.0 = 100% A, 0.5 = 50/50, 1.0 = 100% B)
+
+#### Add Difference
+
+Extract what one model learned relative to another and apply to a third:
+
+```
+merged = A + α * (B - C)
+```
+
+Where:
+- `A`: Base model to modify
+- `B`: Fine-tuned model (what you want to extract from)
+- `C`: Original model (that B was fine-tuned from)
+- `α`: Strength of the difference (1.0 = full strength)
+
+### Sequential Merging
+
+For 3+ models, merges are applied sequentially:
+
+```
+result = ((A ⊕ B) ⊕ C) ⊕ D...
+```
+
+Each step uses the previous result as the new base.
+
+### Memory Management
+
+The merge system automatically adapts to available RAM:
+
+| Available RAM | Mode | Description |
+|---------------|------|-------------|
+| ≥32GB | Standard | Load all models simultaneously |
+| <32GB | Chunked | Process weights key-by-key |
+| Unknown (no psutil) | Chunked | Safe fallback mode |
+
+### Key Functions (`src/merge.py`)
+
+```python
+# Core merge algorithms
+weighted_sum_merge(weights_a, weights_b, alpha=0.5)
+add_difference_merge(weights_a, weights_b, weights_c, alpha=1.0)
+
+# Memory-efficient chunked variants
+weighted_sum_merge_chunked(model_path_a, model_path_b, output_path, alpha)
+add_difference_merge_chunked(model_path_a, model_path_b, model_path_c, output_path, alpha)
+
+# Sequential merging for 3+ models
+merge_models_sequential(base_weights, [(weights_b, 0.3), (weights_c, 0.2)])
+
+# Discovery
+get_available_merge_models(models_dir, exclude_quantized=True)
+
+# Memory detection
+get_available_ram_gb()  # Returns None if psutil unavailable
+should_use_chunked_mode(num_models)  # Returns (bool, reason_message)
+
+# Main entry point
+perform_merge(
+    base_model_path,
+    merge_models=[(path, weight), ...],
+    output_path,
+    method="weighted_sum",  # or "add_difference"
+    model_c_path=None,      # Required for add_difference
+    add_diff_alpha=1.0,
+    progress_callback=None
+)
+```
+
+### Quantized Model Exclusion
+
+FP8 quantized models cannot be merged because:
+1. Quantized weights use a different format (uint32 packed + scales/biases)
+2. Merging quantized values directly would produce incorrect results
+3. Dequantizing, merging, and re-quantizing introduces precision loss
+
+The `get_available_merge_models()` function automatically excludes quantized models.
+
+### Output Model Structure
+
+Merged models are saved with:
+- `weights.safetensors` - Merged transformer weights
+- `config.json` - Updated with merge metadata and `"precision": "FP16"`
+- `merge_info.json` - Detailed merge operation record
+- Copied from base: VAE, text encoder, tokenizer, scheduler
+
+### UI Integration
+
+The Merge tab in `app.py` provides:
+
+1. **Memory Status**: Shows available RAM and processing mode
+2. **Method Selector**: Weighted Sum or Add Difference
+3. **Model Rows**: Enable checkbox + weight slider for each available model
+4. **Model C Selector**: Appears only for Add Difference method
+5. **Output Name**: Name for the merged model
+6. **Progress Feedback**: Real-time merge status
+
+### Merge Workflow
+
+```
+1. User selects base model in Generate tab (becomes Model A)
+2. User goes to Merge tab
+3. User selects merge method
+4. User enables models to merge and sets weights
+5. For Add Difference: User selects Model C
+6. User enters output name and clicks Merge
+7. System detects RAM and chooses standard/chunked mode
+8. Weights are loaded and merged
+9. Result saved to models/mlx/<output_name>/
+10. Model dropdown refreshed to include new model
+```
 
 ---
 
