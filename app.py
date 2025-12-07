@@ -63,6 +63,15 @@ except ImportError:
     UPSCALER_AVAILABLE = False
     logger.warning("Upscaler module not available. Install torch to enable upscaling.")
 
+# Training UI imports
+try:
+    from training_ui import create_training_tab, TRAINING_AVAILABLE
+    logger.info(f"Training module available: {TRAINING_AVAILABLE}")
+except ImportError:
+    TRAINING_AVAILABLE = False
+    create_training_tab = None
+    logger.warning("Training UI module not available.")
+
 # Global model cache
 _mlx_models = None
 _pytorch_pipe = None
@@ -4127,6 +4136,33 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             gr.Markdown("#### 📊 Installed Models")
             model_status = gr.Textbox(label="Model Inventory", interactive=False, lines=12, max_lines=30, autoscroll=False, value="Checking...")
             refresh_status_btn = gr.Button("🔄 Refresh Inventory", variant="secondary")
+        
+        # Training Tab
+        if create_training_tab is not None:
+            training_components = create_training_tab()
+        else:
+            with gr.Tab("🎓 Training"):
+                gr.Markdown(
+                    """
+                    ## Training Not Available
+                    
+                    Training requires PyTorch with CUDA support. To enable training:
+                    
+                    1. **Install PyTorch with CUDA:**
+                       ```
+                       pip install torch --index-url https://download.pytorch.org/whl/cu121
+                       ```
+                    
+                    2. **Install additional dependencies:**
+                       ```
+                       pip install diffusers transformers accelerate
+                       ```
+                    
+                    3. **Restart the application**
+                    
+                    *Note: Training requires an NVIDIA GPU with at least 16GB VRAM (24GB+ recommended).*
+                    """
+                )
     
     # Hidden state to store temporary paths, prompt, seed, and selected index
     temp_png_path = gr.State()

@@ -5,6 +5,7 @@ huggingface_hub
 transformers
 diffusers
 torch
+torchvision
 numpy
 gguf
 gradio

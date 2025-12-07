@@ -2,6 +2,44 @@
 
 Add the ability to train custom LoRAs and fine-tune models directly within the app, using datasets selected by the user.
 
+## ✅ IMPLEMENTATION STATUS
+
+### Completed
+- [x] **Phase 1: Dataset Management** - `src/training/dataset.py`
+  - DatasetManager class for dataset creation and management
+  - TrainingDataset PyTorch Dataset class
+  - Aspect ratio bucketing support
+  - Caption file handling
+
+- [x] **Phase 2: Training Configuration** - `src/training/config.py`
+  - TrainingConfig, LoRAConfig, DatasetConfig dataclasses
+  - Preset configurations (quick_test, character_lora, style_lora, concept_lora)
+  - JSON save/load support
+
+- [x] **Phase 3: Training Backend** - `src/training/`
+  - `trainer.py` - Main LoRATrainer class with full training loop
+  - `lora_network.py` - LoRA injection and weight management
+  - `adapter.py` - Training adapter (Ostris de-distillation) support
+  - `utils.py` - Training utilities, memory estimation, timers
+
+- [x] **Phase 4: Training UI** - `src/training_ui.py` + `app.py`
+  - Training tab added to Gradio interface
+  - Dataset management UI (create, add images, validate)
+  - Training configuration UI with presets
+  - Progress monitoring
+  - VRAM estimation
+
+### Remaining Work
+- [ ] **Testing** - Test full training pipeline with real GPU
+- [ ] **Validation Images** - Improve validation image generation during training
+- [ ] **WandB Integration** - Add Weights & Biases logging support
+- [ ] **Auto-captioning** - Add BLIP/Florence-2 integration for automatic captions
+- [ ] **Cloud Training** - Optional integration with cloud GPU services
+
+---
+
+## Technical Reference
+
 ### Background & Research
 
 #### Key Resources
