@@ -6,18 +6,18 @@ This module provides LoRA training capabilities for Z-Image-Turbo models.
 
 Training requires one of the following GPU backends:
 
-### macOS (Apple Silicon)
+### macOS (Apple Silicon) - Recommended
 - **Apple Silicon Mac** (M1/M2/M3/M4) with MPS support
 - **macOS 12.3+** (Monterey or later)
-- **16GB+ unified memory** recommended
-- **PyTorch 2.0+**: `pip install torch`
+- **16GB+ unified memory** recommended (32GB+ for larger batches)
+- **PyTorch 2.0+**: Already included in requirements.txt
 
 ### Linux/Windows (NVIDIA)
 - **NVIDIA GPU** with CUDA support (24GB+ VRAM recommended)
 - **PyTorch with CUDA**: `pip install torch --index-url https://download.pytorch.org/whl/cu121`
 
 ### Common Requirements
-- **Additional packages**: `pip install diffusers transformers`
+- **Additional packages**: `pip install diffusers transformers torchvision`
 
 > **Note**: MLX is used for inference only. Training uses PyTorch with MPS (Apple Silicon) or CUDA (NVIDIA). Trained LoRAs work seamlessly with MLX inference.
 
@@ -36,7 +36,11 @@ Training requires one of the following GPU backends:
 ### Dataset Management
 - Create and manage training datasets
 - Automatic caption file handling
-- Aspect ratio bucketing for efficient training
+- **Aspect ratio bucketing** for training on varied image dimensions:
+  - 9 predefined buckets from 768×1344 to 1344×768
+  - Maintains ~1 megapixel per image regardless of aspect ratio
+  - No cropping required - images resized to nearest bucket
+  - Enable/disable via checkbox in training UI
 
 ## Quick Start
 
@@ -111,9 +115,16 @@ trainer.train()
 
 Or use the Training tab in the Gradio UI.
 
-### 4. Use Your LoRA
+### 4. Export Your LoRA
 
-After training, your LoRA will be saved to the output directory. Copy it to `models/loras/` to use it in the Generate tab.
+After training, use the **💾 Export Trained LoRA** section in the Training tab to save your LoRA:
+
+- **📁 LoRA Only**: Copy to `models/loras/custom/` for use in Generate tab
+- **🍎 MLX**: Bake LoRA into base model, save to `models/mlx/`
+- **🔥 PyTorch**: Bake LoRA into base model, save to `models/pytorch/`
+- **🎨 ComfyUI**: Bake LoRA into base model, save to `models/comfyui/`
+
+You can select multiple formats simultaneously.
 
 ## Training Presets
 

@@ -2,6 +2,15 @@
 
 ✅ **COMPLETED** - LoRA support has been fully implemented!
 
+### Training Support
+
+✅ **COMPLETED** - LoRA training is now available!
+
+- Train custom LoRAs using PyTorch with MPS (Apple Silicon) or CUDA (NVIDIA)
+- Aspect ratio bucketing for varied image dimensions
+- Export trained LoRAs as standalone files or merged models (MLX/PyTorch/ComfyUI)
+- Training tab located after Merge tab in the UI
+
 Add the ability to load and apply LoRA (Low-Rank Adaptation) models to the MLX image generator, enabling style and concept customization without full model retraining.
 
 ### Completed Implementation

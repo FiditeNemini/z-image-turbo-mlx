@@ -13,6 +13,11 @@
 .conda-env
 .agent/
 
+# Training data and logs
+/logs/
+/datasets/
+/outputs/
+
 # MacOS
 .DS_Store
 .AppleDouble

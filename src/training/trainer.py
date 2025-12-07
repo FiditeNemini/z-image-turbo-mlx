@@ -40,7 +40,15 @@ from datetime import datetime
 from tqdm import tqdm
 
 from .config import TrainingConfig, LoRAConfig, DatasetConfig
-from .dataset import DatasetManager, TrainingDataset, ImageEntry, create_dataloader
+from .dataset import (
+    DatasetManager,
+    TrainingDataset,
+    ImageEntry,
+    AspectRatioBucket,
+    BucketBatchSampler,
+    create_dataloader,
+    create_bucketed_dataloader,
+)
 from .lora_network import LoRANetwork, get_target_modules_for_zimage
 from .adapter import TrainingAdapterManager, AdapterAwareTraining
 from .utils import (
@@ -391,6 +399,22 @@ class LoRATrainer:
         if not entries:
             raise ValueError(f"No images found in dataset: {dataset_config.dataset_path}")
         
+        # Set up bucketing if enabled
+        bucket_manager = None
+        if dataset_config.use_bucketing:
+            bucket_manager = AspectRatioBucket(
+                base_resolution=dataset_config.resolution,
+                max_resolution=dataset_config.resolution,
+                min_resolution=dataset_config.min_resolution,
+                step_size=64,
+                max_aspect_ratio=dataset_config.max_aspect_ratio,
+            )
+            print(f"\nAspect ratio bucketing enabled:")
+            print(f"  Base resolution: {dataset_config.resolution}px")
+            print(f"  Min resolution: {dataset_config.min_resolution}px")
+            print(f"  Max aspect ratio: {dataset_config.max_aspect_ratio}")
+            print(f"  Available buckets: {len(bucket_manager.buckets)}")
+        
         # Create dataset
         dataset = TrainingDataset(
             entries=entries,
@@ -398,15 +422,30 @@ class LoRATrainer:
             flip_horizontal=dataset_config.flip_horizontal,
             flip_vertical=dataset_config.flip_vertical,
             random_crop=dataset_config.random_crop,
+            bucket_manager=bucket_manager,
         )
         
-        # Create dataloader
-        self.dataloader = create_dataloader(
-            dataset,
-            batch_size=self.config.batch_size,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory,
-        )
+        # Create dataloader (bucketed or standard)
+        if dataset_config.use_bucketing and bucket_manager is not None:
+            self.dataloader, self.bucket_sampler = create_bucketed_dataloader(
+                dataset,
+                batch_size=self.config.batch_size,
+                num_workers=self.config.num_workers,
+                pin_memory=self.config.pin_memory,
+            )
+            # Print bucket distribution
+            stats = self.bucket_sampler.get_bucket_stats()
+            print(f"\nBucket distribution ({stats['num_buckets']} buckets used):")
+            for bucket_name, info in stats["buckets"].items():
+                print(f"  {bucket_name}: {info['count']} images, {info['batches']} batches")
+        else:
+            self.dataloader = create_dataloader(
+                dataset,
+                batch_size=self.config.batch_size,
+                num_workers=self.config.num_workers,
+                pin_memory=self.config.pin_memory,
+            )
+            self.bucket_sampler = None
     
     def _load_entries_from_path(self, dataset_path: Path) -> List[ImageEntry]:
         """Load dataset entries from a direct path."""

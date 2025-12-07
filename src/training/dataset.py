@@ -451,6 +451,7 @@ class TrainingDataset(Dataset):
     PyTorch Dataset for Z-Image-Turbo training.
     
     Handles image loading, preprocessing, and optional latent caching.
+    Supports both fixed resolution and bucketed (variable resolution) modes.
     """
     
     def __init__(
@@ -463,19 +464,21 @@ class TrainingDataset(Dataset):
         random_crop: bool = False,
         cached_latents: Optional[Dict[str, torch.Tensor]] = None,
         cached_text_embeds: Optional[Dict[str, torch.Tensor]] = None,
+        bucket_manager: Optional["AspectRatioBucket"] = None,
     ):
         """
         Initialize training dataset.
         
         Args:
             entries: List of ImageEntry objects
-            resolution: Target resolution
+            resolution: Target resolution (used when not bucketing)
             transform: Optional custom transform
             flip_horizontal: Enable horizontal flipping
             flip_vertical: Enable vertical flipping
             random_crop: Use random crop instead of center crop
             cached_latents: Pre-computed latents (keyed by image path)
             cached_text_embeds: Pre-computed text embeddings (keyed by caption hash)
+            bucket_manager: Optional AspectRatioBucket for variable resolutions
         """
         self.entries = entries
         self.resolution = resolution
@@ -484,26 +487,51 @@ class TrainingDataset(Dataset):
         self.random_crop = random_crop
         self.cached_latents = cached_latents or {}
         self.cached_text_embeds = cached_text_embeds or {}
+        self.bucket_manager = bucket_manager
         
+        # Pre-compute bucket assignments if bucketing is enabled
+        self.entry_buckets: Dict[int, Tuple[int, int]] = {}
+        if bucket_manager is not None:
+            for idx, entry in enumerate(entries):
+                if entry.width > 0 and entry.height > 0:
+                    self.entry_buckets[idx] = bucket_manager.get_bucket(entry.width, entry.height)
+                else:
+                    self.entry_buckets[idx] = (resolution, resolution)
+        
+        # Only create default transform if not bucketing (bucketing creates per-sample transforms)
         if transform is not None:
             self.transform = transform
+        elif bucket_manager is None:
+            self.transform = self._create_transform(resolution, resolution)
         else:
-            self.transform = self._create_transform()
+            self.transform = None  # Will create per-sample in __getitem__
     
-    def _create_transform(self) -> Callable:
-        """Create default image transform pipeline."""
+    def _create_transform(self, target_width: int, target_height: int) -> Callable:
+        """Create image transform pipeline for a specific target size."""
         if TORCHVISION_AVAILABLE:
-            transform_list = [
-                transforms.Resize(
-                    self.resolution,
-                    interpolation=transforms.InterpolationMode.LANCZOS,
-                ),
-            ]
+            # For bucketing, we resize to fit the bucket then crop to exact size
+            transform_list = []
             
-            if self.random_crop:
-                transform_list.append(transforms.RandomCrop(self.resolution))
+            if target_width == target_height:
+                # Square: resize shortest side, then crop
+                transform_list.append(
+                    transforms.Resize(
+                        target_width,
+                        interpolation=transforms.InterpolationMode.LANCZOS,
+                    )
+                )
+                if self.random_crop:
+                    transform_list.append(transforms.RandomCrop(target_width))
+                else:
+                    transform_list.append(transforms.CenterCrop(target_width))
             else:
-                transform_list.append(transforms.CenterCrop(self.resolution))
+                # Non-square: resize to fit bucket dimensions
+                transform_list.append(
+                    transforms.Resize(
+                        (target_height, target_width),
+                        interpolation=transforms.InterpolationMode.LANCZOS,
+                    )
+                )
             
             transform_list.extend([
                 transforms.ToTensor(),
@@ -512,23 +540,28 @@ class TrainingDataset(Dataset):
             
             return transforms.Compose(transform_list)
         else:
-            # Fallback without torchvision
-            return self._pil_transform
+            # Fallback without torchvision - create a closure
+            return lambda img: self._pil_transform(img, target_width, target_height)
     
-    def _pil_transform(self, image: Image.Image) -> torch.Tensor:
+    def _pil_transform(self, image: Image.Image, target_width: int, target_height: int) -> torch.Tensor:
         """Fallback transform using PIL only (when torchvision not available)."""
         import numpy as np
         
-        # Resize maintaining aspect ratio then crop
         w, h = image.size
-        scale = self.resolution / min(w, h)
-        new_w, new_h = int(w * scale), int(h * scale)
-        image = image.resize((new_w, new_h), Image.LANCZOS)
         
-        # Center crop
-        left = (new_w - self.resolution) // 2
-        top = (new_h - self.resolution) // 2
-        image = image.crop((left, top, left + self.resolution, top + self.resolution))
+        if target_width == target_height:
+            # Square: resize maintaining aspect ratio then center crop
+            scale = target_width / min(w, h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            image = image.resize((new_w, new_h), Image.LANCZOS)
+            
+            # Center crop to square
+            left = (new_w - target_width) // 2
+            top = (new_h - target_height) // 2
+            image = image.crop((left, top, left + target_width, top + target_height))
+        else:
+            # Non-square bucket: resize to exact dimensions
+            image = image.resize((target_width, target_height), Image.LANCZOS)
         
         # Convert to tensor and normalize to [-1, 1]
         arr = np.array(image).astype(np.float32) / 255.0
@@ -549,6 +582,7 @@ class TrainingDataset(Dataset):
             - pixel_values: Image tensor [C, H, W]
             - caption: Caption string
             - image_path: Path to original image
+            - bucket_size: (width, height) tuple if bucketing
             - latent: Cached latent if available
             - text_embed: Cached text embedding if available
         """
@@ -564,12 +598,20 @@ class TrainingDataset(Dataset):
         if self.flip_vertical and random.random() > 0.5:
             image = image.transpose(Image.FLIP_TOP_BOTTOM)
         
-        pixel_values = self.transform(image)
+        # Get target size (from bucket or default resolution)
+        if self.bucket_manager is not None and idx in self.entry_buckets:
+            target_w, target_h = self.entry_buckets[idx]
+            transform = self._create_transform(target_w, target_h)
+            pixel_values = transform(image)
+        else:
+            target_w, target_h = self.resolution, self.resolution
+            pixel_values = self.transform(image)
         
         sample = {
             "pixel_values": pixel_values,
             "caption": entry.caption,
             "image_path": str(entry.image_path),
+            "bucket_size": (target_w, target_h),
         }
         
         # Add cached latent if available
@@ -620,27 +662,39 @@ class AspectRatioBucket:
         self.buckets = self._generate_buckets()
     
     def _generate_buckets(self) -> List[Tuple[int, int]]:
-        """Generate all valid bucket sizes."""
+        """Generate all valid bucket sizes maintaining roughly constant total pixels."""
         buckets = set()
         
-        # Target total pixels
+        # Target total pixels (from base resolution)
         target_pixels = self.base_resolution ** 2
         
-        # Generate bucket sizes
+        # Generate bucket sizes - iterate through possible widths
+        # and calculate corresponding height to maintain similar pixel count
         for width in range(self.min_resolution, self.max_resolution + 1, self.step_size):
             # Calculate height to maintain ~same total pixels
             height = int(target_pixels / width)
+            # Round to step size
             height = (height // self.step_size) * self.step_size
             
-            if height < self.min_resolution or height > self.max_resolution:
+            # Skip if height is out of valid range
+            if height < self.min_resolution:
                 continue
             
-            aspect = width / height
-            if aspect > self.max_aspect_ratio or aspect < (1 / self.max_aspect_ratio):
+            # Cap height at a reasonable maximum (allow some flexibility)
+            max_h = int(self.base_resolution * self.max_aspect_ratio)
+            max_h = (max_h // self.step_size) * self.step_size
+            if height > max_h:
+                height = max_h
+            
+            # Check aspect ratio
+            aspect = max(width / height, height / width)
+            if aspect > self.max_aspect_ratio:
                 continue
             
             buckets.add((width, height))
-            buckets.add((height, width))  # Also add rotated version
+            # Also add rotated version (portrait)
+            if width != height:
+                buckets.add((height, width))
         
         # Always include square bucket
         buckets.add((self.base_resolution, self.base_resolution))
@@ -697,6 +751,95 @@ class AspectRatioBucket:
             bucket_assignments[bucket].append(entry)
         
         return bucket_assignments
+    
+    def get_bucket_info(self) -> str:
+        """Get human-readable bucket information."""
+        lines = [f"Aspect Ratio Buckets (base {self.base_resolution}px):"]
+        for w, h in sorted(self.buckets, key=lambda x: x[0]/x[1]):
+            aspect = w / h
+            lines.append(f"  {w}x{h} (aspect {aspect:.2f})")
+        return "\n".join(lines)
+
+
+class BucketBatchSampler:
+    """
+    Batch sampler that groups images by their aspect ratio bucket.
+    
+    This ensures all images in a batch have the same target dimensions,
+    allowing efficient batching without padding waste.
+    """
+    
+    def __init__(
+        self,
+        dataset: TrainingDataset,
+        batch_size: int,
+        drop_last: bool = True,
+        shuffle: bool = True,
+    ):
+        """
+        Initialize bucket batch sampler.
+        
+        Args:
+            dataset: TrainingDataset with bucket assignments
+            batch_size: Number of samples per batch
+            drop_last: Drop incomplete batches
+            shuffle: Shuffle within buckets each epoch
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+        
+        # Group indices by bucket
+        self.bucket_indices: Dict[Tuple[int, int], List[int]] = {}
+        for idx in range(len(dataset)):
+            bucket = dataset.entry_buckets.get(idx, (dataset.resolution, dataset.resolution))
+            if bucket not in self.bucket_indices:
+                self.bucket_indices[bucket] = []
+            self.bucket_indices[bucket].append(idx)
+        
+        # Calculate total batches
+        self._calculate_batches()
+    
+    def _calculate_batches(self):
+        """Calculate batches for current epoch."""
+        self.batches = []
+        
+        for bucket, indices in self.bucket_indices.items():
+            if self.shuffle:
+                indices = indices.copy()
+                random.shuffle(indices)
+            
+            # Create batches from this bucket
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    self.batches.append(batch)
+        
+        # Shuffle batches across buckets
+        if self.shuffle:
+            random.shuffle(self.batches)
+    
+    def __iter__(self):
+        self._calculate_batches()  # Re-shuffle each epoch
+        for batch in self.batches:
+            yield batch
+    
+    def __len__(self):
+        return len(self.batches)
+    
+    def get_bucket_stats(self) -> Dict[str, Any]:
+        """Get statistics about bucket distribution."""
+        stats = {
+            "num_buckets": len(self.bucket_indices),
+            "buckets": {},
+        }
+        for bucket, indices in self.bucket_indices.items():
+            stats["buckets"][f"{bucket[0]}x{bucket[1]}"] = {
+                "count": len(indices),
+                "batches": len(indices) // self.batch_size,
+            }
+        return stats
 
 
 def create_dataloader(
@@ -707,7 +850,7 @@ def create_dataloader(
     pin_memory: bool = True,
 ) -> DataLoader:
     """
-    Create a DataLoader for training.
+    Create a DataLoader for training (fixed resolution, no bucketing).
     
     Args:
         dataset: Training dataset
@@ -730,6 +873,47 @@ def create_dataloader(
     )
 
 
+def create_bucketed_dataloader(
+    dataset: TrainingDataset,
+    batch_size: int = 1,
+    shuffle: bool = True,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+) -> Tuple[DataLoader, BucketBatchSampler]:
+    """
+    Create a DataLoader with aspect ratio bucketing.
+    
+    Images are grouped by similar aspect ratios so each batch contains
+    images with the same target dimensions, eliminating padding waste.
+    
+    Args:
+        dataset: Training dataset with bucket_manager set
+        batch_size: Batch size
+        shuffle: Whether to shuffle within and across buckets
+        num_workers: Number of data loading workers
+        pin_memory: Whether to pin memory for faster GPU transfer
+        
+    Returns:
+        Tuple of (DataLoader, BucketBatchSampler)
+    """
+    sampler = BucketBatchSampler(
+        dataset=dataset,
+        batch_size=batch_size,
+        drop_last=True,
+        shuffle=shuffle,
+    )
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=_collate_fn,
+    )
+    
+    return dataloader, sampler
+
+
 def _collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Collate function for batching training samples.
@@ -739,6 +923,10 @@ def _collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "captions": [b["caption"] for b in batch],
         "image_paths": [b["image_path"] for b in batch],
     }
+    
+    # Include bucket size info
+    if "bucket_size" in batch[0]:
+        result["bucket_size"] = batch[0]["bucket_size"]  # All same in bucketed batch
     
     # Handle optional cached values
     if "latent" in batch[0]:

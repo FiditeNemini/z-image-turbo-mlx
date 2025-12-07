@@ -3891,8 +3891,8 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         
                         dataset_location = gr.Textbox(
                             label="Dataset Save Location",
-                            value="./dataset/",
-                            placeholder="e.g., ~/Documents/datasets/z-image or /Users/you/datasets/z-image",
+                            value="./datasets/",
+                            placeholder="e.g., ~/Documents/datasets/my_dataset or ./datasets/my_project",
                             info="Images and prompts will be saved here for training datasets (you can drag a folder here)",
                         )
                         
@@ -4052,6 +4052,38 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             
             refresh_merge_models_btn = gr.Button("🔄 Refresh Model List", size="sm")
         
+        # Training Tab (after Merge, before Model Settings)
+        if create_training_tab is not None:
+            training_components = create_training_tab()
+        else:
+            with gr.Tab("🎓 Training"):
+                gr.Markdown(
+                    """
+                    ## Training Not Available
+                    
+                    Training requires PyTorch with MPS (Apple Silicon) or CUDA (NVIDIA) support.
+                    
+                    **On macOS (Apple Silicon):**
+                    PyTorch MPS should be available by default. If not, reinstall PyTorch:
+                    ```
+                    pip install torch torchvision
+                    ```
+                    
+                    **On Linux/Windows (NVIDIA GPU):**
+                    Install PyTorch with CUDA:
+                    ```
+                    pip install torch --index-url https://download.pytorch.org/whl/cu121
+                    ```
+                    
+                    **Additional dependencies:**
+                    ```
+                    pip install diffusers transformers
+                    ```
+                    
+                    Then restart the application.
+                    """
+                )
+        
         with gr.Tab("⚙️ Model Settings"):
             gr.Markdown(
                 """
@@ -4136,33 +4168,6 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             gr.Markdown("#### 📊 Installed Models")
             model_status = gr.Textbox(label="Model Inventory", interactive=False, lines=12, max_lines=30, autoscroll=False, value="Checking...")
             refresh_status_btn = gr.Button("🔄 Refresh Inventory", variant="secondary")
-        
-        # Training Tab
-        if create_training_tab is not None:
-            training_components = create_training_tab()
-        else:
-            with gr.Tab("🎓 Training"):
-                gr.Markdown(
-                    """
-                    ## Training Not Available
-                    
-                    Training requires PyTorch with CUDA support. To enable training:
-                    
-                    1. **Install PyTorch with CUDA:**
-                       ```
-                       pip install torch --index-url https://download.pytorch.org/whl/cu121
-                       ```
-                    
-                    2. **Install additional dependencies:**
-                       ```
-                       pip install diffusers transformers accelerate
-                       ```
-                    
-                    3. **Restart the application**
-                    
-                    *Note: Training requires an NVIDIA GPU with at least 16GB VRAM (24GB+ recommended).*
-                    """
-                )
     
     # Hidden state to store temporary paths, prompt, seed, and selected index
     temp_png_path = gr.State()

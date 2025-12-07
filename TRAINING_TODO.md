@@ -30,11 +30,17 @@ Add the ability to train custom LoRAs and fine-tune models directly within the a
   - VRAM estimation
 
 ### Remaining Work
-- [ ] **Testing** - Test full training pipeline with real GPU
+- [ ] **Testing** - Test full training pipeline end-to-end
 - [ ] **Validation Images** - Improve validation image generation during training
 - [ ] **WandB Integration** - Add Weights & Biases logging support
 - [ ] **Auto-captioning** - Add BLIP/Florence-2 integration for automatic captions
 - [ ] **Cloud Training** - Optional integration with cloud GPU services
+
+### Recently Completed
+- [x] **MPS Backend Support** - Training now works on Apple Silicon via MPS (not just CUDA)
+- [x] **Aspect Ratio Bucketing** - Train on varied image dimensions without cropping
+- [x] **Export Options** - Export trained LoRAs as standalone files or merged models
+- [x] **Training Tab Placement** - Moved to after Merge tab for better workflow
 
 ---
 

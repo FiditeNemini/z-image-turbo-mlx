@@ -15,6 +15,14 @@ This folder contains the essential source files for running Z-Image-Turbo on bot
 
 ### Utilities
 - **`convert_to_mlx.py`** - Convert PyTorch weights to MLX format
+- **`upscaler.py`** - ESRGAN upscaler implementation
+
+### Training
+- **`training_ui.py`** - Training tab UI components for Gradio
+- **`training/`** - Training module (see `training/README.md` for details)
+  - Dataset management with aspect ratio bucketing
+  - LoRA training with MPS/CUDA support
+  - Training adapter integration
 
 ## Usage
 
@@ -31,7 +39,8 @@ Options:
 - `--steps` - Number of inference steps (default: 9)
 - `--height` - Image height (default: 1024)
 - `--width` - Image width (default: 1024)
-- `--model_path` - Path to MLX model weights (default: `./models/mlx_model`)
+- `--model_path` - Path to MLX model weights (default: `../models/mlx/Z-Image-Turbo-MLX`)
+- `--cache` - LeMiCa speed mode: slow/medium/fast (default: disabled)
 
 ### PyTorch Generation
 
@@ -56,4 +65,4 @@ If you need to re-convert PyTorch weights to MLX format:
 python src/convert_to_mlx.py
 ```
 
-This reads from `models/Z-Image-Turbo/` and writes to `models/mlx_model/`.
+This reads from `models/pytorch/Z-Image-Turbo/` and writes to `models/mlx/Z-Image-Turbo-MLX/`.

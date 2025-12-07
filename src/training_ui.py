@@ -43,6 +43,10 @@ except ImportError:
 DATASETS_DIR = Path("./datasets")
 TRAINING_ADAPTERS_DIR = Path("./models/training_adapters")
 OUTPUTS_DIR = Path("./outputs/training")
+LORAS_DIR = Path("./models/loras")
+MLX_MODELS_DIR = Path("./models/mlx")
+PYTORCH_MODELS_DIR = Path("./models/pytorch")
+COMFYUI_MODELS_DIR = Path("./models/comfyui")
 
 # Global training state
 _training_thread: Optional[threading.Thread] = None
@@ -265,18 +269,60 @@ def validate_dataset(dataset_name: str) -> str:
         return f"❌ Validation error: {e}"
 
 
+def get_available_adapters() -> List[str]:
+    """Get list of available training adapters for dropdown."""
+    TRAINING_ADAPTERS_DIR.mkdir(parents=True, exist_ok=True)
+    adapters = list(TRAINING_ADAPTERS_DIR.glob("*.safetensors"))
+    return [a.name for a in sorted(adapters)]
+
+
+def get_trained_loras() -> List[str]:
+    """Get list of trained LoRAs from the outputs directory."""
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    loras = []
+    for d in OUTPUTS_DIR.iterdir():
+        if d.is_dir():
+            # Look for final LoRA or latest checkpoint
+            lora_file = d / f"{d.name}_final.safetensors"
+            if lora_file.exists():
+                loras.append(d.name)
+            else:
+                # Check for checkpoints
+                checkpoints = list(d.glob("*_step_*.safetensors"))
+                if checkpoints:
+                    loras.append(d.name)
+    return sorted(loras)
+
+
+def get_lora_path_for_export(lora_name: str) -> Optional[Path]:
+    """Get the path to a trained LoRA file for export."""
+    lora_dir = OUTPUTS_DIR / lora_name
+    if not lora_dir.exists():
+        return None
+    
+    # Prefer final LoRA
+    final_lora = lora_dir / f"{lora_name}_final.safetensors"
+    if final_lora.exists():
+        return final_lora
+    
+    # Fall back to latest checkpoint
+    checkpoints = sorted(lora_dir.glob("*_step_*.safetensors"))
+    if checkpoints:
+        return checkpoints[-1]
+    
+    return None
+
+
 def get_training_adapter_info() -> str:
     """Get info about available training adapters."""
-    TRAINING_ADAPTERS_DIR.mkdir(parents=True, exist_ok=True)
-    
-    adapters = list(TRAINING_ADAPTERS_DIR.glob("*.safetensors"))
+    adapters = get_available_adapters()
     
     if not adapters:
         return "No training adapters found.\n\nDownload from: https://huggingface.co/ostris/zimage_turbo_training_adapter"
     
     lines = ["**Available Training Adapters:**", ""]
     for adapter in adapters:
-        lines.append(f"• {adapter.name}")
+        lines.append(f"• {adapter}")
     
     lines.append("")
     lines.append("*Training adapters help preserve turbo model capabilities during fine-tuning.*")
@@ -300,7 +346,7 @@ def update_config_from_preset(preset_name: str):
     """Update UI values from preset."""
     if preset_name == "custom":
         # Return current values unchanged
-        return [gr.update() for _ in range(12)]
+        return [gr.update() for _ in range(13)]
     
     preset = PRESET_CONFIGS.get(preset_name, {})
     lora = preset.get("lora", {})
@@ -318,6 +364,7 @@ def update_config_from_preset(preset_name: str):
         gr.update(value=preset.get("validation_every_n_steps", 250)),
         gr.update(value=dataset.get("flip_horizontal", True)),
         gr.update(value=dataset.get("resolution", 1024)),
+        gr.update(value=dataset.get("use_bucketing", True)),
         gr.update(value=preset.get("use_training_adapter", True)),
     ]
 
@@ -451,7 +498,9 @@ def start_training(
     validate_every: int,
     flip_horizontal: bool,
     resolution: int,
+    use_bucketing: bool,
     use_adapter: bool,
+    adapter_name: str,
     adapter_weight: float,
     validation_prompts: str,
 ) -> str:
@@ -499,10 +548,12 @@ def start_training(
             dataset_path=str(DATASETS_DIR / dataset_name),
             resolution=resolution,
             flip_horizontal=flip_horizontal,
+            use_bucketing=use_bucketing,
         ),
         
         # Adapter
         use_training_adapter=use_adapter,
+        training_adapter_path=str(TRAINING_ADAPTERS_DIR / adapter_name) if adapter_name else "",
         training_adapter_weight=adapter_weight,
         
         # Checkpointing
@@ -572,6 +623,167 @@ def stop_training() -> str:
     _training_progress["message"] = "Stopping training..."
     
     return "⏹️ Stop signal sent. Training will stop after current step."
+
+
+def save_trained_lora_as_model(
+    trained_lora_name: str,
+    output_model_name: str,
+    lora_scale: float,
+    save_lora_only: bool,
+    save_mlx: bool,
+    save_pytorch: bool,
+    save_comfyui: bool,
+    progress=None,
+) -> str:
+    """
+    Save a trained LoRA in various formats.
+    
+    Args:
+        trained_lora_name: Name of the trained LoRA in outputs directory
+        output_model_name: Name for the output model/LoRA
+        lora_scale: Scale/strength to apply when baking into model
+        save_lora_only: If True, just copy the LoRA to models/loras/
+        save_mlx: Save as MLX model with LoRA baked in
+        save_pytorch: Save as PyTorch model with LoRA baked in
+        save_comfyui: Save as ComfyUI model with LoRA baked in
+        progress: Optional Gradio progress callback
+    
+    Returns:
+        Status message
+    """
+    import re
+    
+    if not trained_lora_name:
+        return "❌ Please select a trained LoRA"
+    
+    if not output_model_name or not output_model_name.strip():
+        return "❌ Please enter an output name"
+    
+    output_model_name = output_model_name.strip()
+    
+    # Validate name
+    if not re.match(r'^[\w\-]+$', output_model_name):
+        return "❌ Name can only contain letters, numbers, hyphens, and underscores"
+    
+    # Check at least one format selected
+    if not save_lora_only and not save_mlx and not save_pytorch and not save_comfyui:
+        return "❌ Please select at least one output format"
+    
+    # Get the LoRA path
+    lora_path = get_lora_path_for_export(trained_lora_name)
+    if not lora_path:
+        return f"❌ Could not find LoRA file for '{trained_lora_name}'"
+    
+    results = []
+    
+    try:
+        # Save as standalone LoRA
+        if save_lora_only:
+            result = _copy_lora_to_models(lora_path, output_model_name, progress)
+            results.append(result)
+        
+        # Save as merged model(s)
+        if save_mlx or save_pytorch or save_comfyui:
+            result = _save_lora_as_merged_model(
+                lora_path, output_model_name, lora_scale,
+                save_mlx, save_pytorch, save_comfyui, progress
+            )
+            results.append(result)
+        
+        return "\n".join(results)
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"❌ Error: {str(e)}"
+
+
+def _copy_lora_to_models(lora_path: Path, output_name: str, progress=None) -> str:
+    """Copy a trained LoRA to the models/loras/custom/ directory."""
+    output_dir = LORAS_DIR / "custom"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    output_path = output_dir / f"{output_name}.safetensors"
+    if output_path.exists():
+        return f"❌ LoRA '{output_name}.safetensors' already exists in models/loras/custom/"
+    
+    if progress:
+        progress(0.5, desc="Copying LoRA file...")
+    
+    shutil.copy2(lora_path, output_path)
+    
+    if progress:
+        progress(1.0, desc="Done!")
+    
+    return f"✅ Saved LoRA to models/loras/custom/{output_name}.safetensors"
+
+
+def _save_lora_as_merged_model(
+    lora_path: Path,
+    output_name: str,
+    lora_scale: float,
+    save_mlx: bool,
+    save_pytorch: bool,
+    save_comfyui: bool,
+    progress=None,
+) -> str:
+    """
+    Save a LoRA baked into a base model in various formats.
+    
+    This uses the existing save_fused_model infrastructure from app.py.
+    """
+    # Import the save functions from app.py
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    
+    try:
+        from app import save_fused_model, MLX_MODEL_PATH, PYTORCH_MODEL_PATH
+    except ImportError as e:
+        return f"❌ Could not import save functions: {e}"
+    
+    # Create a lora_config for the save_fused_model function
+    # The path should be relative to LORAS_DIR for the function
+    # But our trained LoRA is in OUTPUTS_DIR, so we need to handle this
+    
+    # First, temporarily copy the LoRA to a location the function can find
+    temp_lora_name = f"_temp_export_{output_name}.safetensors"
+    temp_lora_path = LORAS_DIR / temp_lora_name
+    
+    try:
+        if progress:
+            progress(0.1, desc="Preparing LoRA for export...")
+        
+        # Copy to temp location
+        shutil.copy2(lora_path, temp_lora_path)
+        
+        # Create the lora config
+        lora_configs = [{
+            'name': temp_lora_name,
+            'scale': lora_scale,
+        }]
+        
+        # Determine backend and source model
+        backend = "MLX (Apple Silicon)"  # Default to MLX
+        source_model = "Z-Image-Turbo-MLX"
+        
+        # Call the save function
+        result = save_fused_model(
+            model_name=output_name,
+            backend=backend,
+            source_model=source_model,
+            lora_configs=lora_configs,
+            save_mlx=save_mlx,
+            save_pytorch=save_pytorch,
+            save_comfyui=save_comfyui,
+            progress=progress,
+        )
+        
+        return result
+    
+    finally:
+        # Clean up temp file
+        if temp_lora_path.exists():
+            temp_lora_path.unlink()
 
 
 def get_training_progress() -> Tuple[str, float, str]:
@@ -785,12 +997,26 @@ def create_training_tab():
                         value=True,
                         info="Disable for asymmetric subjects",
                     )
+                    use_bucketing = gr.Checkbox(
+                        label="Aspect Ratio Bucketing",
+                        value=True,
+                        info="Train on varied aspect ratios (landscape/portrait/square) without cropping",
+                    )
                     
                     gr.Markdown("**Training Adapter**")
+                    available_adapters = get_available_adapters()
                     use_adapter = gr.Checkbox(
                         label="Use De-distillation Adapter",
-                        value=True,
+                        value=len(available_adapters) > 0,
                         info="Preserves turbo capabilities during training",
+                        interactive=len(available_adapters) > 0,
+                    )
+                    adapter_dropdown = gr.Dropdown(
+                        choices=available_adapters,
+                        value=available_adapters[0] if available_adapters else None,
+                        label="Select Adapter",
+                        info="Choose which training adapter to use",
+                        visible=len(available_adapters) > 0,
                     )
                     adapter_weight = gr.Slider(
                         minimum=0.0,
@@ -798,8 +1024,10 @@ def create_training_tab():
                         value=1.0,
                         step=0.1,
                         label="Adapter Weight",
-                        visible=True,
+                        visible=len(available_adapters) > 0,
                     )
+                    if not available_adapters:
+                        gr.Markdown("⚠️ No adapters found. Download from [ostris/zimage_turbo_training_adapter](https://huggingface.co/ostris/zimage_turbo_training_adapter)")
             
             with gr.Accordion("🔮 Validation Prompts", open=False):
                 validation_prompts = gr.Textbox(
@@ -832,6 +1060,71 @@ def create_training_tab():
         
         with gr.Accordion("ℹ️ Training Adapter Info", open=False):
             adapter_info = gr.Markdown(get_training_adapter_info())
+        
+        with gr.Accordion("💾 Export Trained LoRA", open=False):
+            gr.Markdown(
+                """
+                Export your trained LoRA as a standalone file or bake it into a new model.
+                
+                **Options:**
+                - **LoRA Only**: Copy the LoRA to `models/loras/custom/` for use in the Generate tab
+                - **Merged Model**: Bake the LoRA into the base model and save as MLX/PyTorch/ComfyUI format
+                """
+            )
+            
+            with gr.Row():
+                with gr.Column(scale=2):
+                    trained_lora_dropdown = gr.Dropdown(
+                        choices=get_trained_loras(),
+                        label="Select Trained LoRA",
+                        info="Choose a completed training run from outputs/training/",
+                    )
+                    refresh_trained_loras_btn = gr.Button("🔄 Refresh", size="sm")
+                
+                with gr.Column(scale=2):
+                    export_output_name = gr.Textbox(
+                        label="Output Name",
+                        placeholder="e.g., my_custom_model",
+                        info="Name for the exported LoRA or model (alphanumeric, hyphens, underscores)",
+                    )
+                    export_lora_scale = gr.Slider(
+                        minimum=0.1,
+                        maximum=2.0,
+                        value=1.0,
+                        step=0.1,
+                        label="LoRA Strength (for merged models)",
+                        info="Strength to apply when baking LoRA into model",
+                    )
+            
+            gr.Markdown("**Output Formats**")
+            with gr.Row():
+                export_lora_only = gr.Checkbox(
+                    label="📁 LoRA Only",
+                    value=True,
+                    info="Save to models/loras/custom/",
+                )
+                export_mlx = gr.Checkbox(
+                    label="🍎 MLX",
+                    value=False,
+                    info="Save to models/mlx/",
+                )
+                export_pytorch = gr.Checkbox(
+                    label="🔥 PyTorch",
+                    value=False,
+                    info="Save to models/pytorch/",
+                )
+                export_comfyui = gr.Checkbox(
+                    label="🎨 ComfyUI",
+                    value=False,
+                    info="Save to models/comfyui/",
+                )
+            
+            export_btn = gr.Button("💾 Export", variant="primary")
+            export_status = gr.Textbox(
+                label="Export Status",
+                interactive=False,
+                lines=3,
+            )
         
         # Event handlers
         create_dataset_btn.click(
@@ -880,7 +1173,7 @@ def create_training_tab():
             outputs=[
                 max_train_steps, learning_rate, batch_size, grad_accum,
                 lora_rank, lora_alpha, lr_scheduler, save_every, validate_every,
-                flip_horizontal, train_resolution, use_adapter,
+                flip_horizontal, train_resolution, use_bucketing, use_adapter,
             ],
         )
         
@@ -891,9 +1184,9 @@ def create_training_tab():
         )
         
         use_adapter.change(
-            fn=lambda x: gr.update(visible=x),
+            fn=lambda x: (gr.update(visible=x), gr.update(visible=x)),
             inputs=[use_adapter],
-            outputs=[adapter_weight],
+            outputs=[adapter_dropdown, adapter_weight],
         )
         
         start_training_btn.click(
@@ -902,7 +1195,8 @@ def create_training_tab():
                 dataset_dropdown, output_name, model_path_input,
                 max_train_steps, learning_rate, batch_size, grad_accum,
                 lora_rank, lora_alpha, lr_scheduler, save_every, validate_every,
-                flip_horizontal, train_resolution, use_adapter, adapter_weight,
+                flip_horizontal, train_resolution, use_bucketing,
+                use_adapter, adapter_dropdown, adapter_weight,
                 validation_prompts,
             ],
             outputs=[training_status],
@@ -920,6 +1214,26 @@ def create_training_tab():
         refresh_progress_btn.click(
             fn=refresh_progress,
             outputs=[training_progress_text],
+        )
+        
+        # Export section event handlers
+        refresh_trained_loras_btn.click(
+            fn=lambda: gr.update(choices=get_trained_loras()),
+            outputs=[trained_lora_dropdown],
+        )
+        
+        export_btn.click(
+            fn=save_trained_lora_as_model,
+            inputs=[
+                trained_lora_dropdown,
+                export_output_name,
+                export_lora_scale,
+                export_lora_only,
+                export_mlx,
+                export_pytorch,
+                export_comfyui,
+            ],
+            outputs=[export_status],
         )
         
         # Return components for potential external access
