@@ -660,6 +660,7 @@ class TrainingDataset(Dataset):
             "caption": entry.caption,
             "image_path": str(entry.image_path),
             "bucket_size": (target_w, target_h),
+            "index": idx,  # Include index for cache lookup
         }
         
         # Add cached latent if available
@@ -970,6 +971,7 @@ def _collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
         "captions": [b["caption"] for b in batch],
         "image_paths": [b["image_path"] for b in batch],
+        "indices": torch.tensor([b["index"] for b in batch]),  # Include indices for cache lookup
     }
     
     # Include bucket size info

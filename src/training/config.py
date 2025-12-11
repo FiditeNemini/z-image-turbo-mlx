@@ -257,6 +257,9 @@ class TrainingConfig:
     pin_memory: bool = True
     """Pin memory for data loading (faster GPU transfer)."""
     
+    gradient_checkpointing: bool = False
+    """Enable gradient checkpointing to save memory at the cost of slower training."""
+    
     # Sub-configs
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     """LoRA configuration."""

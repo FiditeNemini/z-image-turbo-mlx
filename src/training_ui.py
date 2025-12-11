@@ -557,6 +557,33 @@ def get_trained_loras() -> List[str]:
     return sorted(loras)
 
 
+def get_available_checkpoints() -> List[str]:
+    """Get list of available checkpoints for continue training.
+    
+    Returns checkpoints in format: "run_name (step N)"
+    """
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    checkpoints = []
+    
+    for d in OUTPUTS_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        
+        # Look for checkpoint files with step numbers
+        ckpt_files = list(d.glob("*_step_*.safetensors"))
+        if ckpt_files:
+            # Extract step numbers and get the latest
+            import re
+            for ckpt in sorted(ckpt_files, reverse=True):
+                match = re.search(r"step_(\d+)", ckpt.name)
+                if match:
+                    step = int(match.group(1))
+                    checkpoints.append(f"{d.name} (step {step})")
+                    break  # Only add the latest checkpoint per run
+    
+    return sorted(checkpoints)
+
+
 def get_lora_path_for_export(lora_name: str) -> Optional[Path]:
     """Get the path to a trained LoRA file for export."""
     lora_dir = OUTPUTS_DIR / lora_name
@@ -637,6 +664,7 @@ def estimate_vram_usage(
     batch_size: int,
     resolution: int,
     grad_accum: int,
+    grad_checkpointing: bool,
 ) -> str:
     """Estimate memory usage for training."""
     if not TRAINING_AVAILABLE:
@@ -653,7 +681,7 @@ def estimate_vram_usage(
             lora_rank=rank,
             batch_size=batch_size,
             resolution=resolution,
-            gradient_checkpointing=True,
+            gradient_checkpointing=grad_checkpointing,
         )
         
         total = estimate["total_estimated_gb"]
@@ -765,6 +793,7 @@ def start_training(
     use_adapter: bool,
     adapter_name: str,
     adapter_weight: float,
+    use_grad_checkpointing: bool,
     validation_prompts: str,
 ) -> str:
     """Start the training process."""
@@ -798,6 +827,7 @@ def start_training(
         learning_rate=learning_rate,
         batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,
+        gradient_checkpointing=use_grad_checkpointing,
         lr_scheduler=lr_scheduler,
         
         # LoRA
@@ -886,6 +916,117 @@ def stop_training() -> str:
     _training_progress["message"] = "Stopping training..."
     
     return "**⏹️ Stopping...** Training will stop after current step."
+
+
+def continue_training(
+    checkpoint_selection: str,
+    additional_steps: int,
+    new_resolution: int,
+    dataset_name: str,
+    model_path: str,
+) -> str:
+    """Continue training from a checkpoint with optional resolution change.
+    
+    This enables progressive training (e.g., 512px -> 1024px).
+    """
+    global _training_thread, _training_stop_flag, _training_progress
+    import re
+    
+    if not TRAINING_AVAILABLE:
+        return "**❌ Error:** Training not available (requires MPS or CUDA)"
+    
+    if _training_thread and _training_thread.is_alive():
+        return "**❌ Error:** Training already in progress. Stop current training first."
+    
+    if not checkpoint_selection:
+        return "**❌ Error:** Please select a checkpoint"
+    
+    if not dataset_name:
+        return "**❌ Error:** Please select a dataset"
+    
+    # Parse checkpoint selection: "run_name (step N)"
+    match = re.match(r"(.+) \(step (\d+)\)", checkpoint_selection)
+    if not match:
+        return f"**❌ Error:** Invalid checkpoint format: {checkpoint_selection}"
+    
+    run_name = match.group(1)
+    current_step = int(match.group(2))
+    checkpoint_dir = OUTPUTS_DIR / run_name
+    
+    if not checkpoint_dir.exists():
+        return f"**❌ Error:** Checkpoint directory not found: {checkpoint_dir}"
+    
+    # Find the checkpoint file
+    ckpt_file = checkpoint_dir / f"{run_name}_step_{current_step}.safetensors"
+    if not ckpt_file.exists():
+        return f"**❌ Error:** Checkpoint file not found: {ckpt_file}"
+    
+    total_steps = current_step + additional_steps
+    
+    # Load original config and update
+    config_path = checkpoint_dir / "training_config.json"
+    if config_path.exists():
+        base_config = TrainingConfig.load(str(config_path))
+        # Update with new parameters
+        base_config.max_train_steps = total_steps
+        base_config.resume_from_checkpoint = str(checkpoint_dir)
+        base_config.dataset.resolution = new_resolution
+        base_config.dataset.dataset_path = str(DATASETS_DIR / dataset_name)
+    else:
+        return "**❌ Error:** Could not find training config for checkpoint"
+    
+    # Reset state
+    _training_stop_flag = False
+    _training_progress = {
+        "status": "starting",
+        "step": current_step,
+        "total_steps": total_steps,
+        "loss": 0.0,
+        "lr": base_config.learning_rate,
+        "eta": "calculating...",
+        "message": f"Resuming from step {current_step}...",
+    }
+    
+    def progress_callback(step, loss, lr, eta):
+        global _training_progress
+        _training_progress.update({
+            "status": "training",
+            "step": step,
+            "loss": loss,
+            "lr": lr,
+            "eta": eta,
+            "message": f"Step {step}/{total_steps} - Loss: {loss:.4f}",
+        })
+    
+    def training_thread():
+        global _training_progress, _training_stop_flag
+        try:
+            trainer = LoRATrainer(base_config)
+            
+            _training_progress["message"] = "Loading models and checkpoint..."
+            trainer.setup(progress_callback=lambda msg, prog: _training_progress.update({"message": msg}))
+            
+            _training_progress["message"] = f"Continuing training from step {current_step}..."
+            trainer.train(progress_callback=progress_callback)
+            
+            _training_progress.update({
+                "status": "complete",
+                "message": f"✅ Training complete! LoRA saved to {base_config.output_dir}",
+            })
+        
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            _training_progress.update({
+                "status": "error",
+                "message": f"❌ Training error: {e}",
+            })
+    
+    # Start training thread
+    _training_thread = threading.Thread(target=training_thread, daemon=True)
+    _training_thread.start()
+    
+    return f"**✅ Continuing from step {current_step}!** Training {additional_steps} more steps at {new_resolution}px."
 
 
 def save_trained_lora_as_model(
@@ -1224,6 +1365,7 @@ def create_training_tab():
                 train_resolution = gr.Dropdown(choices=[512, 768, 1024], value=1024, label="Resolution")
                 flip_horizontal = gr.Checkbox(label="Horizontal Flip", value=True)
                 use_bucketing = gr.Checkbox(label="Aspect Bucketing", value=True)
+                grad_checkpointing = gr.Checkbox(label="Gradient Checkpointing", value=False)
             
             available_adapters = get_available_adapters()
             with gr.Row():
@@ -1265,6 +1407,32 @@ def create_training_tab():
         
         with gr.Accordion("ℹ️ Training Adapter Info", open=False):
             adapter_info = gr.Markdown(get_training_adapter_info())
+        
+        with gr.Accordion("🔄 Continue Training", open=False):
+            gr.Markdown("*Resume from a checkpoint with optional resolution change (e.g., 512px → 1024px)*")
+            with gr.Row():
+                continue_checkpoint = gr.Dropdown(
+                    choices=get_available_checkpoints(),
+                    label="Checkpoint",
+                    scale=2,
+                )
+                refresh_checkpoints_btn = gr.Button("🔄", size="sm", scale=0, min_width=40)
+            with gr.Row():
+                continue_additional_steps = gr.Number(
+                    value=200,
+                    label="Additional Steps",
+                    precision=0,
+                    minimum=10,
+                    maximum=10000,
+                    scale=1,
+                )
+                continue_resolution = gr.Dropdown(
+                    choices=[512, 768, 1024],
+                    value=1024,
+                    label="New Resolution",
+                    scale=1,
+                )
+            continue_btn = gr.Button("▶️ Continue Training", variant="primary")
         
         with gr.Accordion("💾 Export LoRA", open=False):
             with gr.Row():
@@ -1385,7 +1553,7 @@ def create_training_tab():
         
         estimate_vram_btn.click(
             fn=estimate_vram_usage,
-            inputs=[lora_rank, batch_size, train_resolution, grad_accum],
+            inputs=[lora_rank, batch_size, train_resolution, grad_accum, grad_checkpointing],
             outputs=[vram_estimate],
         )
         
@@ -1403,6 +1571,7 @@ def create_training_tab():
                 lora_rank, lora_alpha, lr_scheduler, save_every, validate_every,
                 flip_horizontal, train_resolution, use_bucketing,
                 use_adapter, adapter_dropdown, adapter_weight,
+                grad_checkpointing,
                 validation_prompts,
             ],
             outputs=[training_status],
@@ -1440,6 +1609,24 @@ def create_training_tab():
                 export_comfyui,
             ],
             outputs=[export_status],
+        )
+        
+        # Continue Training event handlers
+        refresh_checkpoints_btn.click(
+            fn=lambda: gr.update(choices=get_available_checkpoints()),
+            outputs=[continue_checkpoint],
+        )
+        
+        continue_btn.click(
+            fn=continue_training,
+            inputs=[
+                continue_checkpoint,
+                continue_additional_steps,
+                continue_resolution,
+                dataset_dropdown,
+                model_path_input,
+            ],
+            outputs=[training_status],
         )
         
         # Return components for potential external access

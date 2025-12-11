@@ -91,14 +91,11 @@ except ImportError:
     UPSCALER_AVAILABLE = False
     logger.warning("Upscaler module not available. Install torch to enable upscaling.")
 
-# Training UI imports
-try:
-    from training_ui import create_training_tab, TRAINING_AVAILABLE
-    logger.info(f"Training module available: {TRAINING_AVAILABLE}")
-except ImportError:
-    TRAINING_AVAILABLE = False
-    create_training_tab = None
-    logger.warning("Training UI module not available.")
+# T# Training UI moved to separate app (train_app.py) to prevent MPS/PyTorch crashes
+# when mixed with other components.
+TRAINING_AVAILABLE = False
+create_training_tab = None
+logger.warning("Training UI module not available.")
 
 # Global model cache
 _mlx_models = None
@@ -4081,36 +4078,21 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
             refresh_merge_models_btn = gr.Button("🔄 Refresh Model List", size="sm")
         
         # Training Tab (after Merge, before Model Settings)
-        if create_training_tab is not None:
-            training_components = create_training_tab()
-        else:
-            with gr.Tab("🎓 Training"):
-                gr.Markdown(
-                    """
-                    ## Training Not Available
-                    
-                    Training requires PyTorch with MPS (Apple Silicon) or CUDA (NVIDIA) support.
-                    
-                    **On macOS (Apple Silicon):**
-                    PyTorch MPS should be available by default. If not, reinstall PyTorch:
-                    ```
-                    pip install torch torchvision
-                    ```
-                    
-                    **On Linux/Windows (NVIDIA GPU):**
-                    Install PyTorch with CUDA:
-                    ```
-                    pip install torch --index-url https://download.pytorch.org/whl/cu121
-                    ```
-                    
-                    **Additional dependencies:**
-                    ```
-                    pip install diffusers transformers
-                    ```
-                    
-                    Then restart the application.
-                    """
-                )
+        # Training Tab - Moved to separate app
+        with gr.Tab("🎓 Training"):
+            gr.Markdown(
+                """
+                ### Training Moved to Separate App
+                
+                To improve stability and prevent crashes on macOS/MPS, training has been moved to a dedicated application.
+                
+                Please run:
+                ```bash
+                python train_app.py
+                ```
+                Then open **[http://localhost:7861](http://localhost:7861)** in your browser.
+                """
+            )
         
         with gr.Tab("⚙️ Model Settings"):
             gr.Markdown(

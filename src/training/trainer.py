@@ -204,8 +204,13 @@ class LoRATrainer:
         
         # Load dataset
         if progress_callback:
-            progress_callback("Loading dataset...", 0.9)
+            progress_callback("Loading dataset...", 0.85)
         self._setup_dataset()
+        
+        # Cache latents and text embeddings (CRITICAL for speed)
+        if progress_callback:
+            progress_callback("Caching latents and text embeddings...", 0.9)
+        self._cache_encodings()
         
         # Resume from checkpoint if specified
         if self.config.resume_from_checkpoint:
@@ -222,6 +227,7 @@ class LoRATrainer:
         print(f"  - Dataset size: {len(self.dataloader.dataset)} images")
         print(f"  - Effective batch size: {self.config.effective_batch_size}")
         print(f"  - Training steps: {self.config.max_train_steps}")
+        print(f"  - Latent/Text Caching: Enabled (all data pre-encoded)")
     
     def _load_transformer(self):
         """Load the Z-Image-Turbo transformer model."""
@@ -261,6 +267,13 @@ class LoRATrainer:
         
         self.model = self.model.to(self.device)
         self.model.requires_grad_(False)  # Freeze base model
+        
+        if hasattr(self.config, "gradient_checkpointing") and self.config.gradient_checkpointing:
+            self.model.enable_gradient_checkpointing()
+            print("✓ Gradient checkpointing enabled for memory efficiency")
+        
+        # Note: torch.compile() is NOT compatible with this model on MPS
+        # It breaks adapter application and causes dynamo autocast errors
     
     def _load_text_encoder(self):
         """Load the text encoder (Qwen2.5-3B)."""
@@ -344,7 +357,7 @@ class LoRATrainer:
             alpha=self.config.lora.alpha,
             dropout=self.config.lora.dropout,
             use_dora=self.config.lora.use_dora,
-        )
+        ).to(self.device)
         
         print(f"LoRA initialized with rank {self.config.lora.rank}, "
               f"alpha {self.config.lora.alpha}")
@@ -459,13 +472,20 @@ class LoRATrainer:
             bucket_manager=bucket_manager,
         )
         
+        # Disable pin_memory on MPS to avoid warnings
+        pin_memory = self.config.pin_memory
+        num_workers = self.config.num_workers
+        if self.device.type == "mps":
+            pin_memory = False
+            num_workers = 0  # Avoid fork overhead on MPS
+            
         # Create dataloader (bucketed or standard)
         if dataset_config.use_bucketing and bucket_manager is not None:
             self.dataloader, self.bucket_sampler = create_bucketed_dataloader(
                 dataset,
                 batch_size=self.config.batch_size,
-                num_workers=self.config.num_workers,
-                pin_memory=self.config.pin_memory,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
             )
             # Print bucket distribution
             stats = self.bucket_sampler.get_bucket_stats()
@@ -476,8 +496,8 @@ class LoRATrainer:
             self.dataloader = create_dataloader(
                 dataset,
                 batch_size=self.config.batch_size,
-                num_workers=self.config.num_workers,
-                pin_memory=self.config.pin_memory,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
             )
             self.bucket_sampler = None
     
@@ -552,6 +572,85 @@ class LoRATrainer:
         
         return text_embeds
     
+    def _cache_encodings(self):
+        """
+        Pre-encode all images and captions ONCE before training.
+        
+        This is CRITICAL for training speed. Without caching:
+        - VAE encoding: ~0.5s per image
+        - Text encoding: ~1.5s per caption (Qwen2.5-3B is large!)
+        - Per-step overhead: ~2s
+        
+        With caching: per-step overhead drops to ~0.01s
+        """
+        import gc
+        
+        dataset = self.dataloader.dataset
+        num_samples = len(dataset)
+        
+        print(f"\n📦 Caching {num_samples} samples (one-time cost)...")
+        
+        self.latent_cache = {}
+        self.text_embed_cache = {}
+        
+        # Process in batches to avoid memory issues
+        cache_batch_size = 4  # Small batch to avoid OOM during caching
+        
+        with torch.no_grad():
+            for start_idx in tqdm(range(0, num_samples, cache_batch_size), desc="Caching"):
+                end_idx = min(start_idx + cache_batch_size, num_samples)
+                
+                # Collect batch
+                batch_pixels = []
+                batch_captions = []
+                batch_indices = list(range(start_idx, end_idx))
+                
+                for idx in batch_indices:
+                    sample = dataset[idx]
+                    batch_pixels.append(sample["pixel_values"])
+                    batch_captions.append(sample["caption"])
+                
+                # Stack and encode
+                pixel_values = torch.stack(batch_pixels).to(self.device, dtype=self._get_dtype())
+                latents = self._encode_images(pixel_values)
+                text_embeds = self._encode_text(batch_captions)
+                
+                # Store in cache
+                for i, idx in enumerate(batch_indices):
+                    self.latent_cache[idx] = latents[i].cpu()
+                    self.text_embed_cache[idx] = text_embeds[i].cpu()
+                
+                # Clear VRAM periodically
+                if start_idx % 32 == 0:
+                    if self.device.type == "mps":
+                        torch.mps.empty_cache()
+                    elif self.device.type == "cuda":
+                        torch.cuda.empty_cache()
+        
+        print(f"✓ Cached {num_samples} latents and text embeddings")
+        
+        # Optionally unload VAE and text encoder to free memory
+        # (they're not needed during training, only for caching)
+        if hasattr(self, 'vae'):
+            self.vae.cpu()
+            del self.vae
+            self.vae = None
+        if hasattr(self, 'text_encoder'):
+            self.text_encoder.cpu()
+            del self.text_encoder
+            self.text_encoder = None
+        if hasattr(self, 'tokenizer'):
+            del self.tokenizer
+            self.tokenizer = None
+        
+        gc.collect()
+        if self.device.type == "mps":
+            torch.mps.empty_cache()
+        elif self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        
+        print("✓ Unloaded VAE and Text Encoder (no longer needed)")
+    
     def _compute_loss(
         self,
         latents: torch.Tensor,
@@ -592,17 +691,29 @@ class LoRATrainer:
         x_list = [noisy_latents[i] for i in range(batch_size)]
         cap_feats_list = [text_embeds[i] for i in range(batch_size)]
         
-        # Forward pass
-        # ZImage forward returns: (output_list, {}) not an object with .sample
-        output, _ = self.model(
+        # Ensure inputs match model dtype for MPS
+        # MPS is strict about mixed precision in matrix multiplication
+        target_dtype = next(self.model.parameters()).dtype
+        if x_list[0].dtype != target_dtype:
+            # print(f"  Casting latents from {x_list[0].dtype} to {target_dtype}")
+            x_list = [l.to(target_dtype) for l in x_list]
+        if cap_feats_list[0].dtype != target_dtype:
+            # print(f"  Casting text_embeds from {cap_feats_list[0].dtype} to {target_dtype}")
+            cap_feats_list = [t.to(target_dtype) for t in cap_feats_list]
+
+        # Call forward
+        # Z-Image-Turbo (Diffusers) signature:
+        # forward(x: List[Tensor], t, cap_feats: List[Tensor], ...)
+        model_pred, _ = self.model(
             x=x_list,
-            t=t_normalized,
+            t=t_normalized, 
             cap_feats=cap_feats_list,
+            patch_size=2,
+            f_patch_size=1
         )
-        
         # Reconstruct batch from list output and negate (as done in inference)
         # output is List[Tensor], stack back to batch
-        model_pred = torch.stack(output, dim=0)
+        model_pred = torch.stack(model_pred, dim=0)
         model_pred = -model_pred  # Negate like inference does
         
         # Target is the velocity from latents to noise
@@ -659,11 +770,24 @@ class LoRATrainer:
                 # Move batch to device
                 pixel_values = batch["pixel_values"].to(self.device, dtype=self._get_dtype())
                 captions = batch["captions"]
+                indices = batch.get("indices", None)
                 
-                # Encode images and text
-                with torch.no_grad():
-                    latents = self._encode_images(pixel_values)
-                    text_embeds = self._encode_text(captions)
+                # Use cached latents/embeddings if available (CRITICAL for speed)
+                if hasattr(self, 'latent_cache') and self.latent_cache and indices is not None:
+                    # Fetch from cache
+                    latents = torch.stack([self.latent_cache[i.item()] for i in indices]).to(self.device, dtype=self._get_dtype())
+                    text_embeds = torch.stack([self.text_embed_cache[i.item()] for i in indices]).to(self.device, dtype=self._get_dtype())
+                elif "latent" in batch and "text_embed" in batch:
+                    # Dataset returned cached values directly
+                    latents = batch["latent"].to(self.device, dtype=self._get_dtype())
+                    text_embeds = batch["text_embed"].to(self.device, dtype=self._get_dtype())
+                else:
+                    # Fallback: encode on-the-fly (slow!)
+                    if self.global_step == 0:
+                        print("⚠️ WARNING: Caching not working! Falling back to slow encoding.")
+                    with torch.no_grad():
+                        latents = self._encode_images(pixel_values)
+                        text_embeds = self._encode_text(captions)
                 
                 # Sample timesteps
                 batch_size = latents.shape[0]
@@ -684,7 +808,6 @@ class LoRATrainer:
                     self.scaler.scale(loss).backward()
                 elif self.device.type == "mps" and self.config.mixed_precision != "no":
                     # MPS with manual dtype (no GradScaler support)
-                    # Compute loss with model in correct dtype
                     loss = self._compute_loss(latents, text_embeds, timesteps)
                     loss = loss / self.config.gradient_accumulation_steps
                     loss.backward()
