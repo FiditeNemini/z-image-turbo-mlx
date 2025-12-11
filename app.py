@@ -7,6 +7,16 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Disable Gradio telemetry/analytics
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "false"
+# Force MPS to use float32 fallback for unsupported ops
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+# Use spawn instead of fork for multiprocessing to avoid MPS issues
+import multiprocessing
+if multiprocessing.get_start_method(allow_none=True) != "spawn":
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass  # Already set
 
 import logging
 from datetime import datetime
@@ -32,6 +42,24 @@ logger.info(f"Z-Image-Turbo starting - log file: {log_filename}")
 
 import gradio as gr
 import torch
+# Force float32 as default to prevent MPS dtype mismatch crashes
+# MPS has issues when bfloat16/float16 mix with float32 in some operations
+torch.set_default_dtype(torch.float32)
+
+# Monkey-patch torch.amp.autocast to fix diffusers bug
+# diffusers/models/transformers/transformer_z_image.py uses hardcoded 'cuda' autocast
+# which crashes on MPS with "Destination NDArray and Accumulator NDArray cannot have 
+# different datatype" error. This patch makes 'cuda' autocast a no-op on non-CUDA devices.
+_original_autocast = torch.amp.autocast
+class _SafeAutocast(_original_autocast):
+    def __init__(self, device_type, *args, **kwargs):
+        # If trying to use cuda autocast on non-cuda device, use cpu instead (effectively no-op)
+        if device_type == "cuda" and not torch.cuda.is_available():
+            device_type = "cpu"
+            kwargs['enabled'] = False
+        super().__init__(device_type, *args, **kwargs)
+torch.amp.autocast = _SafeAutocast
+
 import numpy as np
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo

@@ -63,12 +63,33 @@ _training_progress: Dict[str, Any] = {
 
 
 def get_available_datasets() -> List[str]:
-    """Get list of available datasets."""
+    """Get list of available datasets.
+    
+    Supports both:
+    - Structured datasets: datasets/<name>/images/ (from Training tab)
+    - Flat datasets: datasets/<name>/ with images directly (from Generate tab)
+    """
     DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+    
+    image_extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
     datasets = []
+    
     for d in DATASETS_DIR.iterdir():
-        if d.is_dir() and (d / "images").exists():
+        if not d.is_dir():
+            continue
+        
+        # Check for structured dataset (has images/ subdirectory)
+        if (d / "images").exists():
             datasets.append(d.name)
+        else:
+            # Check for flat dataset (has images directly in folder)
+            has_images = any(
+                f.suffix.lower() in image_extensions 
+                for f in d.iterdir() if f.is_file()
+            )
+            if has_images:
+                datasets.append(d.name)
+    
     return sorted(datasets)
 
 
@@ -81,7 +102,11 @@ def get_dataset_info(dataset_name: str) -> str:
     if not dataset_path.exists():
         return f"Dataset not found: {dataset_name}"
     
+    # Determine images directory (supports flat and structured layouts)
     images_dir = dataset_path / "images"
+    if not images_dir.exists():
+        images_dir = dataset_path  # Flat layout
+    is_flat = images_dir == dataset_path
     
     # Load metadata
     metadata_path = dataset_path / "dataset.json"
@@ -100,6 +125,7 @@ def get_dataset_info(dataset_name: str) -> str:
     
     info_lines = [
         f"📁 **{dataset_name}**",
+        f"*{'Saved from Generate tab' if is_flat else 'Structured dataset'}*",
         "",
         f"📷 Images: {num_images}",
         f"📝 Captions: {num_captions} ({num_captions/num_images*100:.0f}% coverage)" if num_images > 0 else "📝 Captions: 0",
@@ -118,6 +144,122 @@ def get_dataset_info(dataset_name: str) -> str:
     return "\n".join(info_lines)
 
 
+def load_dataset_metadata(dataset_name: str) -> Tuple[str, str, str, int]:
+    """Load metadata for a dataset (returns trigger_word, description, default_caption, resolution)."""
+    if not dataset_name:
+        return "", "", "", 1024
+    
+    dataset_path = DATASETS_DIR / dataset_name
+    metadata_path = dataset_path / "dataset.json"
+    
+    if metadata_path.exists():
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        return (
+            metadata.get("trigger_word", ""),
+            metadata.get("description", ""),
+            metadata.get("default_caption", ""),
+            metadata.get("resolution", 1024),
+        )
+    
+    return "", "", "", 1024
+
+
+def save_dataset_metadata(
+    dataset_name: str,
+    trigger_word: str,
+    description: str,
+    default_caption: str,
+    resolution: int,
+) -> str:
+    """Save or update metadata for an existing dataset."""
+    if not dataset_name:
+        return "❌ Select a dataset first"
+    
+    dataset_path = DATASETS_DIR / dataset_name
+    if not dataset_path.exists():
+        return f"❌ Dataset not found: {dataset_name}"
+    
+    # Determine images directory to count images
+    images_dir = dataset_path / "images"
+    if not images_dir.exists():
+        images_dir = dataset_path  # Flat layout
+    
+    # Count images
+    image_extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    image_count = sum(1 for f in images_dir.iterdir() if f.is_file() and f.suffix.lower() in image_extensions)
+    
+    # Load existing metadata or create new
+    metadata_path = dataset_path / "dataset.json"
+    if metadata_path.exists():
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+    else:
+        metadata = {
+            "name": dataset_name,
+            "created_at": datetime.now().isoformat(),
+        }
+    
+    # Update fields
+    metadata.update({
+        "trigger_word": trigger_word,
+        "description": description,
+        "default_caption": default_caption,
+        "resolution": resolution,
+        "num_images": image_count,
+    })
+    
+    # Save
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    return f"✅ Metadata saved for {dataset_name}"
+
+
+def create_dataset_simple(name: str) -> Tuple[str, List[str]]:
+    """Create a new empty dataset (just the name).
+    
+    Returns: (status message, updated dataset choices list)
+    """
+    if not name:
+        return "❌ Please enter a dataset name", get_available_datasets()
+    
+    # Sanitize name
+    name = "".join(c for c in name if c.isalnum() or c in "._- ")
+    name = name.strip()
+    
+    if not name:
+        return "❌ Invalid dataset name", get_available_datasets()
+    
+    dataset_path = DATASETS_DIR / name
+    if dataset_path.exists():
+        return f"❌ Dataset already exists: {name}", get_available_datasets()
+    
+    try:
+        # Create directories
+        images_dir = dataset_path / "images"
+        images_dir.mkdir(parents=True)
+        
+        # Create minimal metadata
+        metadata = {
+            "name": name,
+            "description": "",
+            "trigger_word": "",
+            "default_caption": "",
+            "resolution": 1024,
+            "created_at": datetime.now().isoformat(),
+            "num_images": 0,
+        }
+        
+        with open(dataset_path / "dataset.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+        
+        return f"✅ Created dataset: {name}", get_available_datasets()
+    
+    except Exception as e:
+        return f"❌ Error creating dataset: {e}", get_available_datasets()
+
+
 def create_dataset(
     name: str,
     description: str,
@@ -125,7 +267,7 @@ def create_dataset(
     default_caption: str,
     resolution: int,
 ) -> str:
-    """Create a new dataset."""
+    """Create a new dataset (legacy function for compatibility)."""
     if not name:
         return "❌ Please enter a dataset name"
     
@@ -167,43 +309,68 @@ def create_dataset(
 
 def add_images_to_dataset(
     dataset_name: str,
-    image_files: List[str],
+    uploaded_files: List[str],
     auto_caption: bool,
 ) -> str:
-    """Add images to an existing dataset."""
+    """Add images and caption files to an existing dataset."""
     if not dataset_name:
         return "❌ Select a dataset first"
     
-    if not image_files:
-        return "❌ No images selected"
+    if not uploaded_files:
+        return "❌ No files selected"
     
     dataset_path = DATASETS_DIR / dataset_name
     if not dataset_path.exists():
         return f"❌ Dataset not found: {dataset_name}"
     
+    # Determine images directory (supports flat and structured layouts)
     images_dir = dataset_path / "images"
-    added = 0
+    if not images_dir.exists():
+        images_dir = dataset_path  # Flat layout
+    added_images = 0
+    added_captions = 0
     errors = []
     
-    for src_path in image_files:
+    # Separate images and caption files
+    image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+    image_files = []
+    caption_files = {}
+    
+    for src_path in uploaded_files:
         src = Path(src_path)
         if not src.exists():
             errors.append(f"Not found: {src.name}")
             continue
         
-        # Copy image
+        if src.suffix.lower() in image_extensions:
+            image_files.append(src)
+        elif src.suffix.lower() == ".txt":
+            # Store by stem for matching with images
+            caption_files[src.stem] = src
+    
+    # Process images and their paired captions
+    for src in image_files:
         dst = images_dir / src.name
         counter = 1
+        orig_stem = src.stem
+        new_stem = orig_stem
         while dst.exists():
-            dst = images_dir / f"{src.stem}_{counter}{src.suffix}"
+            new_stem = f"{orig_stem}_{counter}"
+            dst = images_dir / f"{new_stem}{src.suffix}"
             counter += 1
         
         try:
             shutil.copy2(src, dst)
-            added += 1
+            added_images += 1
             
-            # Create empty caption file if auto_caption disabled
-            if not auto_caption:
+            # Check if there's a matching caption file uploaded
+            if orig_stem in caption_files:
+                caption_src = caption_files[orig_stem]
+                caption_dst = dst.with_suffix(".txt")
+                shutil.copy2(caption_src, caption_dst)
+                added_captions += 1
+            elif not auto_caption:
+                # Create empty caption file if requested
                 caption_path = dst.with_suffix(".txt")
                 if not caption_path.exists():
                     caption_path.touch()
@@ -215,11 +382,107 @@ def add_images_to_dataset(
     if metadata_path.exists():
         with open(metadata_path) as f:
             metadata = json.load(f)
-        metadata["num_images"] = len(list(images_dir.glob("*.png")) + list(images_dir.glob("*.jpg")))
+        metadata["num_images"] = len(list(images_dir.glob("*.png")) + list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.jpeg")) + list(images_dir.glob("*.webp")))
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
     
-    result = f"✅ Added {added} images to {dataset_name}"
+    result = f"✅ Added {added_images} images"
+    if added_captions > 0:
+        result += f" and {added_captions} captions"
+    result += f" to {dataset_name}"
+    
+    if errors:
+        result += f"\n\n⚠️ Errors:\n" + "\n".join(errors[:5])
+        if len(errors) > 5:
+            result += f"\n... and {len(errors) - 5} more"
+    
+    return result
+
+
+def import_folder_to_dataset(
+    dataset_name: str,
+    folder_path: str,
+) -> str:
+    """Import a folder of image/caption pairs to a dataset."""
+    if not dataset_name:
+        return "❌ Select a dataset first"
+    
+    if not folder_path or not folder_path.strip():
+        return "❌ Please enter a folder path"
+    
+    folder = Path(folder_path.strip()).expanduser()
+    if not folder.exists():
+        return f"❌ Folder not found: {folder}"
+    if not folder.is_dir():
+        return f"❌ Not a folder: {folder}"
+    
+    dataset_path = DATASETS_DIR / dataset_name
+    if not dataset_path.exists():
+        return f"❌ Dataset not found: {dataset_name}"
+    
+    # Determine images directory (supports flat and structured layouts)
+    images_dir = dataset_path / "images"
+    if not images_dir.exists():
+        images_dir = dataset_path  # Flat layout
+    
+    image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+    
+    added_images = 0
+    added_captions = 0
+    errors = []
+    
+    # Find all images in the folder
+    for src in folder.iterdir():
+        if not src.is_file():
+            continue
+        if src.suffix.lower() not in image_extensions:
+            continue
+        
+        # Determine destination path
+        dst = images_dir / src.name
+        counter = 1
+        orig_stem = src.stem
+        new_stem = orig_stem
+        while dst.exists():
+            new_stem = f"{orig_stem}_{counter}"
+            dst = images_dir / f"{new_stem}{src.suffix}"
+            counter += 1
+        
+        try:
+            shutil.copy2(src, dst)
+            added_images += 1
+            
+            # Check for accompanying caption file
+            caption_src = src.with_suffix(".txt")
+            if caption_src.exists():
+                caption_dst = dst.with_suffix(".txt")
+                shutil.copy2(caption_src, caption_dst)
+                added_captions += 1
+        except Exception as e:
+            errors.append(f"Error copying {src.name}: {e}")
+    
+    # Update metadata
+    metadata_path = dataset_path / "dataset.json"
+    if metadata_path.exists():
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        metadata["num_images"] = len(
+            list(images_dir.glob("*.png")) + 
+            list(images_dir.glob("*.jpg")) + 
+            list(images_dir.glob("*.jpeg")) + 
+            list(images_dir.glob("*.webp"))
+        )
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+    
+    if added_images == 0:
+        return f"❌ No images found in {folder}"
+    
+    result = f"✅ Imported {added_images} images"
+    if added_captions > 0:
+        result += f" and {added_captions} captions"
+    result += f" from {folder.name}"
+    
     if errors:
         result += f"\n\n⚠️ Errors:\n" + "\n".join(errors[:5])
         if len(errors) > 5:
@@ -508,16 +771,16 @@ def start_training(
     global _training_thread, _training_stop_flag, _training_progress
     
     if not TRAINING_AVAILABLE:
-        return "❌ Training not available (requires MPS or CUDA)"
+        return "**❌ Error:** Training not available (requires MPS or CUDA)"
     
     if _training_thread and _training_thread.is_alive():
-        return "❌ Training already in progress. Stop current training first."
+        return "**❌ Error:** Training already in progress. Stop current training first."
     
     if not dataset_name:
-        return "❌ Please select a dataset"
+        return "**❌ Error:** Please select a dataset"
     
     if not output_name:
-        return "❌ Please enter an output name"
+        return "**❌ Error:** Please enter an output name"
     
     # Parse validation prompts
     prompts = [p.strip() for p in validation_prompts.split("\n") if p.strip()]
@@ -611,7 +874,7 @@ def start_training(
     _training_thread = threading.Thread(target=training_thread, daemon=True)
     _training_thread.start()
     
-    return "✅ Training started! Monitor progress below."
+    return "**✅ Training started!** Monitor progress below."
 
 
 def stop_training() -> str:
@@ -622,7 +885,7 @@ def stop_training() -> str:
     _training_progress["status"] = "stopping"
     _training_progress["message"] = "Stopping training..."
     
-    return "⏹️ Stop signal sent. Training will stop after current step."
+    return "**⏹️ Stopping...** Training will stop after current step."
 
 
 def save_trained_lora_as_model(
@@ -841,307 +1104,240 @@ def create_training_tab():
         )
         
         with gr.Accordion("📁 Dataset Management", open=True):
+            # Row 1: Select existing OR Create new
+            with gr.Row():
+                dataset_dropdown = gr.Dropdown(
+                    choices=get_available_datasets(),
+                    label="Select Dataset",
+                    info="Existing datasets (or create new below)",
+                    scale=2,
+                )
+                refresh_datasets_btn = gr.Button("🔄", size="sm", scale=0, min_width=40)
+                new_dataset_name = gr.Textbox(
+                    label="New Dataset Name",
+                    placeholder="my_character",
+                    scale=2,
+                )
+                create_dataset_btn = gr.Button("📁 Create", variant="secondary", scale=0, min_width=80)
+            create_dataset_status = gr.Textbox(show_label=False, interactive=False, max_lines=1)
+            
+            # Row 2: Dataset Info display
+            dataset_info_display = gr.Markdown("*Select a dataset to view/edit settings*")
+            
+            # Row 3: Metadata fields (all in one row)
+            with gr.Row():
+                meta_trigger_word = gr.Textbox(
+                    label="Trigger Word",
+                    placeholder="ohwx person",
+                    scale=1,
+                )
+                meta_default_caption = gr.Textbox(
+                    label="Default Caption",
+                    placeholder="a photo of ohwx person",
+                    scale=2,
+                )
+                meta_resolution = gr.Dropdown(
+                    choices=[512, 768, 1024],
+                    value=1024,
+                    label="Resolution",
+                    scale=0,
+                    min_width=100,
+                )
+            with gr.Row():
+                meta_description = gr.Textbox(
+                    label="Description (optional)",
+                    placeholder="Dataset description",
+                    scale=3,
+                )
+                save_metadata_btn = gr.Button("💾 Save", variant="primary", scale=0, min_width=80)
+                metadata_status = gr.Textbox(show_label=False, interactive=False, max_lines=1, scale=1)
+            
+            # Row 4: Add images
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("**Create New Dataset**")
-                    new_dataset_name = gr.Textbox(
-                        label="Dataset Name",
-                        placeholder="e.g., my_character",
+                    image_upload = gr.File(
+                        label="Upload Images (.png/.jpg + .txt captions)",
+                        file_count="multiple",
+                        file_types=[".png", ".jpg", ".jpeg", ".webp", ".txt"],
+                        height=80,
                     )
-                    new_dataset_description = gr.Textbox(
-                        label="Description",
-                        placeholder="Optional description",
-                    )
-                    new_dataset_trigger = gr.Textbox(
-                        label="Trigger Word",
-                        placeholder="e.g., ohwx person",
-                        info="Unique word to activate the concept",
-                    )
-                    new_dataset_caption = gr.Textbox(
-                        label="Default Caption",
-                        placeholder="e.g., a photo of ohwx person",
-                    )
-                    new_dataset_resolution = gr.Dropdown(
-                        choices=[512, 768, 1024],
-                        value=1024,
-                        label="Training Resolution",
-                    )
-                    create_dataset_btn = gr.Button("📁 Create Dataset", variant="secondary")
-                    create_dataset_status = gr.Textbox(label="Status", interactive=False)
+                    with gr.Row():
+                        auto_caption_checkbox = gr.Checkbox(label="Create empty captions", value=True, scale=2)
+                        add_images_btn = gr.Button("➕ Add", variant="secondary", scale=1)
+                    add_images_status = gr.Textbox(show_label=False, interactive=False, max_lines=1)
                 
                 with gr.Column(scale=1):
-                    gr.Markdown("**Select & Manage Dataset**")
-                    dataset_dropdown = gr.Dropdown(
-                        choices=get_available_datasets(),
-                        label="Select Dataset",
-                        info="Choose a dataset to train on",
+                    folder_path_input = gr.Textbox(
+                        label="Import from Folder",
+                        placeholder="/path/to/images",
                     )
-                    refresh_datasets_btn = gr.Button("🔄 Refresh", size="sm")
-                    dataset_info_display = gr.Markdown("Select a dataset to see info")
-                    
-                    gr.Markdown("---")
-                    gr.Markdown("**Add Images**")
-                    image_upload = gr.File(
-                        label="Upload Images",
-                        file_count="multiple",
-                        file_types=["image"],
-                    )
-                    auto_caption_checkbox = gr.Checkbox(
-                        label="Create empty caption files",
-                        value=True,
-                        info="You can edit captions manually later",
-                    )
-                    add_images_btn = gr.Button("➕ Add Images to Dataset", variant="secondary")
-                    add_images_status = gr.Textbox(label="Status", interactive=False)
-                    
-                    validate_dataset_btn = gr.Button("✅ Validate Dataset", variant="secondary")
-                    validate_status = gr.Markdown("")
+                    import_folder_btn = gr.Button("📥 Import Folder", variant="secondary")
+                    import_folder_status = gr.Textbox(show_label=False, interactive=False, max_lines=1)
+            
+            # Row 5: Validate
+            with gr.Row():
+                validate_dataset_btn = gr.Button("✅ Validate Dataset", size="sm")
+                validate_status = gr.Markdown("")
         
         with gr.Accordion("⚙️ Training Configuration", open=True):
+            # Preset selector
             with gr.Row():
                 training_preset = gr.Dropdown(
                     choices=["quick_test", "character_lora", "style_lora", "concept_lora", "custom"],
                     value="character_lora",
-                    label="Training Preset",
-                    info="Select a preset or choose 'custom' for manual configuration",
+                    label="Preset",
+                    scale=1,
                 )
-                preset_description = gr.Markdown(get_preset_description("character_lora"))
+                output_name = gr.Textbox(
+                    label="Output Name",
+                    placeholder="my_character_lora",
+                    scale=2,
+                )
+                model_path_input = gr.Textbox(
+                    label="Model Path",
+                    value="models/pytorch/Z-Image-Turbo",
+                    scale=2,
+                )
+            preset_description = gr.Markdown(get_preset_description("character_lora"))
+            
+            # Main settings - 3 columns
+            with gr.Row():
+                max_train_steps = gr.Slider(100, 10000, 1500, step=100, label="Steps")
+                learning_rate = gr.Number(value=1e-4, label="LR")
+                lora_rank = gr.Slider(4, 128, 32, step=4, label="LoRA Rank")
             
             with gr.Row():
-                with gr.Column():
-                    gr.Markdown("**Basic Settings**")
-                    output_name = gr.Textbox(
-                        label="Output LoRA Name",
-                        placeholder="e.g., my_character_lora",
-                    )
-                    model_path_input = gr.Textbox(
-                        label="Base Model Path",
-                        value="models/pytorch/Z-Image-Turbo",
-                        info="Path to PyTorch model directory",
-                    )
-                    max_train_steps = gr.Slider(
-                        minimum=100,
-                        maximum=10000,
-                        value=1500,
-                        step=100,
-                        label="Max Training Steps",
-                    )
-                    learning_rate = gr.Number(
-                        value=1e-4,
-                        label="Learning Rate",
-                    )
-                
-                with gr.Column():
-                    gr.Markdown("**LoRA Settings**")
-                    lora_rank = gr.Slider(
-                        minimum=4,
-                        maximum=128,
-                        value=32,
-                        step=4,
-                        label="LoRA Rank",
-                        info="Higher = more capacity, more VRAM",
-                    )
-                    lora_alpha = gr.Number(
-                        value=32.0,
-                        label="LoRA Alpha",
-                        info="Typically same as rank",
-                    )
-                    batch_size = gr.Slider(
-                        minimum=1,
-                        maximum=4,
-                        value=1,
-                        step=1,
-                        label="Batch Size",
-                    )
-                    grad_accum = gr.Slider(
-                        minimum=1,
-                        maximum=16,
-                        value=4,
-                        step=1,
-                        label="Gradient Accumulation Steps",
-                        info="Effective batch = batch_size × grad_accum",
-                    )
+                lora_alpha = gr.Number(value=32.0, label="LoRA Alpha")
+                batch_size = gr.Slider(1, 4, 1, step=1, label="Batch Size")
+                grad_accum = gr.Slider(1, 16, 4, step=1, label="Grad Accum")
             
             with gr.Row():
-                with gr.Column():
-                    gr.Markdown("**Training Options**")
-                    lr_scheduler = gr.Dropdown(
-                        choices=["cosine", "constant", "linear", "cosine_with_restarts"],
-                        value="cosine",
-                        label="LR Scheduler",
-                    )
-                    save_every = gr.Slider(
-                        minimum=100,
-                        maximum=2000,
-                        value=500,
-                        step=100,
-                        label="Save Checkpoint Every N Steps",
-                    )
-                    validate_every = gr.Slider(
-                        minimum=100,
-                        maximum=1000,
-                        value=250,
-                        step=50,
-                        label="Generate Validation Images Every N Steps",
-                    )
-                
-                with gr.Column():
-                    gr.Markdown("**Dataset Options**")
-                    train_resolution = gr.Dropdown(
-                        choices=[512, 768, 1024],
-                        value=1024,
-                        label="Training Resolution",
-                    )
-                    flip_horizontal = gr.Checkbox(
-                        label="Random Horizontal Flip",
-                        value=True,
-                        info="Disable for asymmetric subjects",
-                    )
-                    use_bucketing = gr.Checkbox(
-                        label="Aspect Ratio Bucketing",
-                        value=True,
-                        info="Train on varied aspect ratios (landscape/portrait/square) without cropping",
-                    )
-                    
-                    gr.Markdown("**Training Adapter**")
-                    available_adapters = get_available_adapters()
-                    use_adapter = gr.Checkbox(
-                        label="Use De-distillation Adapter",
-                        value=len(available_adapters) > 0,
-                        info="Preserves turbo capabilities during training",
-                        interactive=len(available_adapters) > 0,
-                    )
-                    adapter_dropdown = gr.Dropdown(
-                        choices=available_adapters,
-                        value=available_adapters[0] if available_adapters else None,
-                        label="Select Adapter",
-                        info="Choose which training adapter to use",
-                        visible=len(available_adapters) > 0,
-                    )
-                    adapter_weight = gr.Slider(
-                        minimum=0.0,
-                        maximum=2.0,
-                        value=1.0,
-                        step=0.1,
-                        label="Adapter Weight",
-                        visible=len(available_adapters) > 0,
-                    )
-                    if not available_adapters:
-                        gr.Markdown("⚠️ No adapters found. Download from [ostris/zimage_turbo_training_adapter](https://huggingface.co/ostris/zimage_turbo_training_adapter)")
+                lr_scheduler = gr.Dropdown(
+                    choices=["cosine", "constant", "linear", "cosine_with_restarts"],
+                    value="cosine", label="LR Scheduler",
+                )
+                save_every = gr.Slider(100, 2000, 500, step=100, label="Save Every N")
+                validate_every = gr.Slider(100, 1000, 250, step=50, label="Validate Every N")
+            
+            # Dataset & adapter options in compact rows
+            with gr.Row():
+                train_resolution = gr.Dropdown(choices=[512, 768, 1024], value=1024, label="Resolution")
+                flip_horizontal = gr.Checkbox(label="Horizontal Flip", value=True)
+                use_bucketing = gr.Checkbox(label="Aspect Bucketing", value=True)
+            
+            available_adapters = get_available_adapters()
+            with gr.Row():
+                use_adapter = gr.Checkbox(
+                    label="Use Training Adapter",
+                    value=len(available_adapters) > 0,
+                    interactive=len(available_adapters) > 0,
+                )
+                adapter_dropdown = gr.Dropdown(
+                    choices=available_adapters,
+                    value=available_adapters[0] if available_adapters else None,
+                    label="Adapter",
+                    visible=len(available_adapters) > 0,
+                )
+                adapter_weight = gr.Slider(0.0, 2.0, 1.0, step=0.1, label="Adapter Weight", visible=len(available_adapters) > 0)
+            
+            if not available_adapters:
+                gr.Markdown("⚠️ No adapters found. [Download](https://huggingface.co/ostris/zimage_turbo_training_adapter)")
             
             with gr.Accordion("🔮 Validation Prompts", open=False):
                 validation_prompts = gr.Textbox(
-                    label="Validation Prompts (one per line)",
-                    value="a photograph of [trigger], professional lighting\na portrait of [trigger], detailed, high quality",
-                    lines=4,
-                    info="Replace [trigger] with your trigger word",
+                    label="Prompts (one per line)",
+                    value="a photograph of [trigger], professional lighting\na portrait of [trigger], detailed",
+                    lines=2,
                 )
             
-            vram_estimate = gr.Markdown("Select settings to see VRAM estimate")
-            estimate_vram_btn = gr.Button("📊 Estimate VRAM", variant="secondary")
+            with gr.Row():
+                estimate_vram_btn = gr.Button("📊 Estimate VRAM", size="sm")
+                vram_estimate = gr.Markdown("*Select settings to see estimate*")
         
         with gr.Accordion("🚀 Training", open=True):
             with gr.Row():
-                start_training_btn = gr.Button("▶️ Start Training", variant="primary", scale=2)
-                stop_training_btn = gr.Button("⏹️ Stop Training", variant="stop", scale=1)
+                start_training_btn = gr.Button("▶️ Start", variant="primary", scale=1)
+                stop_training_btn = gr.Button("⏹️ Stop", variant="stop", scale=0, min_width=80)
+                refresh_progress_btn = gr.Button("🔄", size="sm", scale=0, min_width=40)
             
-            training_status = gr.Textbox(
-                label="Status",
-                value="Ready to train",
-                interactive=False,
-                lines=2,
-            )
-            
-            training_progress_bar = gr.Progress()
-            training_progress_text = gr.Markdown("No training in progress")
-            
-            # Auto-refresh progress (using Gradio's built-in mechanism)
-            refresh_progress_btn = gr.Button("🔄 Refresh Progress", size="sm")
+            training_status = gr.Markdown("**Status:** Ready to train")
+            training_progress_text = gr.Markdown("")
         
         with gr.Accordion("ℹ️ Training Adapter Info", open=False):
             adapter_info = gr.Markdown(get_training_adapter_info())
         
-        with gr.Accordion("💾 Export Trained LoRA", open=False):
-            gr.Markdown(
-                """
-                Export your trained LoRA as a standalone file or bake it into a new model.
-                
-                **Options:**
-                - **LoRA Only**: Copy the LoRA to `models/loras/custom/` for use in the Generate tab
-                - **Merged Model**: Bake the LoRA into the base model and save as MLX/PyTorch/ComfyUI format
-                """
-            )
+        with gr.Accordion("💾 Export LoRA", open=False):
+            with gr.Row():
+                trained_lora_dropdown = gr.Dropdown(
+                    choices=get_trained_loras(),
+                    label="Trained LoRA",
+                    scale=2,
+                )
+                refresh_trained_loras_btn = gr.Button("🔄", size="sm", scale=0, min_width=40)
+                export_output_name = gr.Textbox(label="Output Name", placeholder="my_lora", scale=2)
+                export_lora_scale = gr.Slider(0.1, 2.0, 1.0, step=0.1, label="Strength", scale=1)
             
             with gr.Row():
-                with gr.Column(scale=2):
-                    trained_lora_dropdown = gr.Dropdown(
-                        choices=get_trained_loras(),
-                        label="Select Trained LoRA",
-                        info="Choose a completed training run from outputs/training/",
-                    )
-                    refresh_trained_loras_btn = gr.Button("🔄 Refresh", size="sm")
-                
-                with gr.Column(scale=2):
-                    export_output_name = gr.Textbox(
-                        label="Output Name",
-                        placeholder="e.g., my_custom_model",
-                        info="Name for the exported LoRA or model (alphanumeric, hyphens, underscores)",
-                    )
-                    export_lora_scale = gr.Slider(
-                        minimum=0.1,
-                        maximum=2.0,
-                        value=1.0,
-                        step=0.1,
-                        label="LoRA Strength (for merged models)",
-                        info="Strength to apply when baking LoRA into model",
-                    )
+                export_lora_only = gr.Checkbox(label="📁 LoRA", value=True)
+                export_mlx = gr.Checkbox(label="🍎 MLX", value=False)
+                export_pytorch = gr.Checkbox(label="🔥 PyTorch", value=False)
+                export_comfyui = gr.Checkbox(label="🎨 ComfyUI", value=False)
+                export_btn = gr.Button("💾 Export", variant="primary")
             
-            gr.Markdown("**Output Formats**")
-            with gr.Row():
-                export_lora_only = gr.Checkbox(
-                    label="📁 LoRA Only",
-                    value=True,
-                    info="Save to models/loras/custom/",
-                )
-                export_mlx = gr.Checkbox(
-                    label="🍎 MLX",
-                    value=False,
-                    info="Save to models/mlx/",
-                )
-                export_pytorch = gr.Checkbox(
-                    label="🔥 PyTorch",
-                    value=False,
-                    info="Save to models/pytorch/",
-                )
-                export_comfyui = gr.Checkbox(
-                    label="🎨 ComfyUI",
-                    value=False,
-                    info="Save to models/comfyui/",
-                )
-            
-            export_btn = gr.Button("💾 Export", variant="primary")
-            export_status = gr.Textbox(
-                label="Export Status",
-                interactive=False,
-                lines=3,
-            )
+            export_status = gr.Textbox(show_label=False, interactive=False, max_lines=2)
         
         # Event handlers
+        
+        # Create new dataset (simple flow - just name, then edit metadata)
+        def on_create_dataset(name):
+            status, choices = create_dataset_simple(name)
+            # Return status, updated dropdown choices, and select the new dataset if created
+            if status.startswith("✅"):
+                # Extract the created dataset name
+                new_name = name.strip()
+                new_name = "".join(c for c in new_name if c.isalnum() or c in "._- ")
+                return status, gr.update(choices=choices, value=new_name)
+            return status, gr.update(choices=choices)
+        
         create_dataset_btn.click(
-            fn=create_dataset,
-            inputs=[new_dataset_name, new_dataset_description, new_dataset_trigger, new_dataset_caption, new_dataset_resolution],
-            outputs=[create_dataset_status],
-        ).then(
-            fn=lambda: gr.update(choices=get_available_datasets()),
-            outputs=[dataset_dropdown],
+            fn=on_create_dataset,
+            inputs=[new_dataset_name],
+            outputs=[create_dataset_status, dataset_dropdown],
         )
+        
+        # Helper to load dataset info and metadata together
+        def refresh_and_load(current_dataset):
+            choices = get_available_datasets()
+            if current_dataset and current_dataset in choices:
+                info = get_dataset_info(current_dataset)
+                trigger, desc, caption, res = load_dataset_metadata(current_dataset)
+                return gr.update(choices=choices), info, trigger, desc, caption, res
+            return gr.update(choices=choices), "*Select a dataset above to see info and edit settings*", "", "", "", 1024
         
         refresh_datasets_btn.click(
-            fn=lambda: gr.update(choices=get_available_datasets()),
-            outputs=[dataset_dropdown],
+            fn=refresh_and_load,
+            inputs=[dataset_dropdown],
+            outputs=[dataset_dropdown, dataset_info_display, meta_trigger_word, meta_description, meta_default_caption, meta_resolution],
         )
         
+        # When dataset is selected, load its info AND populate metadata fields
+        def on_dataset_select(dataset_name):
+            info = get_dataset_info(dataset_name)
+            trigger, desc, caption, res = load_dataset_metadata(dataset_name)
+            return info, trigger, desc, caption, res
+        
         dataset_dropdown.change(
+            fn=on_dataset_select,
+            inputs=[dataset_dropdown],
+            outputs=[dataset_info_display, meta_trigger_word, meta_description, meta_default_caption, meta_resolution],
+        )
+        
+        # Save metadata button
+        save_metadata_btn.click(
+            fn=save_dataset_metadata,
+            inputs=[dataset_dropdown, meta_trigger_word, meta_description, meta_default_caption, meta_resolution],
+            outputs=[metadata_status],
+        ).then(
             fn=get_dataset_info,
             inputs=[dataset_dropdown],
             outputs=[dataset_info_display],
@@ -1161,6 +1357,16 @@ def create_training_tab():
             fn=validate_dataset,
             inputs=[dataset_dropdown],
             outputs=[validate_status],
+        )
+        
+        import_folder_btn.click(
+            fn=import_folder_to_dataset,
+            inputs=[dataset_dropdown, folder_path_input],
+            outputs=[import_folder_status],
+        ).then(
+            fn=get_dataset_info,
+            inputs=[dataset_dropdown],
+            outputs=[dataset_info_display],
         )
         
         training_preset.change(

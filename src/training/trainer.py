@@ -229,25 +229,34 @@ class LoRATrainer:
         
         # Try to load from diffusers format or safetensors
         try:
-            from diffusers import FluxTransformer2DModel
+            # Z-Image uses its own custom transformer architecture, not Flux
+            from diffusers import ZImageTransformer2DModel
             
             # Check if it's a diffusers-format model
+            # First check if config.json exists at model_path (direct transformer path)
+            # Then check if it's a pipeline directory with transformer subdirectory
             if (model_path / "config.json").exists():
-                self.model = FluxTransformer2DModel.from_pretrained(
-                    model_path,
-                    torch_dtype=self._get_dtype(),
-                )
+                transformer_path = model_path
+            elif (model_path / "transformer" / "config.json").exists():
+                # Diffusers pipeline format - transformer is in subdirectory
+                transformer_path = model_path / "transformer"
             else:
                 # Load from safetensors directly
                 # This requires the model architecture to be defined
                 raise NotImplementedError(
                     "Direct safetensors loading not yet implemented. "
-                    "Please provide a diffusers-format model."
+                    "Please provide a diffusers-format model (with config.json in the model "
+                    "directory or in a 'transformer' subdirectory)."
                 )
+            
+            self.model = ZImageTransformer2DModel.from_pretrained(
+                transformer_path,
+                torch_dtype=self._get_dtype(),
+            )
         except ImportError:
             raise ImportError(
                 "diffusers library is required for training. "
-                "Install with: pip install diffusers"
+                "Install with: pip install git+https://github.com/huggingface/diffusers"
             )
         
         self.model = self.model.to(self.device)
@@ -257,17 +266,32 @@ class LoRATrainer:
         """Load the text encoder (Qwen2.5-3B)."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
         
-        # Text encoder path
-        encoder_path = Path(self.config.model_path).parent / "text_encoder"
+        # Text encoder path - inside the model directory
+        model_path = Path(self.config.model_path)
+        encoder_path = model_path / "text_encoder"
+        tokenizer_path = model_path / "tokenizer"  # Tokenizer is in separate folder
         
         if not encoder_path.exists():
-            # Try to download from HuggingFace
-            encoder_path = "Qwen/Qwen2.5-3B"
+            # Try parent directory structure
+            encoder_path = model_path.parent / "text_encoder"
+            tokenizer_path = model_path.parent / "tokenizer"
         
-        self.tokenizer = AutoTokenizer.from_pretrained(encoder_path)
+        use_local = encoder_path.exists() and tokenizer_path.exists()
+        
+        if not use_local:
+            # Fallback to HuggingFace (with warning)
+            print("⚠️ Local text encoder or tokenizer not found, downloading from HuggingFace...")
+            encoder_path = "Qwen/Qwen2.5-3B"
+            tokenizer_path = "Qwen/Qwen2.5-3B"
+        else:
+            print(f"✓ Using local text encoder: {encoder_path}")
+            print(f"✓ Using local tokenizer: {tokenizer_path}")
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=use_local)
         self.text_encoder = AutoModelForCausalLM.from_pretrained(
             encoder_path,
             torch_dtype=self._get_dtype(),
+            local_files_only=use_local,
         ).to(self.device)
         
         self.text_encoder.requires_grad_(False)  # Freeze text encoder
@@ -276,15 +300,25 @@ class LoRATrainer:
         """Load the VAE for encoding images to latents."""
         from diffusers import AutoencoderKL
         
-        vae_path = Path(self.config.model_path).parent / "vae"
+        # VAE path - inside the model directory
+        model_path = Path(self.config.model_path)
+        vae_path = model_path / "vae"
         
         if not vae_path.exists():
-            # Use default SDXL VAE
+            # Try parent directory structure
+            vae_path = model_path.parent / "vae"
+        
+        if not vae_path.exists():
+            # Fallback to HuggingFace (with warning)
+            print("⚠️ Local VAE not found, downloading from HuggingFace...")
             vae_path = "stabilityai/sdxl-vae"
+        else:
+            print(f"✓ Using local VAE: {vae_path}")
         
         self.vae = AutoencoderKL.from_pretrained(
             vae_path,
             torch_dtype=self._get_dtype(),
+            local_files_only=isinstance(vae_path, Path),
         ).to(self.device)
         
         self.vae.requires_grad_(False)  # Freeze VAE
@@ -532,21 +566,44 @@ class LoRATrainer:
         
         where target_velocity = noise - latents (the direction from latents to noise)
         """
-        # Sample noise
+        batch_size = latents.shape[0]
+        
+        # Add frames dimension if not present: [B, C, H, W] -> [B, C, 1, H, W]
+        if latents.dim() == 4:
+            latents = latents.unsqueeze(2)  # Add F=1 dimension
+        
+        # Sample noise (same shape as latents)
         noise = torch.randn_like(latents)
         
-        # Get sigmas for timesteps
-        sigmas = self.scheduler.sigmas[timesteps].view(-1, 1, 1, 1)
+        # Get sigmas for timesteps (scheduler.sigmas is on CPU, so index with CPU tensor)
+        sigmas = self.scheduler.sigmas[timesteps.cpu()].to(self.device).view(-1, 1, 1, 1, 1)
         
         # Create noisy latents (interpolate between latents and noise)
         noisy_latents = (1 - sigmas) * latents + sigmas * noise
         
-        # Predict velocity
-        model_pred = self.model(
-            hidden_states=noisy_latents,
-            encoder_hidden_states=text_embeds,
-            timestep=timesteps,
-        ).sample
+        # Scale timesteps to [0, 1] as ZImage expects (based on generate_mlx.py)
+        # The scheduler gives timesteps in [0, num_train_timesteps]
+        # ZImage uses: t = (1000 - t_scheduler) / 1000 for inference
+        # For training with random timesteps, just normalize to [0, 1]
+        t_normalized = timesteps.float() / self.config.num_train_timesteps
+        
+        # ZImage expects List[Tensor] for x and cap_feats (one tensor per batch item)
+        # Split batch into list of individual samples
+        x_list = [noisy_latents[i] for i in range(batch_size)]
+        cap_feats_list = [text_embeds[i] for i in range(batch_size)]
+        
+        # Forward pass
+        # ZImage forward returns: (output_list, {}) not an object with .sample
+        output, _ = self.model(
+            x=x_list,
+            t=t_normalized,
+            cap_feats=cap_feats_list,
+        )
+        
+        # Reconstruct batch from list output and negate (as done in inference)
+        # output is List[Tensor], stack back to batch
+        model_pred = torch.stack(output, dim=0)
+        model_pred = -model_pred  # Negate like inference does
         
         # Target is the velocity from latents to noise
         target = noise - latents

@@ -108,14 +108,43 @@ class DatasetManager:
         """
         List available datasets.
         
+        Supports both:
+        - Structured datasets: datasets/<name>/images/ (from Training tab)
+        - Flat datasets: datasets/<name>/ with images directly (from Generate tab)
+        
         Returns:
             List of dataset names
         """
         datasets = []
         for d in self.datasets_dir.iterdir():
-            if d.is_dir() and (d / "images").exists():
+            if not d.is_dir():
+                continue
+            
+            # Check for structured dataset (has images/ subdirectory)
+            if (d / "images").exists():
                 datasets.append(d.name)
+            else:
+                # Check for flat dataset (has images directly in folder)
+                has_images = any(
+                    f.suffix.lower() in SUPPORTED_FORMATS 
+                    for f in d.iterdir() if f.is_file()
+                )
+                if has_images:
+                    datasets.append(d.name)
+        
         return sorted(datasets)
+    
+    def _get_images_dir(self, dataset_path: Path) -> Path:
+        """
+        Get the directory containing images for a dataset.
+        
+        Supports both structured (images/) and flat (direct) layouts.
+        """
+        images_subdir = dataset_path / "images"
+        if images_subdir.exists():
+            return images_subdir
+        # Flat structure - images are directly in the dataset folder
+        return dataset_path
     
     def get_dataset_info(self, name: str) -> Dict[str, Any]:
         """
@@ -131,7 +160,8 @@ class DatasetManager:
         if not dataset_path.exists():
             raise ValueError(f"Dataset not found: {name}")
         
-        images_dir = dataset_path / "images"
+        images_dir = self._get_images_dir(dataset_path)
+        is_flat = images_dir == dataset_path
         
         # Load metadata if exists
         metadata_path = dataset_path / "dataset.json"
@@ -161,6 +191,7 @@ class DatasetManager:
             "has_captions": self._count_captions(images_dir, image_files) > 0,
             "num_captions": self._count_captions(images_dir, image_files),
             "metadata": metadata,
+            "is_flat": is_flat,
         }
     
     def create_dataset(
@@ -295,17 +326,35 @@ class DatasetManager:
         """
         Load all images and captions from a dataset.
         
+        Supports both structured (images/) and flat (direct) layouts.
+        
         Args:
-            dataset_name: Name of the dataset
+            dataset_name: Name of the dataset or path to dataset folder
             
         Returns:
             List of ImageEntry objects
         """
+        # Handle both full paths and just dataset names
+        dataset_name_path = Path(dataset_name)
+        
+        # If it's a full path (like "datasets/Lisanne"), extract just the name
+        if dataset_name_path.parts and dataset_name_path.parts[0] == "datasets":
+            # It's a relative path starting with "datasets/"
+            dataset_name = dataset_name_path.name  # Just take "Lisanne"
+        elif dataset_name_path.is_absolute():
+            # Absolute path - use directly
+            dataset_path = dataset_name_path
+            if not dataset_path.exists():
+                raise ValueError(f"Dataset not found: {dataset_name}")
+            images_dir = self._get_images_dir(dataset_path)
+            # Continue with the rest of the method using this path
+        
+        # Normal case: dataset name relative to datasets_dir
         dataset_path = self.datasets_dir / dataset_name
         if not dataset_path.exists():
             raise ValueError(f"Dataset not found: {dataset_name}")
         
-        images_dir = dataset_path / "images"
+        images_dir = self._get_images_dir(dataset_path)
         
         # Load metadata for default caption
         metadata_path = dataset_path / "dataset.json"
@@ -353,6 +402,8 @@ class DatasetManager:
         """
         Validate a dataset and report any issues.
         
+        Supports both structured (images/) and flat (direct) layouts.
+        
         Args:
             dataset_name: Name of the dataset
             
@@ -363,10 +414,7 @@ class DatasetManager:
         if not dataset_path.exists():
             return {"valid": False, "error": f"Dataset not found: {dataset_name}"}
         
-        images_dir = dataset_path / "images"
-        if not images_dir.exists():
-            return {"valid": False, "error": "No images directory found"}
-        
+        images_dir = self._get_images_dir(dataset_path)
         image_files = self._find_image_files(images_dir)
         
         if not image_files:
