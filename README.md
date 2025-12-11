@@ -2,6 +2,8 @@
 
 High-quality image generation on Apple Silicon using the Z-Image-Turbo model, ported to MLX.
 
+![Z-Image-Turbo MLX](assets/z-image-turbo-mlx.png)
+
 ## Overview
 
 Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-quality 1024×1024 images in just 9 steps. This repository provides an MLX implementation optimized for Apple Silicon Macs, along with the original PyTorch reference implementation.
