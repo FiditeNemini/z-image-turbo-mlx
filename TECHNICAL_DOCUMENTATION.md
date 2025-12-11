@@ -7,15 +7,14 @@
 4. [Model Components](#model-components)
 5. [LoRA Support](#lora-support)
 6. [Model Merging](#model-merging)
-7. [LoRA Training](#lora-training)
-8. [Weight Key Mappings](#weight-key-mappings)
-9. [Precision Modes & Quantization](#precision-modes--quantization)
-10. [Model Loading Flow](#model-loading-flow)
-11. [Image Generation Pipeline](#image-generation-pipeline)
-12. [Model Conversion](#model-conversion)
-13. [Critical Implementation Details](#critical-implementation-details)
-14. [Known Issues & Solutions](#known-issues--solutions)
-15. [Configuration Reference](#configuration-reference)
+7. [Weight Key Mappings](#weight-key-mappings)
+8. [Precision Modes & Quantization](#precision-modes--quantization)
+9. [Model Loading Flow](#model-loading-flow)
+10. [Image Generation Pipeline](#image-generation-pipeline)
+11. [Model Conversion](#model-conversion)
+12. [Critical Implementation Details](#critical-implementation-details)
+13. [Known Issues & Solutions](#known-issues--solutions)
+14. [Configuration Reference](#configuration-reference)
 
 ---
 
@@ -35,8 +34,6 @@ The project supports:
 - **LeMiCa speed acceleration** for up to 30% faster generation
 - **Latent upscaling** for enhanced detail before decoding
 - **ESRGAN upscaling** for pixel-space resolution enhancement
-- **LoRA training** with MPS (Apple Silicon) or CUDA (NVIDIA) backend
-- **Aspect ratio bucketing** for training on varied image dimensions
 
 ---
 
@@ -98,7 +95,7 @@ TransformerBlock(dim=3840, num_heads=30, head_dim=128, mlp_dim=10240):
 
 ```
 z-image-turbo-mlx/
-├── app.py                    # Main Gradio application
+├── app.py                    # Main Gradio application (2438 lines)
 ├── requirements.txt          # Python dependencies
 ├── README.md                 # User documentation
 ├── TECHNICAL_DOCUMENTATION.md # This file
@@ -108,23 +105,13 @@ z-image-turbo-mlx/
 │   ├── text_encoder.py       # MLX Qwen2 Text Encoder implementation
 │   ├── lora.py               # LoRA loading and application
 │   ├── merge.py              # Model merging algorithms
-│   ├── upscaler.py           # ESRGAN upscaler implementation
 │   ├── generate_mlx.py       # Standalone MLX generation script
 │   ├── generate_pytorch.py   # Standalone PyTorch generation script
-│   ├── training_ui.py        # Training tab UI components
 │   ├── convert_to_mlx.py     # HuggingFace → MLX converter
 │   ├── convert_comfyui_to_mlx.py      # ComfyUI → MLX converter
 │   ├── convert_comfyui_to_pytorch.py  # ComfyUI → PyTorch converter
 │   ├── convert_mlx_to_pytorch.py      # MLX → PyTorch converter
-│   ├── convert_pytorch_to_comfyui.py  # PyTorch → ComfyUI converter
-│   └── training/             # Training module
-│       ├── __init__.py
-│       ├── config.py         # Training configurations
-│       ├── dataset.py        # Dataset management & bucketing
-│       ├── trainer.py        # LoRA trainer (MPS/CUDA)
-│       ├── lora_network.py   # LoRA injection
-│       ├── adapter.py        # Training adapter handling
-│       └── utils.py          # Training utilities
+│   └── convert_pytorch_to_comfyui.py  # PyTorch → ComfyUI converter
 ├── models/
 │   ├── mlx/
 │   │   ├── Z-Image-Turbo-MLX/     # Reference working model
@@ -149,15 +136,9 @@ z-image-turbo-mlx/
 │   ├── loras/                     # LoRA files (.safetensors)
 │   │   ├── styles/                # Style LoRAs
 │   │   ├── concepts/              # Concept LoRAs
-│   │   ├── characters/            # Character LoRAs
-│   │   └── custom/                # User-trained LoRAs
-│   ├── training_adapters/         # Training adapters (de-distillation)
+│   │   └── characters/            # Character LoRAs
 │   ├── comfyui/                   # ComfyUI single-file checkpoints
-│   ├── upscalers/                 # ESRGAN upscaler models
 │   └── prompt_enhancer/           # Qwen2.5-1.5B for prompt enhancement
-├── datasets/                      # Training datasets
-├── outputs/                       # Training outputs
-│   └── training/                  # Trained LoRAs and checkpoints
 └── debugging/                     # Debug and testing scripts
 ```
 
@@ -558,115 +539,6 @@ The Merge tab in `app.py` provides:
 13. If ComfyUI selected: Converted with QKV fusion, saved to models/comfyui/<output_name>.safetensors
 14. Model dropdown refreshed to include new model
 ```
-
----
-
-## LoRA Training
-
-### Overview
-
-The training module (`src/training/`) provides LoRA training capabilities using PyTorch with MPS (Apple Silicon) or CUDA (NVIDIA) backends. MLX is used for inference only.
-
-### Requirements
-
-| Platform | Backend | Memory | Notes |
-|----------|---------|--------|-------|
-| **macOS** | MPS | 16GB+ unified | Recommended for Apple Silicon |
-| **Linux/Windows** | CUDA | 24GB+ VRAM | NVIDIA GPU required |
-
-### Training Architecture
-
-```
-Training Flow:
-1. Load PyTorch base model (Z-Image-Turbo)
-2. Inject LoRA layers into transformer
-3. Optionally merge training adapter
-4. Load dataset with aspect ratio bucketing
-5. Train LoRA weights only (base frozen)
-6. Save trained LoRA as safetensors
-7. Export to various formats (optional)
-```
-
-### Aspect Ratio Bucketing
-
-The training system supports variable aspect ratios without cropping:
-
-| Bucket | Resolution | Aspect Ratio | Megapixels |
-|--------|------------|--------------|------------|
-| Portrait Tall | 768×1344 | 0.57 | 1.03 |
-| Portrait | 832×1216 | 0.68 | 1.01 |
-| Portrait Medium | 896×1152 | 0.78 | 1.03 |
-| Square | 1024×1024 | 1.00 | 1.05 |
-| Landscape Medium | 1152×896 | 1.29 | 1.03 |
-| Landscape | 1216×832 | 1.46 | 1.01 |
-| Landscape Wide | 1344×768 | 1.75 | 1.03 |
-
-Images are assigned to the nearest bucket by aspect ratio and resized accordingly.
-
-### Training Configuration
-
-```python
-@dataclass
-class TrainingConfig:
-    # Model paths
-    model_path: str = "models/pytorch/Z-Image-Turbo"
-    output_dir: str = "outputs/training"
-    output_name: str = "my_lora"
-    
-    # Training
-    max_train_steps: int = 1500
-    learning_rate: float = 1e-4
-    batch_size: int = 1
-    gradient_accumulation_steps: int = 4
-    lr_scheduler: str = "cosine"
-    
-    # LoRA
-    lora: LoRAConfig  # rank, alpha, target modules
-    
-    # Dataset
-    dataset: DatasetConfig  # path, resolution, bucketing
-    
-    # Training adapter
-    use_training_adapter: bool = True
-    training_adapter_path: str = ""
-    training_adapter_weight: float = 1.0
-```
-
-### Training Presets
-
-| Preset | Steps | Rank | Best For |
-|--------|-------|------|----------|
-| `quick_test` | 100 | 8 | Testing setup |
-| `character_lora` | 1500 | 32 | Character/subject training |
-| `style_lora` | 2000 | 64 | Artistic styles |
-| `concept_lora` | 1000 | 16 | General concepts |
-
-### Export Formats
-
-After training, LoRAs can be exported to multiple formats:
-
-| Format | Output Location | Description |
-|--------|-----------------|-------------|
-| **LoRA Only** | `models/loras/custom/` | Standalone LoRA for use with base model |
-| **MLX** | `models/mlx/<name>/` | LoRA baked into base model |
-| **PyTorch** | `models/pytorch/<name>/` | LoRA baked into base model (Diffusers format) |
-| **ComfyUI** | `models/comfyui/<name>.safetensors` | LoRA baked into base model (single file) |
-
-### MPS Backend Notes
-
-When training on Apple Silicon:
-- Uses unified memory (shared with system)
-- Mixed precision (fp16) supported without AMP GradScaler
-- No GradScaler on MPS (causes errors)
-- Some operations may fall back to CPU automatically
-
-### UI Components (`src/training_ui.py`)
-
-The training tab provides:
-- **Dataset Management**: Create, populate, and validate datasets
-- **Training Configuration**: Presets and manual settings
-- **Progress Monitoring**: Real-time status and loss tracking
-- **Export Section**: Save trained LoRAs in multiple formats
 
 ---
 

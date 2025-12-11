@@ -330,54 +330,6 @@ The **Merge** tab (between Generate and Model Settings) lets you combine multipl
 
 ⚠️ **Note**: FP8 quantized models cannot be merged. Only FP16 or higher precision models appear in the merge list.
 
-### The Training Tab
-
-The **🎓 Training** tab (after the Merge tab) lets you train custom LoRAs.
-
-#### Requirements
-
-- **Apple Silicon Mac** with MPS support (macOS 12.3+), OR
-- **NVIDIA GPU** with CUDA support
-- 16GB+ unified memory (Apple Silicon) or 24GB+ VRAM (NVIDIA)
-
-#### Training Workflow
-
-1. **Create a Dataset**:
-   - Expand "📁 Dataset Management"
-   - Enter a name, trigger word, and description
-   - Click "📁 Create Dataset"
-   - Add images using the upload area
-
-2. **Configure Training**:
-   - Select your dataset from the dropdown
-   - Choose a preset (character_lora, style_lora, etc.) or customize
-   - Set output name, steps, learning rate, etc.
-   - Enable "Aspect Ratio Bucketing" for varied image dimensions
-
-3. **Train**:
-   - Click "▶️ Start Training"
-   - Monitor progress in the status area
-   - Training saves checkpoints automatically
-
-4. **Export Your LoRA**:
-   - Expand "💾 Export Trained LoRA"
-   - Select the trained LoRA and output name
-   - Choose export formats:
-     - **📁 LoRA Only**: Copy to models/loras/custom/
-     - **🍎 MLX**: Bake into model → models/mlx/
-     - **🔥 PyTorch**: Bake into model → models/pytorch/
-     - **🎨 ComfyUI**: Bake into model → models/comfyui/
-   - Click "💾 Export"
-
-#### Training Presets
-
-| Preset | Steps | Rank | Best For |
-|--------|-------|------|----------|
-| quick_test | 100 | 8 | Testing setup |
-| character_lora | 1500 | 32 | Characters/subjects |
-| style_lora | 2000 | 64 | Artistic styles |
-| concept_lora | 1000 | 16 | General concepts |
-
 ### The Model Settings Tab
 
 This tab lets you manage multiple models.

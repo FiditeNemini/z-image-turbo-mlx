@@ -2,8 +2,6 @@
 
 High-quality image generation on Apple Silicon using the Z-Image-Turbo model, ported to MLX.
 
-![Z-Image-Turbo MLX](assets/z-image-turbo-mlx.png)
-
 ## Overview
 
 Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-quality 1024×1024 images in just 9 steps. This repository provides an MLX implementation optimized for Apple Silicon Macs, along with the original PyTorch reference implementation.
@@ -23,9 +21,6 @@ Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-
 - **Random prompt generation**: Auto-generates creative prompts when input is empty
 - **Comprehensive logging**: Detailed logs in `./logs/` for troubleshooting
 - **Scrollable LoRA list**: Browse all installed LoRAs with improved UI
-- **LoRA Training**: Train custom LoRAs using PyTorch with MPS (Apple Silicon) or CUDA (NVIDIA)
-- **Aspect Ratio Bucketing**: Train on varied image aspect ratios without cropping
-- **Training Export**: Export trained LoRAs as standalone files or merged models (MLX/PyTorch/ComfyUI)
 - **Gradio UI**: User-friendly web interface for image generation
 
 ## 📚 Documentation
@@ -334,22 +329,14 @@ z-image-turbo-mlx/
 │   ├── vae.py              # MLX VAE decoder
 │   ├── lora.py             # LoRA loading and application
 │   ├── merge.py            # Model merging algorithms
-│   ├── convert_to_mlx.py   # Weight converter
-│   ├── training_ui.py      # Training tab UI components
-│   └── training/           # Training module
-│       ├── trainer.py      # LoRA training with MPS/CUDA support
-│       ├── dataset.py      # Dataset management & bucketing
-│       ├── config.py       # Training configurations
-│       └── ...             # Additional training utilities
+│   └── convert_to_mlx.py   # Weight converter
 ├── models/                 # Model weights
 │   ├── mlx/                # MLX-converted models
 │   ├── pytorch/            # PyTorch/Diffusers models
 │   ├── loras/              # LoRA files (.safetensors)
-│   ├── training_adapters/  # Training adapters (de-distillation)
 │   └── upscalers/          # ESRGAN upscaler models
-├── datasets/               # Training datasets
-├── outputs/                # Training outputs
 ├── debugging/              # Debug & diagnostic tools
+│   └── check_loras_import.py  # Scan and validate LoRA files
 └── requirements.txt
 ```
 
