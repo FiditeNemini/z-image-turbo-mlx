@@ -2083,6 +2083,25 @@ def _save_fused_comfyui_model(model_name, source_model, lora_configs, progress, 
 
 # --- Upscaler Functions ---
 
+# Import upscaler download utilities
+try:
+    from src.upscaler_download import (
+        download_default_upscaler,
+        download_all_upscalers,
+        list_installed_upscalers,
+        get_upscaler_info,
+        AVAILABLE_UPSCALERS,
+    )
+    UPSCALER_DOWNLOAD_AVAILABLE = True
+except ImportError:
+    UPSCALER_DOWNLOAD_AVAILABLE = False
+    def list_installed_upscalers():
+        return []
+    def get_upscaler_info():
+        return "Upscaler download not available"
+    AVAILABLE_UPSCALERS = {}
+
+
 def get_upscaler_choices():
     """Get list of available upscalers for dropdown.
     Returns ["None"] plus all supported (ESRGAN/RRDB) upscaler names.
@@ -2093,8 +2112,35 @@ def get_upscaler_choices():
     # Only show supported upscalers (ESRGAN/RRDB architecture)
     upscalers = get_available_upscalers(Path(UPSCALERS_DIR), filter_supported=True)
     if not upscalers:
+        if UPSCALER_DOWNLOAD_AVAILABLE:
+            return ["None (click ⬇️ Download Upscalers)"]
         return ["None (no supported upscalers found)"]
     return ["None"] + upscalers
+
+
+def download_upscalers_ui(progress=gr.Progress()):
+    """Download all available upscalers. Called from UI button."""
+    if not UPSCALER_DOWNLOAD_AVAILABLE:
+        return "❌ Upscaler download module not available", gr.update()
+    
+    def progress_callback(pct, msg):
+        progress(pct, desc=msg)
+    
+    progress(0, desc="Starting downloads...")
+    results = download_all_upscalers(progress_callback)
+    
+    # Build result message
+    lines = ["**Download Results:**"]
+    success_count = sum(1 for v in results.values() if v)
+    for name, success in results.items():
+        status = "✅" if success else "❌"
+        lines.append(f"{status} {name}")
+    
+    lines.append(f"\n**{success_count}/{len(results)} upscalers downloaded**")
+    
+    # Return updated dropdown choices
+    new_choices = get_upscaler_choices()
+    return "\n".join(lines), gr.update(choices=new_choices, value=new_choices[1] if len(new_choices) > 1 else new_choices[0])
 
 
 def load_cached_upscaler(upscaler_name):
@@ -3857,12 +3903,22 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         gr.Markdown("---")
                         gr.Markdown("**ESRGAN Upscale** - Pixel-space sharpening after generation")
                         
-                        upscaler_dropdown = gr.Dropdown(
-                            choices=get_upscaler_choices(),
-                            value="None",
-                            label="ESRGAN Model",
-                            info="Select an upscaler or 'None' to skip",
-                        )
+                        with gr.Row():
+                            upscaler_dropdown = gr.Dropdown(
+                                choices=get_upscaler_choices(),
+                                value="None",
+                                label="ESRGAN Model",
+                                info="Select an upscaler or 'None' to skip",
+                                scale=3,
+                            )
+                            download_upscalers_btn = gr.Button(
+                                "⬇️ Download",
+                                size="sm",
+                                scale=1,
+                                visible=UPSCALER_DOWNLOAD_AVAILABLE,
+                            )
+                        
+                        upscaler_download_status = gr.Markdown("", visible=False)
                         
                         with gr.Row():
                             upscale_factor = gr.Slider(
@@ -4289,6 +4345,17 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         fn=lambda: "Refresh the page to see new LoRAs",
         inputs=None,
         outputs=[lora_tags_display],
+    )
+    
+    # Download upscalers button
+    def download_upscalers_wrapper(progress=gr.Progress()):
+        status, dropdown_update = download_upscalers_ui(progress)
+        return gr.update(value=status, visible=True), dropdown_update
+    
+    download_upscalers_btn.click(
+        fn=download_upscalers_wrapper,
+        inputs=None,
+        outputs=[upscaler_download_status, upscaler_dropdown],
     )
     
     # Save fused model button
