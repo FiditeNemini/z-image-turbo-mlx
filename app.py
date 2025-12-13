@@ -1840,8 +1840,10 @@ def _save_fused_pytorch_model(model_name, source_model, lora_configs, progress, 
     if not PYTORCH_AVAILABLE:
         return "❌ PyTorch backend not available"
     
-    # Determine source model path  
-    if source_model and source_model != "Z-Image-Turbo":
+    # Determine source model path
+    # Accept both "Z-Image-Turbo" and "Z-Image-Turbo-MLX" as indicators to use default
+    default_models = ["Z-Image-Turbo", "Z-Image-Turbo-MLX", "mlx_model"]
+    if source_model and source_model not in default_models:
         source_path = Path(PYTORCH_MODELS_DIR) / source_model
     else:
         source_path = Path(PYTORCH_MODEL_PATH)
@@ -1959,7 +1961,9 @@ def _save_fused_comfyui_model(model_name, source_model, lora_configs, progress, 
     )
     
     # Determine source model path - need PyTorch format for ComfyUI
-    if source_model and source_model != "Z-Image-Turbo":
+    # Accept both "Z-Image-Turbo" and "Z-Image-Turbo-MLX" as indicators to use default
+    default_models = ["Z-Image-Turbo", "Z-Image-Turbo-MLX", "mlx_model"]
+    if source_model and source_model not in default_models:
         source_path = Path(PYTORCH_MODELS_DIR) / source_model
     else:
         source_path = Path(PYTORCH_MODEL_PATH)

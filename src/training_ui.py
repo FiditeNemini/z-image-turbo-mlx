@@ -545,15 +545,24 @@ def get_trained_loras() -> List[str]:
     loras = []
     for d in OUTPUTS_DIR.iterdir():
         if d.is_dir():
-            # Look for final LoRA or latest checkpoint
-            lora_file = d / f"{d.name}_final.safetensors"
+            # Look for final LoRA (same name as directory)
+            lora_file = d / f"{d.name}.safetensors"
             if lora_file.exists():
                 loras.append(d.name)
             else:
-                # Check for checkpoints
-                checkpoints = list(d.glob("*_step_*.safetensors"))
-                if checkpoints:
+                # Also check for old naming convention
+                final_lora = d / f"{d.name}_final.safetensors"
+                if final_lora.exists():
                     loras.append(d.name)
+                else:
+                    # Check for checkpoint subdirectories with lora.safetensors
+                    checkpoint_dirs = [p for p in d.iterdir() if p.is_dir() and p.name.startswith("checkpoint-")]
+                    if checkpoint_dirs:
+                        # Check if any checkpoint has lora.safetensors
+                        for ckpt_dir in checkpoint_dirs:
+                            if (ckpt_dir / "lora.safetensors").exists():
+                                loras.append(d.name)
+                                break
     return sorted(loras)
 
 
@@ -562,6 +571,7 @@ def get_available_checkpoints() -> List[str]:
     
     Returns checkpoints in format: "run_name (step N)"
     """
+    import re
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     checkpoints = []
     
@@ -569,36 +579,57 @@ def get_available_checkpoints() -> List[str]:
         if not d.is_dir():
             continue
         
-        # Look for checkpoint files with step numbers
-        ckpt_files = list(d.glob("*_step_*.safetensors"))
-        if ckpt_files:
+        # Look for checkpoint-N subdirectories
+        checkpoint_dirs = [p for p in d.iterdir() if p.is_dir() and p.name.startswith("checkpoint-")]
+        if checkpoint_dirs:
             # Extract step numbers and get the latest
-            import re
-            for ckpt in sorted(ckpt_files, reverse=True):
-                match = re.search(r"step_(\d+)", ckpt.name)
-                if match:
+            latest_step = 0
+            for ckpt_dir in checkpoint_dirs:
+                match = re.search(r"checkpoint-(\d+)", ckpt_dir.name)
+                if match and (ckpt_dir / "lora.safetensors").exists():
                     step = int(match.group(1))
-                    checkpoints.append(f"{d.name} (step {step})")
-                    break  # Only add the latest checkpoint per run
+                    if step > latest_step:
+                        latest_step = step
+            
+            if latest_step > 0:
+                checkpoints.append(f"{d.name} (step {latest_step})")
     
     return sorted(checkpoints)
 
 
 def get_lora_path_for_export(lora_name: str) -> Optional[Path]:
     """Get the path to a trained LoRA file for export."""
+    import re
     lora_dir = OUTPUTS_DIR / lora_name
     if not lora_dir.exists():
         return None
     
-    # Prefer final LoRA
-    final_lora = lora_dir / f"{lora_name}_final.safetensors"
+    # Prefer final LoRA (same name as directory)
+    final_lora = lora_dir / f"{lora_name}.safetensors"
     if final_lora.exists():
         return final_lora
     
-    # Fall back to latest checkpoint
-    checkpoints = sorted(lora_dir.glob("*_step_*.safetensors"))
-    if checkpoints:
-        return checkpoints[-1]
+    # Also check old naming convention
+    final_lora_old = lora_dir / f"{lora_name}_final.safetensors"
+    if final_lora_old.exists():
+        return final_lora_old
+    
+    # Fall back to latest checkpoint directory
+    checkpoint_dirs = [p for p in lora_dir.iterdir() if p.is_dir() and p.name.startswith("checkpoint-")]
+    if checkpoint_dirs:
+        # Find the highest step checkpoint
+        latest_step = 0
+        latest_path = None
+        for ckpt_dir in checkpoint_dirs:
+            match = re.search(r"checkpoint-(\d+)", ckpt_dir.name)
+            if match:
+                step = int(match.group(1))
+                lora_file = ckpt_dir / "lora.safetensors"
+                if step > latest_step and lora_file.exists():
+                    latest_step = step
+                    latest_path = lora_file
+        if latest_path:
+            return latest_path
     
     return None
 
@@ -956,20 +987,24 @@ def continue_training(
     if not checkpoint_dir.exists():
         return f"**❌ Error:** Checkpoint directory not found: {checkpoint_dir}"
     
-    # Find the checkpoint file
-    ckpt_file = checkpoint_dir / f"{run_name}_step_{current_step}.safetensors"
+    # Find the checkpoint file (checkpoint-N/lora.safetensors)
+    ckpt_subdir = checkpoint_dir / f"checkpoint-{current_step}"
+    ckpt_file = ckpt_subdir / "lora.safetensors"
     if not ckpt_file.exists():
         return f"**❌ Error:** Checkpoint file not found: {ckpt_file}"
     
     total_steps = current_step + additional_steps
     
-    # Load original config and update
+    # Load original config and update - could be in run dir or checkpoint subdir
     config_path = checkpoint_dir / "training_config.json"
+    if not config_path.exists():
+        config_path = ckpt_subdir / "training_config.json"
+    
     if config_path.exists():
         base_config = TrainingConfig.load(str(config_path))
         # Update with new parameters
         base_config.max_train_steps = total_steps
-        base_config.resume_from_checkpoint = str(checkpoint_dir)
+        base_config.resume_from_checkpoint = str(ckpt_subdir)
         base_config.dataset.resolution = new_resolution
         base_config.dataset.dataset_path = str(DATASETS_DIR / dataset_name)
     else:
@@ -1081,20 +1116,12 @@ def save_trained_lora_as_model(
     results = []
     
     try:
-        # Save as standalone LoRA
-        if save_lora_only:
-            result = _copy_lora_to_models(lora_path, output_model_name, progress)
-            results.append(result)
-        
-        # Save as merged model(s)
-        if save_mlx or save_pytorch or save_comfyui:
-            result = _save_lora_as_merged_model(
-                lora_path, output_model_name, lora_scale,
-                save_mlx, save_pytorch, save_comfyui, progress
-            )
-            results.append(result)
-        
-        return "\n".join(results)
+        # Export LoRA and/or provide instructions for model fusion
+        result = _save_lora_as_merged_model(
+            lora_path, output_model_name, lora_scale,
+            save_lora_only, save_mlx, save_pytorch, save_comfyui, progress
+        )
+        return result
     
     except Exception as e:
         import traceback
@@ -1126,68 +1153,369 @@ def _save_lora_as_merged_model(
     lora_path: Path,
     output_name: str,
     lora_scale: float,
+    save_lora_only: bool,
     save_mlx: bool,
     save_pytorch: bool,
     save_comfyui: bool,
     progress=None,
 ) -> str:
     """
-    Save a LoRA baked into a base model in various formats.
+    Export a trained LoRA in multiple formats.
     
-    This uses the existing save_fused_model infrastructure from app.py.
+    - save_lora_only: Copy LoRA to models/loras/ for use in generation
+    - save_mlx: Fuse LoRA into MLX model
+    - save_pytorch: Fuse LoRA into PyTorch model
+    - save_comfyui: Fuse LoRA into ComfyUI single-file checkpoint
     """
-    # Import the save functions from app.py
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent))
+    results = []
     
-    try:
-        from app import save_fused_model, MLX_MODEL_PATH, PYTORCH_MODEL_PATH
-    except ImportError as e:
-        return f"❌ Could not import save functions: {e}"
-    
-    # Create a lora_config for the save_fused_model function
-    # The path should be relative to LORAS_DIR for the function
-    # But our trained LoRA is in OUTPUTS_DIR, so we need to handle this
-    
-    # First, temporarily copy the LoRA to a location the function can find
-    temp_lora_name = f"_temp_export_{output_name}.safetensors"
-    temp_lora_path = LORAS_DIR / temp_lora_name
-    
-    try:
+    # Progress helper
+    def update_progress(pct, desc):
         if progress:
-            progress(0.1, desc="Preparing LoRA for export...")
-        
-        # Copy to temp location
-        shutil.copy2(lora_path, temp_lora_path)
-        
-        # Create the lora config
-        lora_configs = [{
-            'name': temp_lora_name,
-            'scale': lora_scale,
-        }]
-        
-        # Determine backend and source model
-        backend = "MLX (Apple Silicon)"  # Default to MLX
-        source_model = "Z-Image-Turbo-MLX"
-        
-        # Call the save function
-        result = save_fused_model(
-            model_name=output_name,
-            backend=backend,
-            source_model=source_model,
-            lora_configs=lora_configs,
-            save_mlx=save_mlx,
-            save_pytorch=save_pytorch,
-            save_comfyui=save_comfyui,
-            progress=progress,
-        )
-        
-        return result
+            try:
+                progress(pct, desc=desc)
+            except:
+                pass
     
-    finally:
-        # Clean up temp file
-        if temp_lora_path.exists():
-            temp_lora_path.unlink()
+    try:
+        # 1. Export standalone LoRA
+        if save_lora_only:
+            update_progress(0.1, "Exporting LoRA...")
+            lora_output = LORAS_DIR / f"{output_name}.safetensors"
+            LORAS_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(lora_path, lora_output)
+            results.append(f"✅ LoRA: {lora_output}")
+        
+        # 2. Export MLX model with fused LoRA
+        if save_mlx:
+            update_progress(0.2, "Exporting MLX model...")
+            result = _export_fused_mlx_model(lora_path, output_name, lora_scale, update_progress)
+            results.append(result)
+        
+        # 3. Export PyTorch model with fused LoRA
+        if save_pytorch:
+            update_progress(0.5, "Exporting PyTorch model...")
+            result = _export_fused_pytorch_model(lora_path, output_name, lora_scale, update_progress)
+            results.append(result)
+        
+        # 4. Export ComfyUI checkpoint with fused LoRA
+        if save_comfyui:
+            update_progress(0.7, "Exporting ComfyUI checkpoint...")
+            result = _export_fused_comfyui_model(lora_path, output_name, lora_scale, update_progress)
+            results.append(result)
+        
+        update_progress(1.0, "Done!")
+        return "\n".join(results) if results else "❌ No export options selected"
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"❌ Export error: {e}"
+
+
+def _export_fused_mlx_model(lora_path: Path, output_name: str, lora_scale: float, progress_fn) -> str:
+    """Export an MLX model with LoRA fused into weights."""
+    try:
+        import mlx.core as mx
+        import numpy as np
+        from safetensors.numpy import save_file
+        import json
+        
+        # Add src to path for lora import
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        from lora import load_lora, apply_lora_to_model
+        from z_image_mlx import ZImageTransformer2DModel
+    except ImportError as e:
+        return f"❌ MLX export requires: {e}"
+    
+    # Source model path - try multiple common locations
+    source_path = None
+    for model_name in ["Z-Image-Turbo-MLX", "mlx_model"]:
+        candidate = MLX_MODELS_DIR / model_name
+        if candidate.exists() and (candidate / "weights.safetensors").exists():
+            source_path = candidate
+            break
+    
+    if source_path is None:
+        return f"❌ MLX source model not found in: {MLX_MODELS_DIR}"
+    
+    # Output path
+    output_path = MLX_MODELS_DIR / output_name
+    if output_path.exists():
+        return f"❌ Model '{output_name}' already exists"
+    
+    progress_fn(0.25, "Loading MLX model...")
+    
+    # Load model config
+    with open(source_path / "config.json", "r") as f:
+        config = json.load(f)
+    
+    # Create and load model
+    model = ZImageTransformer2DModel(config)
+    weights = mx.load(str(source_path / "weights.safetensors"))
+    
+    # MLX model weights are already in correct format, load directly
+    # Filter out any None keys or pad_token weights
+    processed_weights = {k: v for k, v in weights.items() if k and "pad_token" not in k}
+    model.load_weights(list(processed_weights.items()), strict=False)
+    
+    progress_fn(0.35, "Applying LoRA...")
+    
+    # Apply LoRA
+    lora_weights = load_lora(lora_path)
+    apply_lora_to_model(model, lora_weights, scale=lora_scale, verbose=False)
+    
+    progress_fn(0.4, "Saving fused MLX model...")
+    
+    # Save fused weights
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    fused_weights = {}
+    for name, param in model.named_modules():
+        if hasattr(param, 'weight'):
+            fused_weights[f"{name}.weight"] = np.array(param.weight)
+        if hasattr(param, 'bias') and param.bias is not None:
+            fused_weights[f"{name}.bias"] = np.array(param.bias)
+    
+    save_file(fused_weights, str(output_path / "weights.safetensors"))
+    
+    # Copy auxiliary files
+    for file in ["config.json", "vae_config.json", "vae.safetensors", 
+                 "text_encoder_config.json", "text_encoder.safetensors"]:
+        if (source_path / file).exists():
+            shutil.copy(source_path / file, output_path / file)
+    
+    for folder in ["tokenizer", "scheduler"]:
+        if (source_path / folder).exists():
+            shutil.copytree(source_path / folder, output_path / folder)
+    
+    # Create metadata
+    metadata = {
+        "base_model": "Z-Image-Turbo-MLX",
+        "fused_lora": str(lora_path.name),
+        "lora_scale": lora_scale,
+        "created": datetime.now().isoformat(),
+    }
+    with open(output_path / "lora_fusion_info.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    return f"✅ MLX: {output_path}"
+
+
+def _export_fused_pytorch_model(lora_path: Path, output_name: str, lora_scale: float, progress_fn) -> str:
+    """Export a PyTorch model with LoRA fused into weights."""
+    try:
+        import torch
+        import numpy as np
+        import json
+        
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        from lora import load_lora, parse_lora_weights
+    except ImportError as e:
+        return f"❌ PyTorch export requires: {e}"
+    
+    # Source model path
+    source_path = PYTORCH_MODELS_DIR / "Z-Image-Turbo"
+    if not source_path.exists():
+        return f"❌ PyTorch source model not found: {source_path}"
+    
+    # Output path
+    output_path = PYTORCH_MODELS_DIR / output_name
+    if output_path.exists():
+        return f"❌ Model '{output_name}' already exists"
+    
+    progress_fn(0.55, "Loading PyTorch model...")
+    
+    try:
+        from diffusers import DiffusionPipeline
+        from src.training.models import ZImagePipeline
+    except ImportError:
+        try:
+            from training.models import ZImagePipeline
+        except ImportError:
+            # Fallback: try loading directly from diffusers
+            from diffusers import DiffusionPipeline as ZImagePipeline
+    
+    pipe = ZImagePipeline.from_pretrained(
+        str(source_path),
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=False,
+    )
+    
+    progress_fn(0.6, "Applying LoRA to PyTorch model...")
+    
+    # Apply LoRA
+    lora_weights = load_lora(lora_path)
+    _apply_lora_to_pytorch_transformer(pipe.transformer, lora_weights, lora_scale)
+    
+    progress_fn(0.65, "Saving PyTorch model...")
+    
+    # Save pipeline
+    pipe.save_pretrained(str(output_path))
+    
+    # Create metadata
+    metadata = {
+        "base_model": "Z-Image-Turbo",
+        "fused_lora": str(lora_path.name),
+        "lora_scale": lora_scale,
+        "created": datetime.now().isoformat(),
+    }
+    with open(output_path / "lora_fusion_info.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    return f"✅ PyTorch: {output_path}"
+
+
+def _apply_lora_to_pytorch_transformer(model, lora_weights, scale=1.0):
+    """Apply MLX LoRA weights to a PyTorch transformer model."""
+    import torch
+    import numpy as np
+    
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from lora import parse_lora_weights
+    
+    lora_pairs = parse_lora_weights(lora_weights)
+    
+    for model_key, (lora_a, lora_b) in lora_pairs.items():
+        layer_path = model_key.rsplit(".weight", 1)[0]
+        
+        try:
+            parts = layer_path.split(".")
+            layer = model
+            for part in parts:
+                if part.isdigit():
+                    layer = layer[int(part)]
+                else:
+                    layer = getattr(layer, part)
+            
+            if not hasattr(layer, 'weight'):
+                continue
+            
+            a_np = np.array(lora_a)
+            b_np = np.array(lora_b)
+            
+            if len(a_np.shape) == 2 and len(b_np.shape) == 2:
+                delta_np = b_np @ a_np
+            else:
+                continue
+            
+            with torch.no_grad():
+                delta_torch = torch.from_numpy(delta_np * scale).to(layer.weight.dtype).to(layer.weight.device)
+                if delta_torch.shape == layer.weight.shape:
+                    layer.weight.add_(delta_torch)
+                    
+        except (AttributeError, IndexError, KeyError):
+            continue
+
+
+def _export_fused_comfyui_model(lora_path: Path, output_name: str, lora_scale: float, progress_fn) -> str:
+    """Export a ComfyUI single-file checkpoint with LoRA fused."""
+    try:
+        import torch
+        import numpy as np
+        import json
+        from safetensors.torch import save_file as torch_save_safetensors
+        
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        from lora import load_lora
+        from convert_pytorch_to_comfyui import (
+            convert_transformer_key_to_comfyui,
+            convert_text_encoder_key_to_comfyui,
+            convert_vae_key_to_comfyui,
+        )
+    except ImportError as e:
+        return f"❌ ComfyUI export requires: {e}"
+    
+    # Source model path
+    source_path = PYTORCH_MODELS_DIR / "Z-Image-Turbo"
+    if not source_path.exists():
+        return f"❌ PyTorch source model not found: {source_path}"
+    
+    # Output path
+    COMFYUI_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    output_file = COMFYUI_MODELS_DIR / f"{output_name}.safetensors"
+    if output_file.exists():
+        return f"❌ ComfyUI model '{output_name}.safetensors' already exists"
+    
+    progress_fn(0.75, "Loading PyTorch model for ComfyUI...")
+    
+    try:
+        from src.training.models import ZImagePipeline
+    except ImportError:
+        try:
+            from training.models import ZImagePipeline
+        except ImportError:
+            from diffusers import DiffusionPipeline as ZImagePipeline
+    
+    # Load in bfloat16 for smaller file size (matches typical ComfyUI Z-Image checkpoints)
+    pipe = ZImagePipeline.from_pretrained(
+        str(source_path),
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+    
+    progress_fn(0.8, "Applying LoRA and converting...")
+    
+    # Apply LoRA (convert to float32 for computation, then back to bfloat16)
+    pipe.transformer = pipe.transformer.to(torch.float32)
+    lora_weights = load_lora(lora_path)
+    _apply_lora_to_pytorch_transformer(pipe.transformer, lora_weights, lora_scale)
+    pipe.transformer = pipe.transformer.to(torch.bfloat16)
+    
+    # Convert TRANSFORMER ONLY to ComfyUI format (no VAE/TextEncoder)
+    # VAE and TextEncoder are loaded separately by ComfyUI
+    all_weights = {}
+    
+    # Transformer with QKV fusion
+    transformer = pipe.transformer.state_dict()
+    qkv_groups = {}
+    other_keys = []
+    
+    for key in transformer.keys():
+        if ".attention.to_q.weight" in key:
+            base_key = key.replace(".to_q.weight", "")
+            if base_key not in qkv_groups:
+                qkv_groups[base_key] = {}
+            qkv_groups[base_key]["q"] = key
+        elif ".attention.to_k.weight" in key:
+            base_key = key.replace(".to_k.weight", "")
+            if base_key not in qkv_groups:
+                qkv_groups[base_key] = {}
+            qkv_groups[base_key]["k"] = key
+        elif ".attention.to_v.weight" in key:
+            base_key = key.replace(".to_v.weight", "")
+            if base_key not in qkv_groups:
+                qkv_groups[base_key] = {}
+            qkv_groups[base_key]["v"] = key
+        else:
+            other_keys.append(key)
+    
+    for base_key, qkv_keys in qkv_groups.items():
+        if "q" in qkv_keys and "k" in qkv_keys and "v" in qkv_keys:
+            q = transformer[qkv_keys["q"]]
+            k = transformer[qkv_keys["k"]]
+            v = transformer[qkv_keys["v"]]
+            fused = torch.cat([q, k, v], dim=0)
+            comfyui_key = convert_transformer_key_to_comfyui(f"{base_key}.qkv.weight")
+            all_weights[comfyui_key] = fused
+    
+    for key in other_keys:
+        comfyui_key = convert_transformer_key_to_comfyui(key)
+        all_weights[comfyui_key] = transformer[key]
+    
+    # NOTE: Not including VAE and TextEncoder - ComfyUI loads these separately
+    # This matches the typical 12GB Z-Image checkpoint format
+    
+    progress_fn(0.9, "Saving ComfyUI checkpoint (float16, transformer only)...")
+    
+    torch_save_safetensors(all_weights, str(output_file))
+    file_size = output_file.stat().st_size / (1024 * 1024 * 1024)
+    
+    return f"✅ ComfyUI: {output_file} ({file_size:.2f}GB, transformer only)"
 
 
 def get_training_progress() -> Tuple[str, float, str]:
