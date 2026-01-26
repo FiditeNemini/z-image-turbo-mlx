@@ -2316,24 +2316,24 @@ def blend_tiles(output, tile, y_start, x_start, tile_h, tile_w, overlap, full_h,
     # Top edge
     if y_start > 0:
         for i in range(min(overlap, tile_h)):
-            weight = weight.at[i, :].set(weight[i, :] * (i / overlap))
+            weight[i, :] = weight[i, :] * (i / overlap)
     
     # Left edge
     if x_start > 0:
         for j in range(min(overlap, tile_w)):
-            weight = weight.at[:, j].set(weight[:, j] * (j / overlap))
+            weight[:, j] = weight[:, j] * (j / overlap)
     
     # Bottom edge
     if y_start + tile_h < full_h:
         for i in range(min(overlap, tile_h)):
             idx = tile_h - 1 - i
-            weight = weight.at[idx, :].set(weight[idx, :] * (i / overlap))
+            weight[idx, :] = weight[idx, :] * (i / overlap)
     
     # Right edge
     if x_start + tile_w < full_w:
         for j in range(min(overlap, tile_w)):
             idx = tile_w - 1 - j
-            weight = weight.at[:, idx].set(weight[:, idx] * (j / overlap))
+            weight[:, idx] = weight[:, idx] * (j / overlap)
     
     # Expand weight to match tile shape [B, H, W, C]
     weight = weight[None, :, :, None]
@@ -2344,7 +2344,7 @@ def blend_tiles(output, tile, y_start, x_start, tile_h, tile_w, overlap, full_h,
     
     current = output[:, y_start:y_end, x_start:x_end, :]
     blended = current + (tile - current) * weight
-    output = output.at[:, y_start:y_end, x_start:x_end, :].set(blended)
+    output[:, y_start:y_end, x_start:x_end, :] = blended
     
     return output
 
@@ -2646,28 +2646,28 @@ def _latent_upscale_tiled(latents, prompt_embeds, model, scheduler, timesteps,
                 if y_start > 0:
                     for i in range(min(overlap, tile_h)):
                         alpha = i / overlap
-                        weight = weight.at[:, i, :, :].set(weight[:, i, :, :] * alpha)
+                        weight[:, i, :, :] = weight[:, i, :, :] * alpha
                 
                 if x_start > 0:
                     for j in range(min(overlap, tile_w)):
                         alpha = j / overlap
-                        weight = weight.at[:, :, j, :].set(weight[:, :, j, :] * alpha)
+                        weight[:, :, j, :] = weight[:, :, j, :] * alpha
                 
                 if y_end < full_h:
                     for i in range(min(overlap, tile_h)):
                         idx = tile_h - 1 - i
                         alpha = i / overlap
-                        weight = weight.at[:, idx, :, :].set(weight[:, idx, :, :] * alpha)
+                        weight[:, idx, :, :] = weight[:, idx, :, :] * alpha
                 
                 if x_end < full_w:
                     for j in range(min(overlap, tile_w)):
                         idx = tile_w - 1 - j
                         alpha = j / overlap
-                        weight = weight.at[:, :, idx, :].set(weight[:, :, idx, :] * alpha)
+                        weight[:, :, idx, :] = weight[:, :, idx, :] * alpha
                 
                 # Accumulate weighted tile
-                output = output.at[:, y_start:y_end, x_start:x_end, :].add(denoised_tile * weight)
-                weight_sum = weight_sum.at[:, y_start:y_end, x_start:x_end, :].add(weight)
+                output[:, y_start:y_end, x_start:x_end, :] += denoised_tile * weight
+                weight_sum[:, y_start:y_end, x_start:x_end, :] += weight
         
         # Normalize by weight sum
         latents = output / (weight_sum + 1e-8)
