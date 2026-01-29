@@ -1,16 +1,26 @@
-# Z-Image-Turbo MLX
+# Z-Image MLX
 
-High-quality image generation on Apple Silicon using the Z-Image-Turbo model, ported to MLX.
+High-quality image generation on Apple Silicon using Z-Image models, ported to MLX.
 
-![Z-Image-Turbo MLX](assets/z-image-turbo-mlx.png)
+![Z-Image MLX](assets/z-image-turbo-mlx.png)
 
 ## Overview
 
-Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-quality 1024×1024 images in just 9 steps. This repository provides an MLX implementation optimized for Apple Silicon Macs, along with the original PyTorch reference implementation.
+This repository provides MLX implementations of the Z-Image family of 6B parameter diffusion transformer models, optimized for Apple Silicon Macs:
+
+| Model | Steps | CFG | Negative Prompts | Best For |
+|-------|-------|-----|------------------|----------|
+| **Z-Image (Base)** | 28-50 | 3.0-5.0 | ✅ Yes | Fine-tuning, maximum quality |
+| **Z-Image-Turbo** | 9 | 0.0 (disabled) | ❌ No | Fast generation |
+
+Both models generate high-quality 1024×1024 images with the same architecture. The Base model offers more control with CFG and negative prompts, while Turbo is distilled for speed.
 
 ### Key Features
 
-- **Fast generation**: 9 inference steps for high-quality results
+- **Dual model support**: Both Z-Image Base and Z-Image-Turbo with automatic parameter adjustment
+- **Negative prompting**: Full support for negative prompts (Base model only)
+- **Classifier-free guidance**: Adjustable CFG scale 0.0-10.0 (Base model)
+- **Fast generation**: 9 inference steps for Turbo, 28-50 for Base
 - **LeMiCa speed acceleration**: Training-free caching for up to 30% faster generation
 - **Apple Silicon optimized**: Native MLX implementation for M1/M2/M3/M4 Macs
 - **Bit-perfect accuracy**: MLX output matches PyTorch within 1 pixel per channel
@@ -24,6 +34,7 @@ Z-Image-Turbo is a 6B parameter diffusion transformer model that generates high-
 - **Comprehensive logging**: Detailed logs in `./logs/` for troubleshooting
 - **Scrollable LoRA list**: Browse all installed LoRAs with improved UI
 - **Gradio UI**: User-friendly web interface for image generation
+- **LoRA fine-tuning**: Train custom LoRAs (Base model recommended)
 
 ## 📚 Documentation
 
@@ -59,10 +70,15 @@ pip install -r requirements.txt
 
 # Convert model weights (auto-downloads from Hugging Face if not found)
 cd src
-python convert_to_mlx.py
+
+# Convert Z-Image Base (recommended for fine-tuning)
+python convert_to_mlx.py --model_type base
+
+# Or convert Z-Image-Turbo (fast generation)
+python convert_to_mlx.py --model_type turbo
 ```
 
-The conversion script will automatically download the Z-Image-Turbo model from Hugging Face (~20GB) if it's not already present in `models/pytorch/Z-Image-Turbo/`.
+The conversion script will automatically download the selected model from Hugging Face (~20GB) if it's not already present.
 
 ## Usage
 
@@ -90,6 +106,18 @@ python generate_mlx.py --prompt "A beautiful sunset over the ocean" --output sun
 #### Full Options
 
 ```bash
+# Z-Image Base (full control)
+python src/generate_mlx.py \
+    --prompt "Your detailed prompt here" \
+    --negative_prompt "blurry, low quality" \
+    --output output.png \
+    --seed 42 \
+    --steps 28 \
+    --guidance_scale 4.0 \
+    --height 1024 \
+    --width 1024
+
+# Z-Image-Turbo (fast)
 python src/generate_mlx.py \
     --prompt "Your detailed prompt here" \
     --output output.png \
@@ -135,10 +163,12 @@ Models are organized by platform:
 ```
 models/
 ├── mlx/                    # MLX-converted models (used for generation)
-│   ├── mlx_model/          # Default converted model
+│   ├── Z-Image-MLX/        # Base model (recommended for fine-tuning)
+│   ├── Z-Image-Turbo-MLX/  # Turbo model (fast generation)
 │   └── RedCraft-AIO/       # Example: fine-tuned variant
 └── pytorch/                # PyTorch/Diffusers format models
-    └── Z-Image-Turbo/      # Original model (for conversion)
+    ├── Z-Image/            # Base model
+    └── Z-Image-Turbo/      # Turbo model
 ```
 
 ### Migrating from Previous Versions
@@ -233,7 +263,7 @@ models/loras/
 | **Subfolder Support** | Organize LoRAs in categories |
 | **Live Tags** | See active LoRAs as `<lora:name:weight>` |
 
-> **Note**: Only Z-Image-Turbo compatible LoRAs work. LoRAs trained for SDXL, SD1.5, Flux, etc. are NOT compatible.
+> **Note**: Only Z-Image compatible LoRAs work. LoRAs trained for SDXL, SD1.5, Flux, etc. are NOT compatible. For training new LoRAs, the Base model is recommended.
 
 ## Speed Acceleration (LeMiCa)
 
@@ -351,6 +381,15 @@ z-image-turbo-mlx/
 | **VAE** | FLUX.1-dev compatible (16 latent channels) |
 | **Scheduler** | FlowMatchEulerDiscreteScheduler (shift=3.0) |
 | **Resolution** | 1024×1024 (128×128 latents) |
+
+### Model Variants
+
+| Variant | HuggingFace ID | Steps | CFG | Negative Prompts |
+|---------|----------------|-------|-----|------------------|
+| **Base** | `Tongyi-MAI/Z-Image` | 28-50 | 3.0-5.0 | ✅ Yes |
+| **Turbo** | `Tongyi-MAI/Z-Image-Turbo` | 9 | 0.0 | ❌ No |
+
+The Base model is recommended for fine-tuning/LoRA training. Turbo is distilled for fast inference.
 
 ## Performance
 

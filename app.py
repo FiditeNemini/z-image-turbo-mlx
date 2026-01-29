@@ -9,6 +9,19 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "false"
 # Force MPS to use float32 fallback for unsupported ops
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+# Ensure localhost is not routed through any proxy (fixes Gradio startup check)
+os.environ["no_proxy"] = os.environ.get("no_proxy", "") + ",localhost,127.0.0.1,::1"
+
+# Monkey-patch Gradio's url_ok to bypass the HEAD request check that times out on some systems
+# This allows running locally without requiring share=True
+def _patch_gradio_url_ok():
+    try:
+        import gradio.networking as gn
+        gn.url_ok = lambda url: True
+    except Exception:
+        pass  # Gradio not yet imported or structure changed
+
+_patch_gradio_url_ok()
 
 # Use spawn instead of fork for multiprocessing to avoid MPS issues
 import multiprocessing
@@ -125,7 +138,40 @@ SINGLE_FILE_MODEL_PATH = "./models/single_file"  # For single-file .safetensors 
 LORAS_DIR = "./models/loras"  # LoRA models directory (supports subfolders)
 UPSCALERS_DIR = "./models/upscalers"  # ESRGAN upscaler models directory
 
-# Z-Image-Turbo architecture signature keys
+# Hugging Face model IDs
+HF_MODEL_ID_TURBO = "Tongyi-MAI/Z-Image-Turbo"
+HF_MODEL_ID_BASE = "Tongyi-MAI/Z-Image"
+
+# Model type constants
+MODEL_TYPE_BASE = "base"
+MODEL_TYPE_TURBO = "turbo"
+
+# Model type presets - recommended parameters for each model type
+MODEL_TYPE_PRESETS = {
+    MODEL_TYPE_BASE: {
+        "steps": 28,
+        "guidance_scale": 4.0,
+        "supports_negative_prompt": True,
+        "supports_cfg": True,
+        "time_shift": 3.0,
+        "max_steps": 50,
+        "description": "Full model for fine-tuning, supports CFG and negative prompts",
+    },
+    MODEL_TYPE_TURBO: {
+        "steps": 9,
+        "guidance_scale": 0.0,
+        "supports_negative_prompt": False,
+        "supports_cfg": False,
+        "time_shift": 3.0,
+        "max_steps": 20,
+        "description": "Distilled model for fast inference, no CFG needed",
+    },
+}
+
+# Current model type (detected on model load)
+_current_model_type = MODEL_TYPE_TURBO  # Default to Turbo for backward compatibility
+
+# Z-Image architecture signature keys
 # These patterns identify Z-Image-Turbo compatible models
 ZIMAGE_SIGNATURE_KEYS = {
     # Transformer keys (with or without diffusion_ prefix)
@@ -1125,9 +1171,67 @@ def _is_quantized_weights(weights: dict) -> bool:
     return False
 
 
+def detect_model_type(model_path: str) -> str:
+    """
+    Detect whether a model is Base or Turbo variant.
+    
+    Detection priority:
+    1. config.json "model_type" field (explicit)
+    2. Path name containing "turbo" (case-insensitive)
+    3. Default to Base (safer for fine-tuning workflows)
+    
+    Args:
+        model_path: Path to the model directory
+        
+    Returns:
+        MODEL_TYPE_BASE or MODEL_TYPE_TURBO
+    """
+    from pathlib import Path
+    
+    model_path = Path(model_path)
+    
+    # Check config.json for explicit model_type
+    config_path = model_path / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            if "model_type" in config:
+                model_type = config["model_type"].lower()
+                if model_type in [MODEL_TYPE_BASE, MODEL_TYPE_TURBO]:
+                    logger.debug(f"Model type from config: {model_type}")
+                    return model_type
+        except Exception as e:
+            logger.debug(f"Could not read model_type from config: {e}")
+    
+    # Check path name for "turbo" (case-insensitive)
+    path_lower = str(model_path).lower()
+    if "turbo" in path_lower:
+        logger.debug(f"Model type detected from path (turbo): {model_path}")
+        return MODEL_TYPE_TURBO
+    
+    # Default to Base for models without "turbo" in name
+    # This is safer because Base settings work for fine-tuning
+    logger.debug(f"Model type defaulting to base: {model_path}")
+    return MODEL_TYPE_BASE
+
+
+def get_current_model_type() -> str:
+    """Get the currently loaded model type."""
+    global _current_model_type
+    return _current_model_type
+
+
+def get_model_type_preset(model_type: str = None) -> dict:
+    """Get the preset parameters for a model type."""
+    if model_type is None:
+        model_type = _current_model_type
+    return MODEL_TYPE_PRESETS.get(model_type, MODEL_TYPE_PRESETS[MODEL_TYPE_TURBO])
+
+
 def load_mlx_models(model_path=None):
     """Load MLX models (cached globally)"""
-    global _mlx_models, _current_mlx_model_path
+    global _mlx_models, _current_mlx_model_path, _current_model_type
     
     # Use current selected model path if not specified
     if model_path is None:
@@ -1150,6 +1254,10 @@ def load_mlx_models(model_path=None):
         _current_mlx_model_path = model_path
         global _current_applied_lora
         _current_applied_lora = None  # Reset LoRA when model changes
+    
+    # Detect model type (Base vs Turbo)
+    _current_model_type = detect_model_type(model_path)
+    logger.info(f"Detected model type: {_current_model_type}")
     
     import mlx.core as mx
     import mlx.nn as nn
@@ -1272,7 +1380,7 @@ def load_mlx_models(model_path=None):
 
 def load_pytorch_pipeline(model_path=None):
     """Load PyTorch pipeline (cached globally)"""
-    global _pytorch_pipe, _current_pytorch_model_path
+    global _pytorch_pipe, _current_pytorch_model_path, _current_model_type
     
     if not PYTORCH_AVAILABLE:
         raise ImportError(
@@ -1295,6 +1403,10 @@ def load_pytorch_pipeline(model_path=None):
         _pytorch_pipe = None
     
     _current_pytorch_model_path = model_path
+    
+    # Detect model type (Base vs Turbo)
+    _current_model_type = detect_model_type(model_path)
+    logger.info(f"Detected model type: {_current_model_type}")
     
     # Determine device
     if torch.backends.mps.is_available():
@@ -2874,7 +2986,7 @@ Keep it under 80 words. Respond ONLY with the prompt, no explanations."""
 
 def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_configs=None,
                  latent_scale=1.0, latent_steps=0, latent_denoise=0.55, latent_interp='cubic',
-                 cache_mode=None):
+                 cache_mode=None, negative_prompt="", guidance_scale=0.0):
     """Generate image using MLX backend
     
     Args:
@@ -2884,6 +2996,8 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
         latent_denoise: Denoising strength for latent upscale (0.0-1.0)
         latent_interp: Interpolation mode ('nearest', 'linear', 'cubic')
         cache_mode: LeMiCa cache mode ('slow', 'medium', 'fast') or None to disable
+        negative_prompt: Negative prompt for CFG (only effective when guidance_scale > 0)
+        guidance_scale: CFG scale (0.0 = no guidance, 3.0-5.0 recommended for Base model)
     """
     import mlx.core as mx
     global _mlx_models, _current_applied_lora
@@ -2891,10 +3005,6 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     logger.info("=" * 60)
     logger.info("GENERATE_MLX: Starting image generation")
     logger.info(f"  Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
-    logger.info(f"  Size: {width}x{height}, Steps: {steps}, Time shift: {time_shift}, Seed: {seed}")
-    logger.info(f"  Cache mode: {cache_mode}")
-    logger.info(f"  Latent upscale: {latent_scale}x, denoise: {latent_denoise}, steps: {latent_steps}, interp: {latent_interp}")
-    logger.info(f"  LoRA configs: {lora_configs}")
     
     # Determine if latent upscaling is enabled
     do_latent_upscale = latent_scale > 1.0 and latent_denoise > 0.0
@@ -2920,6 +3030,17 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
         need_lora_apply = len(lora_configs) > 0
     
     models = load_mlx_models()
+    
+    # Determine if CFG is enabled - MUST be after load_mlx_models which sets _current_model_type
+    do_cfg = guidance_scale > 0.0 and _current_model_type == MODEL_TYPE_BASE
+    
+    if do_cfg and negative_prompt:
+        logger.info(f"  Negative: {negative_prompt[:100]}{'...' if len(negative_prompt) > 100 else ''}")
+    logger.info(f"  Size: {width}x{height}, Steps: {steps}, Time shift: {time_shift}, Seed: {seed}")
+    logger.info(f"  Model type: {_current_model_type}, CFG scale: {guidance_scale}, CFG enabled: {do_cfg}")
+    logger.info(f"  Cache mode: {cache_mode}")
+    logger.info(f"  Latent upscale: {latent_scale}x, denoise: {latent_denoise}, steps: {latent_steps}, interp: {latent_interp}")
+    logger.info(f"  LoRA configs: {lora_configs}")
     
     model = models["model"]
     vae = models["vae"]
@@ -2949,7 +3070,7 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     
     progress(0.1, desc="Encoding prompt...")
     
-    # Apply chat template
+    # Apply chat template for positive prompt
     messages = [{"role": "user", "content": prompt}]
     prompt_text = tokenizer.apply_chat_template(
         messages,
@@ -2968,11 +3089,38 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     input_ids = mx.array(text_inputs["input_ids"])
     attention_mask = mx.array(text_inputs["attention_mask"])
     
-    # Text encoder forward
+    # Text encoder forward for positive prompt
     logger.debug("Running text encoder forward pass...")
     prompt_embeds = text_encoder(input_ids, attention_mask=attention_mask)
     prompt_embeds_list = [prompt_embeds[i] for i in range(len(prompt_embeds))]
     logger.debug(f"Text embeddings shape: {prompt_embeds.shape}")
+    
+    # Encode negative prompt for CFG (only if CFG is enabled)
+    negative_prompt_embeds_list = None
+    if do_cfg:
+        progress(0.12, desc="Encoding negative prompt...")
+        neg_text = negative_prompt if negative_prompt else ""
+        neg_messages = [{"role": "user", "content": neg_text}]
+        neg_prompt_text = tokenizer.apply_chat_template(
+            neg_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        
+        neg_text_inputs = tokenizer(
+            neg_prompt_text,
+            padding="max_length",
+            max_length=512,
+            truncation=True,
+            return_tensors="np",
+        )
+        
+        neg_input_ids = mx.array(neg_text_inputs["input_ids"])
+        neg_attention_mask = mx.array(neg_text_inputs["attention_mask"])
+        
+        negative_prompt_embeds = text_encoder(neg_input_ids, attention_mask=neg_attention_mask)
+        negative_prompt_embeds_list = [negative_prompt_embeds[i] for i in range(len(negative_prompt_embeds))]
+        logger.debug(f"Negative text embeddings shape: {negative_prompt_embeds.shape}")
     
     progress(0.2, desc="Preparing latents...")
     
@@ -3003,7 +3151,7 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     # Denoising loop
     scheduler.set_timesteps(steps)
     timesteps = scheduler.timesteps
-    logger.info(f"Starting denoising loop: {steps} steps")
+    logger.info(f"Starting denoising loop: {steps} steps (CFG: {do_cfg}, scale: {guidance_scale})")
     
     for i, t in enumerate(timesteps):
         progress(0.2 + 0.6 * (i / len(timesteps)), desc=f"Denoising step {i+1}/{steps}...")
@@ -3012,12 +3160,32 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
         # Timestep
         t_mx = mx.array([(1000.0 - t.item()) / 1000.0])
         
-        # Forward pass
-        noise_pred = model(latents, t_mx, prompt_embeds_list)
-        
-        # Negate noise prediction (as PyTorch pipeline does)
-        noise_pred = -noise_pred
-        mx.eval(noise_pred)
+        if do_cfg:
+            # Classifier-Free Guidance: run model twice (unconditional and conditional)
+            # Match diffusers ZImagePipeline CFG implementation exactly
+            
+            # 1. Unconditional forward pass (negative prompt) - no negation yet
+            noise_pred_neg = model(latents, t_mx, negative_prompt_embeds_list)
+            mx.eval(noise_pred_neg)
+            
+            # 2. Conditional forward pass (positive prompt) - no negation yet
+            noise_pred_pos = model(latents, t_mx, prompt_embeds_list)
+            mx.eval(noise_pred_pos)
+            
+            # 3. Apply diffusers CFG formula: pred = pos + scale * (pos - neg)
+            # This is different from standard CFG (neg + scale*(pos-neg))
+            noise_pred = noise_pred_pos + guidance_scale * (noise_pred_pos - noise_pred_neg)
+            
+            # 4. Negate AFTER CFG (as diffusers does)
+            noise_pred = -noise_pred
+            mx.eval(noise_pred)
+        else:
+            # No CFG - single forward pass (Turbo mode)
+            noise_pred = model(latents, t_mx, prompt_embeds_list)
+            
+            # Negate noise prediction (as PyTorch pipeline does)
+            noise_pred = -noise_pred
+            mx.eval(noise_pred)
         
         # Scheduler step
         noise_pred_sq = noise_pred.squeeze(2)
@@ -3083,8 +3251,14 @@ def generate_mlx(prompt, width, height, steps, time_shift, seed, progress, lora_
     return Image.fromarray(image)
 
 
-def generate_pytorch(prompt, width, height, steps, time_shift, seed, progress):
-    """Generate image using PyTorch backend"""
+def generate_pytorch(prompt, width, height, steps, time_shift, seed, progress,
+                     negative_prompt="", guidance_scale=0.0):
+    """Generate image using PyTorch backend
+    
+    Args:
+        negative_prompt: Negative prompt for CFG (only effective with Base model and guidance_scale > 0)
+        guidance_scale: CFG scale (0.0 = no guidance, 3.0-5.0 recommended for Base model)
+    """
     pipe = load_pytorch_pipeline()
     
     # Update scheduler with time shift
@@ -3098,21 +3272,33 @@ def generate_pytorch(prompt, width, height, steps, time_shift, seed, progress):
     else:
         device = "cpu"
     
+    # Determine if CFG should be used (only for Base model)
+    do_cfg = guidance_scale > 0.0 and _current_model_type == MODEL_TYPE_BASE
+    actual_guidance_scale = guidance_scale if do_cfg else 0.0
+    
     progress(0.1, desc="Generating with PyTorch...")
+    logger.info(f"PyTorch generation: CFG={do_cfg}, scale={actual_guidance_scale}")
     
     def callback_fn(pipe_obj, step, timestep, callback_kwargs):
         progress(0.1 + 0.8 * (step / steps), desc=f"Denoising step {step+1}/{steps}...")
         return callback_kwargs
     
-    image = pipe(
-        prompt=prompt,
-        height=height,
-        width=width,
-        num_inference_steps=steps,
-        guidance_scale=0.0,
-        generator=torch.Generator(device).manual_seed(seed),
-        callback_on_step_end=callback_fn,
-    ).images[0]
+    # Build pipeline arguments
+    pipe_kwargs = {
+        "prompt": prompt,
+        "height": height,
+        "width": width,
+        "num_inference_steps": steps,
+        "guidance_scale": actual_guidance_scale,
+        "generator": torch.Generator(device).manual_seed(seed),
+        "callback_on_step_end": callback_fn,
+    }
+    
+    # Add negative prompt if CFG is enabled
+    if do_cfg and negative_prompt:
+        pipe_kwargs["negative_prompt"] = negative_prompt
+    
+    image = pipe(**pipe_kwargs).images[0]
     
     return image
 
@@ -3384,7 +3570,8 @@ def save_selected_or_all(selected_index, png_path, jpg_path, prompt, seed, datas
 def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, model_name, 
                    lora_configs=None, lora_tags="", 
                    latent_scale=1.0, latent_steps=0, latent_denoise=0.55, latent_interp='cubic',
-                   upscaler_name="None", upscale_factor=2.0, cache_mode=None, progress=gr.Progress()):
+                   upscaler_name="None", upscale_factor=2.0, cache_mode=None, 
+                   negative_prompt="", guidance_scale=0.0, progress=gr.Progress()):
     """Generate an image using selected backend and model
     
     Args:
@@ -3397,6 +3584,8 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
         upscaler_name: Name of ESRGAN upscaler to use (or "None" to skip)
         upscale_factor: ESRGAN scale factor (1.0-4.0)
         cache_mode: LeMiCa cache mode ('slow', 'medium', 'fast') or None for no caching
+        negative_prompt: Negative prompt for CFG (only effective with Base model)
+        guidance_scale: CFG scale (0.0 = no guidance, 3.0-5.0 recommended for Base model)
     """
     
     logger.info("=" * 60)
@@ -3404,6 +3593,7 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
     logger.info(f"  Backend: {backend}, Model: {model_name}")
     logger.info(f"  Resolution: {base_resolution}, Aspect: {aspect_ratio}")
     logger.info(f"  Steps: {steps}, Time shift: {time_shift}, Seed: {seed}")
+    logger.info(f"  CFG scale: {guidance_scale}, Negative prompt: {negative_prompt[:50] if negative_prompt else 'None'}...")
     logger.info(f"  Cache mode: {cache_mode}")
     logger.info(f"  Latent upscale: {latent_scale}x, steps={latent_steps}, denoise={latent_denoise}")
     logger.info(f"  ESRGAN upscaler: {upscaler_name}, factor={upscale_factor}")
@@ -3456,7 +3646,9 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
             latent_steps=latent_steps,
             latent_denoise=latent_denoise,
             latent_interp=latent_interp,
-            cache_mode=cache_mode
+            cache_mode=cache_mode,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale
         )
     else:
         # Select the PyTorch model
@@ -3465,7 +3657,8 @@ def generate_image(prompt, base_resolution, aspect_ratio, steps, time_shift, see
             print(f"Warning: LoRA support for PyTorch backend not yet implemented")
         if will_latent_upscale:
             print(f"Warning: Latent upscaling for PyTorch backend not yet implemented")
-        pil_image = generate_pytorch(full_prompt, width, height, steps, time_shift, seed, progress)
+        pil_image = generate_pytorch(full_prompt, width, height, steps, time_shift, seed, progress,
+                                     negative_prompt=negative_prompt, guidance_scale=guidance_scale)
     
     # Apply ESRGAN upscaling if enabled
     if will_upscale:
@@ -3675,14 +3868,14 @@ CUSTOM_CSS = """
 """
 
 # Create Gradio interface
-with gr.Blocks(title="Z-Image-Turbo") as demo:
+with gr.Blocks(title="Z-Image") as demo:
     # Inject custom CSS
     gr.HTML(CUSTOM_CSS)
     gr.Markdown(
         """
-        # 🎨 Z-Image-Turbo
+        # 🎨 Z-Image
         
-        Generate high-quality images using Z-Image-Turbo with MLX or PyTorch backend.
+        Generate high-quality images using Z-Image (Base or Turbo) with MLX or PyTorch backend.
         """
     )
     
@@ -3695,6 +3888,13 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                         placeholder="Describe the image you want to generate... (leave empty for a random idea!)",
                         lines=5,
                         max_lines=10,
+                    )
+                    
+                    negative_prompt = gr.Textbox(
+                        label="Negative Prompt",
+                        placeholder="What to avoid in the image... (only effective with Base model + CFG > 0)",
+                        lines=2,
+                        max_lines=5,
                     )
                     
                     enhance_btn = gr.Button("✨ Enhance Prompt", variant="secondary", size="sm")
@@ -3732,11 +3932,11 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                     with gr.Row():
                         steps = gr.Slider(
                             minimum=1,
-                            maximum=20,
+                            maximum=50,
                             value=9,
                             step=1,
                             label="Inference Steps",
-                            info="More steps = better quality but slower (9 recommended)",
+                            info="Turbo: 9 recommended | Base: 28-50 recommended",
                         )
                         
                         time_shift = gr.Slider(
@@ -3746,6 +3946,16 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
                             step=0.1,
                             label="Time Shift",
                             info="Scheduler shift parameter (default: 3.0)",
+                        )
+                    
+                    with gr.Row():
+                        guidance_scale = gr.Slider(
+                            minimum=0.0,
+                            maximum=10.0,
+                            value=0.0,
+                            step=0.5,
+                            label="CFG Scale",
+                            info="0 = disabled (Turbo) | 3-5 recommended for Base model",
                         )
                     
                     with gr.Row():
@@ -4284,6 +4494,42 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         outputs=[active_model_dropdown],
     )
     
+    # Auto-adjust parameters when model is selected
+    def on_model_change(model_name, current_backend):
+        """Auto-adjust UI parameters when model changes (Base vs Turbo detection)."""
+        if not model_name:
+            return gr.update(), gr.update(), gr.update()
+        
+        # Detect model type from name/path
+        model_path = None
+        if current_backend == "MLX (Apple Silicon)":
+            model_path = Path(MLX_MODELS_DIR) / model_name
+        else:
+            model_path = Path(PYTORCH_MODELS_DIR) / model_name
+        
+        if model_path and model_path.exists():
+            model_type = detect_model_type(str(model_path))
+        else:
+            # Fallback to name-based detection
+            model_type = MODEL_TYPE_TURBO if "turbo" in model_name.lower() else MODEL_TYPE_BASE
+        
+        preset = MODEL_TYPE_PRESETS[model_type]
+        
+        logger.info(f"Model changed to {model_name} (type: {model_type})")
+        logger.info(f"Auto-adjusting defaults: steps={preset['steps']}, cfg={preset['guidance_scale']}")
+        
+        # Return updates for steps, guidance_scale
+        return (
+            gr.update(value=preset["steps"]),
+            gr.update(value=preset["guidance_scale"]),
+        )
+    
+    active_model_dropdown.change(
+        fn=on_model_change,
+        inputs=[active_model_dropdown, backend],
+        outputs=[steps, guidance_scale],
+    )
+    
     # Toggle seed slider based on random checkbox
     def toggle_seed(random_checked):
         return gr.update(value=-1 if random_checked else 42, interactive=not random_checked)
@@ -4388,7 +4634,7 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
     )
     
     # Wrapper function to collect LoRA states and generate
-    def generate_with_loras(prompt, base_res, aspect, steps, time_shift, seed, backend, model, 
+    def generate_with_loras(prompt, neg_prompt, base_res, aspect, steps, time_shift, guidance, seed, backend, model, 
                            lat_scale, lat_interp, lat_steps, lat_denoise,
                            upscaler, upscale_by, lemica_cache, *lora_args):
         """Wrapper that collects LoRA component states and calls generate_image"""
@@ -4414,11 +4660,12 @@ with gr.Blocks(title="Z-Image-Turbo") as demo:
         return generate_image(prompt, base_res, aspect, steps, time_shift, seed, backend, model, 
                             lora_configs, lora_tags, 
                             lat_scale, lat_steps, lat_denoise, lat_interp,
-                            upscaler, upscale_by, cache)
+                            upscaler, upscale_by, cache,
+                            negative_prompt=neg_prompt, guidance_scale=guidance)
     
     generate_btn.click(
         fn=generate_with_loras,
-        inputs=[prompt, base_resolution, aspect_ratio, steps, time_shift, seed, backend, active_model_dropdown, 
+        inputs=[prompt, negative_prompt, base_resolution, aspect_ratio, steps, time_shift, guidance_scale, seed, backend, active_model_dropdown, 
                 latent_scale, latent_interp, latent_steps, latent_denoise,
                 upscaler_dropdown, upscale_factor, cache_mode] + all_lora_components,
         outputs=[output_gallery, temp_png_path, temp_jpg_path, stored_prompt, stored_seed, prompt],

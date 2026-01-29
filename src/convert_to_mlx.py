@@ -10,13 +10,38 @@ import shutil
 from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
-# Hugging Face model ID
-HF_MODEL_ID = "Tongyi-MAI/Z-Image-Turbo"
+# Hugging Face model IDs
+HF_MODEL_IDS = {
+    "turbo": "Tongyi-MAI/Z-Image-Turbo",
+    "base": "Tongyi-MAI/Z-Image",
+}
+
+# Default model ID (for backward compatibility)
+HF_MODEL_ID = HF_MODEL_IDS["turbo"]
 
 
-def ensure_model_downloaded(model_dir="../models/Z-Image-Turbo"):
-    """Check if model exists, download from Hugging Face if not."""
+def get_model_type_from_path(model_path: str) -> str:
+    """Detect model type from path name."""
+    path_lower = str(model_path).lower()
+    if "turbo" in path_lower:
+        return "turbo"
+    return "base"
+
+
+def ensure_model_downloaded(model_dir, model_type=None):
+    """Check if model exists, download from Hugging Face if not.
+    
+    Args:
+        model_dir: Directory to store the model
+        model_type: "turbo" or "base" - determines which HuggingFace model to download. Auto-detected from path if None.
+    """
     model_path = Path(model_dir)
+    
+    # Auto-detect model type from path if not specified
+    if model_type is None:
+        model_type = get_model_type_from_path(model_dir)
+    
+    hf_model_id = HF_MODEL_IDS.get(model_type, HF_MODEL_IDS["turbo"])
     
     # Check if model already exists (look for key files)
     transformer_path = model_path / "transformer"
@@ -25,7 +50,7 @@ def ensure_model_downloaded(model_dir="../models/Z-Image-Turbo"):
         return str(model_path)
     
     print(f"Model not found at {model_path}")
-    print(f"Downloading {HF_MODEL_ID} from Hugging Face...")
+    print(f"Downloading {hf_model_id} from Hugging Face...")
     print("This may take a while (~20GB)...")
     
     # Create parent directory if needed
@@ -33,7 +58,7 @@ def ensure_model_downloaded(model_dir="../models/Z-Image-Turbo"):
     
     # Download from Hugging Face with progress bar
     downloaded_path = snapshot_download(
-        repo_id=HF_MODEL_ID,
+        repo_id=hf_model_id,
         local_dir=str(model_path),
         local_dir_use_symlinks=False,
     )
@@ -42,8 +67,20 @@ def ensure_model_downloaded(model_dir="../models/Z-Image-Turbo"):
     return downloaded_path
 
 
-def convert_weights(model_path, output_path):
+def convert_weights(model_path, output_path, model_type=None):
+    """Convert transformer weights from PyTorch/Diffusers format to MLX format.
+    
+    Args:
+        model_path: Path to transformer weights directory or file
+        output_path: Output directory for MLX model
+        model_type: "turbo" or "base" - embedded in config for detection. Auto-detected from path if None.
+    """
+    # Auto-detect model type from path if not specified
+    if model_type is None:
+        model_type = get_model_type_from_path(model_path)
+    
     print(f"Loading weights from {model_path}")
+    print(f"Model type: {model_type}")
     
     state_dict = {}
     model_path = Path(model_path)
@@ -109,7 +146,10 @@ def convert_weights(model_path, output_path):
         # MLX nn.Linear expects (out, in) in the weight array.
         # So we can just cast to float16/float32 and convert.
         
-        # Convert to numpy/mlx
+        # Convert to numpy/mlx - handle bfloat16 by converting to float32 first
+        # MLX doesn't support bfloat16, so we convert: bfloat16 -> float32 -> float16
+        if value.dtype == torch.bfloat16:
+            value = value.float()  # Convert bfloat16 to float32
         tensor = mx.array(value.numpy().astype("float16"))
         new_state_dict[new_key] = tensor
         
@@ -152,20 +192,17 @@ def convert_weights(model_path, output_path):
         "rope_theta": src_config.get("rope_theta", 256.0),
         "axes_dims": src_config.get("axes_dims", [32, 48, 48]),
         "axes_lens": src_config.get("axes_lens", [1536, 512, 512]),
+        "model_type": model_type,  # "base" or "turbo" for detection
     }
     
-    # Save transformer weights
-    mx.save_safetensors(f"{args.output_path}/weights.safetensors", new_state_dict)
-    print(f"Saved weights to {args.output_path}/weights.safetensors")
-
     # Save transformer config
-    with open(f"{args.output_path}/config.json", "w") as f:
+    with open(str(output_dir / "config.json"), "w") as f:
         json.dump(config, f, indent=2)
     print("Saved config.json")
 
     # --- VAE Conversion ---
     print("\nConverting VAE...")
-    vae_path = f"{args.model_path.replace('transformer', 'vae')}"
+    vae_path = str(model_path).replace('transformer', 'vae')
     try:
         vae_weights = load_file(f"{vae_path}/diffusion_pytorch_model.safetensors")
         
@@ -296,8 +333,8 @@ def convert_weights(model_path, output_path):
             
             mlx_vae_weights[new_key] = mx.array(value.float().numpy())
 
-        mx.save_safetensors(f"{args.output_path}/vae.safetensors", mlx_vae_weights)
-        with open(f"{args.output_path}/vae_config.json", "w") as f:
+        mx.save_safetensors(str(output_dir / "vae.safetensors"), mlx_vae_weights)
+        with open(str(output_dir / "vae_config.json"), "w") as f:
             json.dump(vae_config, f, indent=2)
         print("Saved vae.safetensors and vae_config.json")
         
@@ -306,7 +343,7 @@ def convert_weights(model_path, output_path):
 
     # --- Text Encoder Conversion ---
     print("\nConverting Text Encoder...")
-    te_path = f"{args.model_path.replace('transformer', 'text_encoder')}"
+    te_path = str(model_path).replace('transformer', 'text_encoder')
     try:
         # Text encoder might be sharded
         # We need to load sharded weights
@@ -343,8 +380,8 @@ def convert_weights(model_path, output_path):
                 
             mlx_te_weights[new_key] = mx.array(value.float().numpy())
             
-        mx.save_safetensors(f"{args.output_path}/text_encoder.safetensors", mlx_te_weights)
-        with open(f"{args.output_path}/text_encoder_config.json", "w") as f:
+        mx.save_safetensors(str(output_dir / "text_encoder.safetensors"), mlx_te_weights)
+        with open(str(output_dir / "text_encoder_config.json"), "w") as f:
             json.dump(te_config, f, indent=2)
         print("Saved text_encoder.safetensors and text_encoder_config.json")
         
@@ -355,8 +392,8 @@ def convert_weights(model_path, output_path):
     print("\nCopying Tokenizer and Scheduler...")
     try:
         # Tokenizer
-        tokenizer_src = args.model_path.replace("transformer", "tokenizer")
-        tokenizer_dest = f"{args.output_path}/tokenizer"
+        tokenizer_src = str(model_path).replace("transformer", "tokenizer")
+        tokenizer_dest = str(output_dir / "tokenizer")
         if os.path.exists(tokenizer_src):
             if os.path.exists(tokenizer_dest):
                 shutil.rmtree(tokenizer_dest)
@@ -366,8 +403,8 @@ def convert_weights(model_path, output_path):
             print(f"Tokenizer not found at {tokenizer_src}")
             
         # Scheduler
-        scheduler_src = args.model_path.replace("transformer", "scheduler")
-        scheduler_dest = f"{args.output_path}/scheduler"
+        scheduler_src = str(model_path).replace("transformer", "scheduler")
+        scheduler_dest = str(output_dir / "scheduler")
         if os.path.exists(scheduler_src):
             if os.path.exists(scheduler_dest):
                 shutil.rmtree(scheduler_dest)
@@ -380,20 +417,38 @@ def convert_weights(model_path, output_path):
         print(f"Failed to copy tokenizer/scheduler: {e}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert Z-Image-Turbo weights to MLX format")
-    parser.add_argument("--model_path", type=str, default="../models/Z-Image-Turbo/transformer",
+    parser = argparse.ArgumentParser(description="Convert Z-Image weights to MLX format")
+    parser.add_argument("--model_path", type=str, default=None,
                         help="Path to transformer weights (will auto-download if not found)")
-    parser.add_argument("--output_path", type=str, default="../models/mlx_model",
+    parser.add_argument("--output_path", type=str, default=None,
                         help="Output path for MLX weights")
-    parser.add_argument("--model_dir", type=str, default="../models/Z-Image-Turbo",
+    parser.add_argument("--model_dir", type=str, default=None,
                         help="Directory for the full model (for auto-download)")
+    parser.add_argument("--model_type", type=str, default="turbo", choices=["turbo", "base"],
+                        help="Model type: 'turbo' (default) or 'base'")
     args = parser.parse_args()
     
-    # Ensure model is downloaded
-    model_dir = ensure_model_downloaded(args.model_dir)
+    # Set defaults based on model_type
+    if args.model_type == "base":
+        default_model_dir = "../models/pytorch/Z-Image"
+        default_output = "../models/mlx/Z-Image-MLX"
+    else:
+        default_model_dir = "../models/pytorch/Z-Image-Turbo"
+        default_output = "../models/mlx/Z-Image-Turbo-MLX"
     
-    # Update model_path if using default
-    if args.model_path == "../models/Z-Image-Turbo/transformer":
+    if args.model_dir is None:
+        args.model_dir = default_model_dir
+    if args.output_path is None:
+        args.output_path = default_output
+    if args.model_path is None:
+        args.model_path = os.path.join(args.model_dir, "transformer")
+    
+    # Ensure model is downloaded
+    model_dir = ensure_model_downloaded(args.model_dir, model_type=args.model_type)
+    
+    # Update model_path if it should point to downloaded model
+    expected_transformer_path = os.path.join(args.model_dir, "transformer")
+    if args.model_path == expected_transformer_path:
         args.model_path = os.path.join(model_dir, "transformer")
     
-    convert_weights(args.model_path, args.output_path)
+    convert_weights(args.model_path, args.output_path, model_type=args.model_type)

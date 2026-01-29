@@ -7,13 +7,85 @@ import numpy as np
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 
-# LeMiCa cache schedules for 9-step inference
+# LeMiCa cache schedules for 9-step inference (Turbo model)
 # Based on https://github.com/UnicomAI/LeMiCa/tree/main/LeMiCa4Z-Image
-LEMICA_SCHEDULES = {
+LEMICA_SCHEDULES_9 = {
     "slow": [0, 1, 2, 3, 5, 7, 8],      # 7/9 steps computed (highest quality)
     "medium": [0, 1, 2, 4, 6, 8],       # 6/9 steps computed (balanced)
     "fast": [0, 1, 2, 5, 8],            # 5/9 steps computed (fastest)
 }
+
+# LeMiCa cache schedules for 28-step inference (Base model recommended)
+LEMICA_SCHEDULES_28 = {
+    "slow": [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27],  # ~61% computed
+    "medium": [0, 1, 2, 4, 6, 9, 12, 15, 18, 21, 24, 27],                   # ~43% computed
+    "fast": [0, 1, 2, 5, 10, 15, 20, 27],                                    # ~29% computed
+}
+
+# LeMiCa cache schedules for 50-step inference (Base model max quality)
+LEMICA_SCHEDULES_50 = {
+    "slow": [0, 1, 2, 3, 4, 5, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 37, 40, 43, 46, 49],  # ~42% computed
+    "medium": [0, 1, 2, 5, 10, 15, 20, 25, 30, 35, 40, 45, 49],            # ~26% computed
+    "fast": [0, 1, 2, 8, 16, 24, 32, 40, 49],                               # ~18% computed
+}
+
+def get_lemica_schedule_for_steps(num_steps):
+    """Get the appropriate LeMiCa schedule lookup for a given step count."""
+    if num_steps <= 12:
+        return LEMICA_SCHEDULES_9
+    elif num_steps <= 35:
+        return LEMICA_SCHEDULES_28
+    else:
+        return LEMICA_SCHEDULES_50
+
+
+def generate_dynamic_schedule(num_steps, mode):
+    """Generate a dynamic LeMiCa schedule for arbitrary step counts.
+    
+    This creates schedules that follow similar patterns:
+    - Always compute first 3 steps (critical for establishing structure)
+    - Always compute last step (final refinement)
+    - Distribute remaining compute steps based on mode
+    
+    Args:
+        num_steps: Total number of inference steps
+        mode: 'slow', 'medium', or 'fast'
+        
+    Returns:
+        List of step indices to compute
+    """
+    if num_steps <= 5:
+        # Too few steps for caching to help
+        return list(range(num_steps))
+    
+    # Compute ratios based on mode
+    compute_ratios = {
+        "slow": 0.7,    # Compute ~70% of steps
+        "medium": 0.5,  # Compute ~50% of steps
+        "fast": 0.3,    # Compute ~30% of steps
+    }
+    
+    ratio = compute_ratios.get(mode, 0.5)
+    num_compute = max(5, int(num_steps * ratio))  # At least 5 steps
+    
+    # Always include first 3 steps and last step
+    schedule = [0, 1, 2]
+    
+    # Distribute remaining compute steps evenly in the middle
+    remaining = num_compute - 4  # -4 for first 3 and last step
+    if remaining > 0:
+        middle_range = num_steps - 4  # Steps 3 to num_steps-2
+        spacing = middle_range / (remaining + 1)
+        for i in range(remaining):
+            step = int(3 + (i + 1) * spacing)
+            if step not in schedule and step < num_steps - 1:
+                schedule.append(step)
+    
+    # Always include last step
+    schedule.append(num_steps - 1)
+    
+    return sorted(set(schedule))
+
 
 def get_lemica_bool_list(cache_mode, num_steps=9):
     """Get boolean list for which steps to fully compute vs use cache.
@@ -30,11 +102,26 @@ def get_lemica_bool_list(cache_mode, num_steps=9):
         return None
     
     cache_key = cache_mode.lower()
-    if cache_key not in LEMICA_SCHEDULES:
+    
+    # Try to find a pre-defined schedule for this step count
+    schedules = get_lemica_schedule_for_steps(num_steps)
+    
+    if cache_key not in schedules:
         print(f"Warning: Unknown LeMiCa mode '{cache_mode}', using 'medium'")
         cache_key = "medium"
     
-    calc_steps = LEMICA_SCHEDULES[cache_key]
+    # For step counts that don't match pre-defined schedules exactly,
+    # use dynamic generation
+    if num_steps == 9:
+        calc_steps = LEMICA_SCHEDULES_9[cache_key]
+    elif num_steps == 28:
+        calc_steps = LEMICA_SCHEDULES_28[cache_key]
+    elif num_steps == 50:
+        calc_steps = LEMICA_SCHEDULES_50[cache_key]
+    else:
+        # Generate dynamic schedule for non-standard step counts
+        calc_steps = generate_dynamic_schedule(num_steps, cache_key)
+    
     bool_list = [i in calc_steps for i in range(num_steps)]
     return bool_list
 

@@ -1,8 +1,9 @@
-# Z-Image-Turbo-MLX: Complete Technical Documentation
+# Z-Image-MLX: Complete Technical Documentation
 
 ## Table of Contents
 1. [Project Overview](#project-overview)
-2. [Architecture Overview](#architecture-overview)
+2. [Model Variants](#model-variants)
+3. [Architecture Overview](#architecture-overview)
 3. [Directory Structure](#directory-structure)
 4. [Model Components](#model-components)
 5. [LoRA Support](#lora-support)
@@ -20,16 +21,19 @@
 
 ## Project Overview
 
-**Z-Image-Turbo-MLX** is a Gradio web interface for the Z-Image-Turbo image generation model, supporting both:
+**Z-Image-MLX** is a Gradio web interface for the Z-Image family of image generation models, supporting both:
 - **MLX backend** (Apple Silicon optimized, native)
 - **PyTorch backend** (via HuggingFace diffusers)
 
 The project supports:
+- **Z-Image Base** (28-50 steps, CFG 3-5, negative prompts, fine-tunable)
+- **Z-Image-Turbo** (9 steps, distilled for speed)
 - Model conversion from ComfyUI/PyTorch/HuggingFace formats to MLX
 - Three precision modes: Original, FP16, FP8 (quantized)
 - Prompt enhancement using a local LLM
 - Multiple aspect ratios and resolutions
 - **LoRA support** for style and concept customization
+- **LoRA training** (Base model recommended)
 - **Model merging** using Weighted Sum or Add Difference methods
 - **LeMiCa speed acceleration** for up to 30% faster generation
 - **Latent upscaling** for enhanced detail before decoding
@@ -37,11 +41,73 @@ The project supports:
 
 ---
 
+## Model Variants
+
+Z-Image comes in two variants, both sharing the same 6B parameter architecture:
+
+| Feature | Z-Image (Base) | Z-Image-Turbo |
+|---------|----------------|---------------|
+| **HuggingFace ID** | `Tongyi-MAI/Z-Image` | `Tongyi-MAI/Z-Image-Turbo` |
+| **Recommended Steps** | 28-50 | 9 |
+| **Guidance Scale (CFG)** | 3.0-5.0 | 0.0 (disabled) |
+| **Negative Prompts** | ✅ Supported | ❌ Not supported |
+| **Fine-tuning** | ✅ Recommended | ⚠️ Possible but Base preferred |
+| **Use Case** | Maximum quality, training | Fast generation |
+
+### Model Type Detection
+
+The application automatically detects model type from:
+1. `model_type` field in `config.json` (if present)
+2. Model directory name containing "Turbo"
+3. Default fallback to Base model
+
+### Parameter Presets
+
+When switching models in the UI, parameters auto-adjust:
+
+```python
+MODEL_TYPE_PRESETS = {
+    "base": {
+        "steps": 28,
+        "guidance_scale": 4.0,
+        "supports_negative_prompt": True,
+    },
+    "turbo": {
+        "steps": 9,
+        "guidance_scale": 0.0,
+        "supports_negative_prompt": False,
+    }
+}
+```
+
+### Classifier-Free Guidance (CFG)
+
+CFG is only applied for Base model when `guidance_scale > 0.0`:
+
+```python
+# During denoising:
+do_cfg = guidance_scale > 0.0 and model_type == "base"
+
+if do_cfg:
+    # Run model twice - once for negative, once for positive prompt
+    noise_pred_neg = model(latents, t, negative_embeds)
+    noise_pred_pos = model(latents, t, prompt_embeds)
+    
+    # Apply diffusers CFG formula: pred = pos + scale * (pos - neg)
+    # Note: This differs from standard CFG (neg + scale*(pos-neg))
+    noise_pred = noise_pred_pos + guidance_scale * (noise_pred_pos - noise_pred_neg)
+    
+    # Negate after CFG (as diffusers ZImagePipeline does)
+    noise_pred = -noise_pred
+```
+
+---
+
 ## Architecture Overview
 
-### Z-Image-Turbo Model Architecture
+### Z-Image Model Architecture
 
-Z-Image-Turbo is a **Flow Matching** diffusion model with:
+Z-Image (Base and Turbo) is a **Flow Matching** diffusion model with:
 
 | Component | Architecture | Description |
 |-----------|-------------|-------------|
@@ -114,7 +180,7 @@ z-image-turbo-mlx/
 │   └── convert_pytorch_to_comfyui.py  # PyTorch → ComfyUI converter
 ├── models/
 │   ├── mlx/
-│   │   ├── Z-Image-Turbo-MLX/     # Reference working model
+│   │   ├── Z-Image-MLX/           # Base model (recommended for training)
 │   │   │   ├── config.json
 │   │   │   ├── weights.safetensors
 │   │   │   ├── vae_config.json
@@ -123,16 +189,18 @@ z-image-turbo-mlx/
 │   │   │   ├── text_encoder.safetensors
 │   │   │   ├── tokenizer/
 │   │   │   └── scheduler/
+│   │   ├── Z-Image-Turbo-MLX/     # Turbo model (fast generation)
 │   │   ├── ZTI-FP16-MLX/          # FP16 converted model
 │   │   └── ZTI-FP8-MLX/           # FP8 quantized model
 │   ├── pytorch/
-│   │   └── Z-Image-Turbo/         # HuggingFace format
-│   │       ├── model_index.json
-│   │       ├── transformer/
-│   │       ├── vae/
-│   │       ├── text_encoder/
-│   │       ├── tokenizer/
-│   │       └── scheduler/
+│   │   ├── Z-Image/               # Base model (HuggingFace format)
+│   │   │   ├── model_index.json
+│   │   │   ├── transformer/
+│   │   │   ├── vae/
+│   │   │   ├── text_encoder/
+│   │   │   ├── tokenizer/
+│   │   │   └── scheduler/
+│   │   └── Z-Image-Turbo/         # Turbo model (HuggingFace format)
 │   ├── loras/                     # LoRA files (.safetensors)
 │   │   ├── styles/                # Style LoRAs
 │   │   ├── concepts/              # Concept LoRAs
@@ -927,11 +995,30 @@ Based on [LeMiCa: Lexicographic Minimax Path Caching](https://github.com/UnicomA
 #### Constants and Schedules (`src/z_image_mlx.py`)
 
 ```python
-LEMICA_SCHEDULES = {
+# Turbo schedules (9 steps)
+LEMICA_SCHEDULES_9 = {
     "slow": [0, 1, 2, 3, 5, 7, 8],      # 7/9 steps computed
     "medium": [0, 1, 2, 4, 6, 8],       # 6/9 steps computed  
     "fast": [0, 1, 2, 5, 8],            # 5/9 steps computed
 }
+
+# Base model schedules (28 steps)
+LEMICA_SCHEDULES_28 = {
+    "slow": [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 27],
+    "medium": [0, 1, 2, 4, 7, 10, 14, 18, 22, 25, 27],
+    "fast": [0, 1, 2, 5, 10, 15, 20, 27],
+}
+
+# Base model schedules (50 steps)
+LEMICA_SCHEDULES_50 = {
+    "slow": [...],  # ~35 computed steps
+    "medium": [...],  # ~25 computed steps
+    "fast": [...],  # ~15 computed steps
+}
+
+# Dynamic schedule generation for arbitrary step counts
+def generate_dynamic_schedule(num_steps, mode):
+    """Generate LeMiCa schedule for any step count."""
 ```
 
 #### Transformer State Variables
@@ -1317,6 +1404,6 @@ for k in ['layers.0.attention.to_q.weight', 'layers.0.attention.norm_q.weight']:
 
 ---
 
-*Document Version: 2.0*
+*Document Version: 3.0*
 *Last Updated: December 2025*
-*Project: Z-Image-Turbo-MLX*
+*Project: Z-Image-MLX*

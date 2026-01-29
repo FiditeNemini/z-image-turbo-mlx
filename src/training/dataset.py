@@ -55,6 +55,8 @@ class ImageEntry:
     height: int = 0
     latent_path: Optional[Path] = None
     text_embed_path: Optional[Path] = None
+    is_regularisation: bool = False
+    """True if this is a regularisation/class image for prior preservation."""
     
     def __post_init__(self):
         if isinstance(self.image_path, str):
@@ -661,6 +663,7 @@ class TrainingDataset(Dataset):
             "image_path": str(entry.image_path),
             "bucket_size": (target_w, target_h),
             "index": idx,  # Include index for cache lookup
+            "is_regularisation": entry.is_regularisation,
         }
         
         # Add cached latent if available

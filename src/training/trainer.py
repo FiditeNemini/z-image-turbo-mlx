@@ -446,6 +446,34 @@ class LoRATrainer:
         if not entries:
             raise ValueError(f"No images found in dataset: {dataset_config.dataset_path}")
         
+        # Store subject count for logging
+        subject_count = len(entries)
+        
+        # Apply subject repeat (multiply subject images for small datasets)
+        if dataset_config.subject_repeat > 1:
+            repeated_entries = []
+            for _ in range(dataset_config.subject_repeat):
+                repeated_entries.extend(entries)
+            entries = repeated_entries
+            print(f"Subject images repeated {dataset_config.subject_repeat}x: {subject_count} → {len(entries)}")
+        
+        # Load regularisation images if enabled
+        reg_count = 0
+        if dataset_config.use_regularisation and dataset_config.regularisation_path:
+            reg_entries = self._load_regularisation_images(dataset_config.regularisation_path)
+            if reg_entries:
+                reg_count = len(reg_entries)
+                entries.extend(reg_entries)
+                print(f"\n✓ Loaded {reg_count} regularisation images for prior preservation")
+                print(f"  Subject images: {subject_count}")
+                print(f"  Regularisation images: {reg_count}")
+                print(f"  Total entries: {len(entries)}")
+            else:
+                print(f"⚠️ No regularisation images found at: {dataset_config.regularisation_path}")
+        
+        # Store regularisation weight for loss computation
+        self.regularisation_weight = dataset_config.regularisation_weight if dataset_config.use_regularisation else 1.0
+        
         # Set up bucketing if enabled
         bucket_manager = None
         if dataset_config.use_bucketing:
@@ -535,6 +563,70 @@ class LoRATrainer:
         
         return entries
     
+    def _load_regularisation_images(self, reg_path: str) -> List[ImageEntry]:
+        """Load regularisation images from a folder path.
+        
+        These are class/prior preservation images that help prevent overfitting.
+        Regularisation images use their caption files or a generic class caption.
+        
+        Args:
+            reg_path: Path to folder containing regularisation images
+            
+        Returns:
+            List of ImageEntry objects with is_regularisation=True
+        """
+        from .dataset import SUPPORTED_FORMATS
+        from PIL import Image
+        
+        entries = []
+        path = Path(reg_path).expanduser()
+        
+        if not path.exists():
+            print(f"⚠️ Regularisation path not found: {path}")
+            return entries
+        
+        if not path.is_dir():
+            print(f"⚠️ Regularisation path is not a directory: {path}")
+            return entries
+        
+        # Check for images/ subdirectory (structured dataset format)
+        images_dir = path / "images" if (path / "images").exists() else path
+        
+        # Load default caption from dataset.json if present
+        metadata_path = path / "dataset.json"
+        default_caption = ""
+        if metadata_path.exists():
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+                default_caption = metadata.get("default_caption", "")
+        
+        for f in images_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in SUPPORTED_FORMATS:
+                # Load caption if exists
+                caption_path = f.with_suffix(".txt")
+                if caption_path.exists():
+                    with open(caption_path) as cf:
+                        caption = cf.read().strip()
+                else:
+                    caption = default_caption
+                
+                # Get image dimensions
+                try:
+                    with Image.open(f) as img:
+                        width, height = img.size
+                except Exception:
+                    width, height = 0, 0
+                
+                entries.append(ImageEntry(
+                    image_path=f,
+                    caption=caption,
+                    width=width,
+                    height=height,
+                    is_regularisation=True,
+                ))
+        
+        return entries
+    
     def _get_dtype(self) -> torch.dtype:
         """Get torch dtype based on mixed precision config."""
         if self.config.mixed_precision == "fp16":
@@ -592,36 +684,67 @@ class LoRATrainer:
         
         self.latent_cache = {}
         self.text_embed_cache = {}
+        self.is_regularisation_cache = {}  # Track which samples are regularisation
         
-        # Process in batches to avoid memory issues
-        cache_batch_size = 4  # Small batch to avoid OOM during caching
+        # CONSERVATIVE memory handling:
+        # - Process ONE sample at a time to avoid OOM at higher resolutions
+        # - 1024x1024 images require ~4x memory vs 512x512
+        # - Offload text encoder while encoding latents, then swap
+        # - Aggressive memory cleanup after each sample
+        cache_batch_size = 1  # Process one at a time for safety
+        
+        # Move text encoder to CPU during VAE encoding to free GPU memory
+        if hasattr(self, 'text_encoder') and self.text_encoder is not None:
+            self.text_encoder.cpu()
+            gc.collect()
+            if self.device.type == "mps":
+                torch.mps.empty_cache()
+            elif self.device.type == "cuda":
+                torch.cuda.empty_cache()
         
         with torch.no_grad():
-            for start_idx in tqdm(range(0, num_samples, cache_batch_size), desc="Caching"):
-                end_idx = min(start_idx + cache_batch_size, num_samples)
+            for idx in tqdm(range(num_samples), desc="Caching latents"):
+                sample = dataset[idx]
                 
-                # Collect batch
-                batch_pixels = []
-                batch_captions = []
-                batch_indices = list(range(start_idx, end_idx))
+                # Encode latent (VAE on GPU)
+                pixel_values = sample["pixel_values"].unsqueeze(0).to(self.device, dtype=self._get_dtype())
+                latent = self._encode_images(pixel_values)
+                self.latent_cache[idx] = latent[0].cpu()
                 
-                for idx in batch_indices:
-                    sample = dataset[idx]
-                    batch_pixels.append(sample["pixel_values"])
-                    batch_captions.append(sample["caption"])
+                # Store regularisation flag
+                self.is_regularisation_cache[idx] = sample.get("is_regularisation", False)
                 
-                # Stack and encode
-                pixel_values = torch.stack(batch_pixels).to(self.device, dtype=self._get_dtype())
-                latents = self._encode_images(pixel_values)
-                text_embeds = self._encode_text(batch_captions)
+                # Clear GPU memory after each sample
+                del pixel_values, latent
+                if self.device.type == "mps":
+                    torch.mps.empty_cache()
+                elif self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+            
+            # Now offload VAE and load text encoder for text encoding
+            print("✓ Latents cached, encoding text embeddings...")
+            if hasattr(self, 'vae') and self.vae is not None:
+                self.vae.cpu()
+                del self.vae
+                self.vae = None
+            gc.collect()
+            if self.device.type == "mps":
+                torch.mps.empty_cache()
+            elif self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            
+            # Move text encoder back to GPU
+            if hasattr(self, 'text_encoder') and self.text_encoder is not None:
+                self.text_encoder.to(self.device)
+            
+            # Encode text embeddings (one at a time for memory safety)
+            for idx in tqdm(range(num_samples), desc="Caching text"):
+                sample = dataset[idx]
+                text_embed = self._encode_text([sample["caption"]])
+                self.text_embed_cache[idx] = text_embed[0].cpu()
                 
-                # Store in cache
-                for i, idx in enumerate(batch_indices):
-                    self.latent_cache[idx] = latents[i].cpu()
-                    self.text_embed_cache[idx] = text_embeds[i].cpu()
-                
-                # Clear VRAM periodically
-                if start_idx % 32 == 0:
+                # Clear every 8 samples
+                if idx % 8 == 0:
                     if self.device.type == "mps":
                         torch.mps.empty_cache()
                     elif self.device.type == "cuda":
@@ -656,14 +779,21 @@ class LoRATrainer:
         latents: torch.Tensor,
         text_embeds: torch.Tensor,
         timesteps: torch.Tensor,
+        sample_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute flow matching loss.
+        Compute flow matching loss with optional per-sample weighting.
         
         The loss is computed as:
         loss = MSE(predicted_velocity, target_velocity)
         
         where target_velocity = noise - latents (the direction from latents to noise)
+        
+        Args:
+            latents: Encoded image latents [B, C, H, W] or [B, C, 1, H, W]
+            text_embeds: Text embeddings for the batch
+            timesteps: Sampled timesteps [B]
+            sample_weights: Optional per-sample weights [B] for regularisation weighting
         """
         batch_size = latents.shape[0]
         
@@ -719,8 +849,16 @@ class LoRATrainer:
         # Target is the velocity from latents to noise
         target = noise - latents
         
-        # Compute loss
-        loss = F.mse_loss(model_pred, target, reduction="mean")
+        # Compute loss with optional per-sample weighting
+        if sample_weights is not None:
+            # Per-sample MSE: mean over all dims except batch
+            per_sample_loss = F.mse_loss(model_pred, target, reduction="none")
+            per_sample_loss = per_sample_loss.mean(dim=list(range(1, per_sample_loss.dim())))  # [B]
+            # Apply weights and average
+            weighted_loss = per_sample_loss * sample_weights
+            loss = weighted_loss.sum() / sample_weights.sum()
+        else:
+            loss = F.mse_loss(model_pred, target, reduction="mean")
         
         return loss
     
@@ -797,23 +935,33 @@ class LoRATrainer:
                     device=self.device,
                 )
                 
+                # Build sample weights based on regularisation status
+                sample_weights = None
+                if hasattr(self, 'is_regularisation_cache') and self.is_regularisation_cache and indices is not None:
+                    weights_list = []
+                    for i in indices:
+                        is_reg = self.is_regularisation_cache.get(i.item(), False)
+                        # Regularisation images get regularisation_weight, subject images get 1.0
+                        weights_list.append(self.regularisation_weight if is_reg else 1.0)
+                    sample_weights = torch.tensor(weights_list, device=self.device, dtype=self._get_dtype())
+                
                 # Forward pass with mixed precision
                 if self.scaler is not None:
                     # CUDA with GradScaler
                     with torch.amp.autocast(device_type="cuda", dtype=self._get_dtype()):
-                        loss = self._compute_loss(latents, text_embeds, timesteps)
+                        loss = self._compute_loss(latents, text_embeds, timesteps, sample_weights)
                     
                     # Scale loss for gradient accumulation
                     loss = loss / self.config.gradient_accumulation_steps
                     self.scaler.scale(loss).backward()
                 elif self.device.type == "mps" and self.config.mixed_precision != "no":
                     # MPS with manual dtype (no GradScaler support)
-                    loss = self._compute_loss(latents, text_embeds, timesteps)
+                    loss = self._compute_loss(latents, text_embeds, timesteps, sample_weights)
                     loss = loss / self.config.gradient_accumulation_steps
                     loss.backward()
                 else:
                     # CPU or full precision
-                    loss = self._compute_loss(latents, text_embeds, timesteps)
+                    loss = self._compute_loss(latents, text_embeds, timesteps, sample_weights)
                     loss = loss / self.config.gradient_accumulation_steps
                     loss.backward()
                 

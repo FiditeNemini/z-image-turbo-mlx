@@ -102,6 +102,19 @@ class DatasetConfig:
     bucket_no_upscale: bool = True
     """Don't upscale images in bucketing (only downscale)."""
     
+    # Regularisation (prior preservation)
+    use_regularisation: bool = False
+    """Enable regularisation images for prior preservation during training."""
+    
+    regularisation_path: str = ""
+    """Path to folder containing regularisation/class images."""
+    
+    regularisation_weight: float = 1.0
+    """Weight for regularisation loss (1.0 = equal to subject loss)."""
+    
+    subject_repeat: int = 1
+    """How many times to repeat subject images per epoch (for small datasets)."""
+    
     def to_dict(self) -> dict:
         return {
             "dataset_path": self.dataset_path,
@@ -116,6 +129,10 @@ class DatasetConfig:
             "cache_text_embeddings": self.cache_text_embeddings,
             "use_bucketing": self.use_bucketing,
             "bucket_no_upscale": self.bucket_no_upscale,
+            "use_regularisation": self.use_regularisation,
+            "regularisation_path": self.regularisation_path,
+            "regularisation_weight": self.regularisation_weight,
+            "subject_repeat": self.subject_repeat,
         }
     
     @classmethod
@@ -359,6 +376,29 @@ PRESET_CONFIGS = {
         "save_every_n_steps": 250,
         "validation_every_n_steps": 250,
         "lora": {"rank": 16, "alpha": 16.0},
+    },
+    "concept_overwrite": {
+        # Optimized for "triggerless" concept overwriting (nipples, vulva, etc.)
+        # Based on research: "Advanced Optimization Strategies for Natural Language 
+        # Concept Overwriting in Distilled Diffusion Architectures"
+        "max_train_steps": 3000,
+        "learning_rate": 1e-4,
+        "batch_size": 1,
+        "gradient_accumulation_steps": 4,  # Effective batch size 4
+        "lr_warmup_ratio": 0.1,  # 10% warmup (~300 steps)
+        "optimizer": "adamw8bit",  # Memory-efficient optimizer
+        "save_every_n_steps": 500,
+        "validation_every_n_steps": 200,  # Monitor for overtraining
+        "lora": {
+            "rank": 32,
+            "alpha": 32.0,  # 1:1 ratio for aggressive overwriting
+            "dropout": 0.05,  # Light dropout to prevent overfitting
+        },
+        "dataset": {
+            "flip_horizontal": True,
+            "resolution": 1024,
+        },
+        "use_training_adapter": True,
     },
 }
 

@@ -1,11 +1,13 @@
 """
-Training UI functions for Z-Image-Turbo Gradio interface.
+Training UI functions for Z-Image Gradio interface.
 
 This module provides Gradio UI components and callbacks for:
 - Dataset management (create, import, validate)
 - Training configuration
 - LoRA training execution
 - Training progress monitoring
+
+Supports both Z-Image Base (recommended for fine-tuning) and Z-Image Turbo models.
 """
 
 import gradio as gr
@@ -658,6 +660,7 @@ def get_preset_description(preset_name: str) -> str:
         "character_lora": "**Character LoRA** - Optimized for training character/subject concepts (1500 steps, no horizontal flip)",
         "style_lora": "**Style LoRA** - For artistic styles (2000 steps, high rank for style details)",
         "concept_lora": "**Concept LoRA** - General concept training (1000 steps, balanced settings)",
+        "concept_overwrite": "**Concept Overwrite** - Triggerless training for natural language concepts (3000 steps, 1:1 rank/alpha, 8-bit optimizer)",
         "custom": "**Custom** - Configure all settings manually",
     }
     return descriptions.get(preset_name, "")
@@ -666,15 +669,20 @@ def get_preset_description(preset_name: str) -> str:
 def update_config_from_preset(preset_name: str):
     """Update UI values from preset."""
     if preset_name == "custom":
-        # Return current values unchanged
-        return [gr.update() for _ in range(13)]
+        # Return current values unchanged (17 total UI components)
+        return [gr.update() for _ in range(17)]
     
     preset = PRESET_CONFIGS.get(preset_name, {})
     lora = preset.get("lora", {})
     dataset = preset.get("dataset", {})
     
+    # Calculate warmup steps from ratio if provided
+    max_steps = preset.get("max_train_steps", 1000)
+    warmup_ratio = preset.get("lr_warmup_ratio", 0.0)
+    warmup_steps = int(max_steps * warmup_ratio) if warmup_ratio > 0 else preset.get("lr_warmup_steps", 100)
+    
     return [
-        gr.update(value=preset.get("max_train_steps", 1000)),
+        gr.update(value=max_steps),
         gr.update(value=preset.get("learning_rate", 1e-4)),
         gr.update(value=preset.get("batch_size", 1)),
         gr.update(value=preset.get("gradient_accumulation_steps", 1)),
@@ -687,6 +695,11 @@ def update_config_from_preset(preset_name: str):
         gr.update(value=dataset.get("resolution", 1024)),
         gr.update(value=dataset.get("use_bucketing", True)),
         gr.update(value=preset.get("use_training_adapter", True)),
+        # New parameters
+        gr.update(value=preset.get("optimizer", "adamw")),
+        gr.update(value=warmup_steps),
+        gr.update(value=lora.get("dropout", 0.0)),
+        gr.update(value=lora.get("use_dora", False)),
     ]
 
 
@@ -826,6 +839,15 @@ def start_training(
     adapter_weight: float,
     use_grad_checkpointing: bool,
     validation_prompts: str,
+    # New parameters
+    optimizer: str,
+    warmup_steps: int,
+    lora_dropout: float,
+    use_dora: bool,
+    # Regularisation parameters
+    use_regularisation: bool,
+    regularisation_path: str,
+    regularisation_weight: float,
 ) -> str:
     """Start the training process."""
     global _training_thread, _training_stop_flag, _training_progress
@@ -860,11 +882,15 @@ def start_training(
         gradient_accumulation_steps=grad_accum,
         gradient_checkpointing=use_grad_checkpointing,
         lr_scheduler=lr_scheduler,
+        lr_warmup_steps=int(warmup_steps),
+        optimizer=optimizer,
         
         # LoRA
         lora=LoRAConfig(
             rank=lora_rank,
             alpha=lora_alpha,
+            dropout=lora_dropout,
+            use_dora=use_dora,
         ),
         
         # Dataset
@@ -873,6 +899,9 @@ def start_training(
             resolution=resolution,
             flip_horizontal=flip_horizontal,
             use_bucketing=use_bucketing,
+            use_regularisation=use_regularisation,
+            regularisation_path=regularisation_path if use_regularisation else "",
+            regularisation_weight=regularisation_weight,
         ),
         
         # Adapter
@@ -1229,9 +1258,9 @@ def _export_fused_mlx_model(lora_path: Path, output_name: str, lora_scale: float
     except ImportError as e:
         return f"❌ MLX export requires: {e}"
     
-    # Source model path - try multiple common locations
+    # Source model path - try multiple common locations (both Base and Turbo)
     source_path = None
-    for model_name in ["Z-Image-Turbo-MLX", "mlx_model"]:
+    for model_name in ["Z-Image-Turbo-MLX", "Z-Image-MLX", "mlx_model"]:
         candidate = MLX_MODELS_DIR / model_name
         if candidate.exists() and (candidate / "weights.safetensors").exists():
             source_path = candidate
@@ -1316,10 +1345,18 @@ def _export_fused_pytorch_model(lora_path: Path, output_name: str, lora_scale: f
     except ImportError as e:
         return f"❌ PyTorch export requires: {e}"
     
-    # Source model path
-    source_path = PYTORCH_MODELS_DIR / "Z-Image-Turbo"
-    if not source_path.exists():
-        return f"❌ PyTorch source model not found: {source_path}"
+    # Source model path - try both Base and Turbo
+    source_path = None
+    base_model_name = None
+    for model_name in ["Z-Image-Turbo", "Z-Image"]:
+        candidate = PYTORCH_MODELS_DIR / model_name
+        if candidate.exists():
+            source_path = candidate
+            base_model_name = model_name
+            break
+    
+    if source_path is None:
+        return f"❌ PyTorch source model not found in: {PYTORCH_MODELS_DIR}"
     
     # Output path
     output_path = PYTORCH_MODELS_DIR / output_name
@@ -1357,7 +1394,7 @@ def _export_fused_pytorch_model(lora_path: Path, output_name: str, lora_scale: f
     
     # Create metadata
     metadata = {
-        "base_model": "Z-Image-Turbo",
+        "base_model": base_model_name,
         "fused_lora": str(lora_path.name),
         "lora_scale": lora_scale,
         "created": datetime.now().isoformat(),
@@ -1430,10 +1467,16 @@ def _export_fused_comfyui_model(lora_path: Path, output_name: str, lora_scale: f
     except ImportError as e:
         return f"❌ ComfyUI export requires: {e}"
     
-    # Source model path
-    source_path = PYTORCH_MODELS_DIR / "Z-Image-Turbo"
-    if not source_path.exists():
-        return f"❌ PyTorch source model not found: {source_path}"
+    # Source model path - try both Base and Turbo
+    source_path = None
+    for model_name in ["Z-Image-Turbo", "Z-Image"]:
+        candidate = PYTORCH_MODELS_DIR / model_name
+        if candidate.exists():
+            source_path = candidate
+            break
+    
+    if source_path is None:
+        return f"❌ PyTorch source model not found in: {PYTORCH_MODELS_DIR}"
     
     # Output path
     COMFYUI_MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1563,11 +1606,12 @@ def create_training_tab():
         
         gr.Markdown(
             """
-            ### LoRA Training for Z-Image-Turbo
+            ### LoRA Training for Z-Image
             
-            Train custom LoRA adapters for Z-Image-Turbo models. Training uses PyTorch with
+            Train custom LoRA adapters for Z-Image models (Base or Turbo). Training uses PyTorch with
             MPS (Apple Silicon) or CUDA (NVIDIA) and can leverage Ostris's de-distillation adapter.
             
+            **Note:** Z-Image **Base** is recommended for fine-tuning due to its non-distilled nature.
             **Workflow:** 1️⃣ Prepare Dataset → 2️⃣ Configure Training → 3️⃣ Train → 4️⃣ Use LoRA in Generate tab
             """
         )
@@ -1652,7 +1696,7 @@ def create_training_tab():
             # Preset selector
             with gr.Row():
                 training_preset = gr.Dropdown(
-                    choices=["quick_test", "character_lora", "style_lora", "concept_lora", "custom"],
+                    choices=["quick_test", "character_lora", "style_lora", "concept_lora", "concept_overwrite", "custom"],
                     value="character_lora",
                     label="Preset",
                     scale=1,
@@ -1663,8 +1707,8 @@ def create_training_tab():
                     scale=2,
                 )
                 model_path_input = gr.Textbox(
-                    label="Model Path",
-                    value="models/pytorch/Z-Image-Turbo",
+                    label="Model Path (Base recommended for training)",
+                    value="models/pytorch/Z-Image",
                     scale=2,
                 )
             preset_description = gr.Markdown(get_preset_description("character_lora"))
@@ -1685,6 +1729,13 @@ def create_training_tab():
                     choices=["cosine", "constant", "linear", "cosine_with_restarts"],
                     value="cosine", label="LR Scheduler",
                 )
+                optimizer_dropdown = gr.Dropdown(
+                    choices=["adamw", "adamw8bit", "prodigy"],
+                    value="adamw", label="Optimizer",
+                )
+                warmup_steps = gr.Slider(0, 500, 100, step=10, label="Warmup Steps")
+            
+            with gr.Row():
                 save_every = gr.Slider(100, 2000, 500, step=100, label="Save Every N")
                 validate_every = gr.Slider(100, 1000, 250, step=50, label="Validate Every N")
             
@@ -1694,6 +1745,38 @@ def create_training_tab():
                 flip_horizontal = gr.Checkbox(label="Horizontal Flip", value=True)
                 use_bucketing = gr.Checkbox(label="Aspect Bucketing", value=True)
                 grad_checkpointing = gr.Checkbox(label="Gradient Checkpointing", value=False)
+            
+            with gr.Row():
+                lora_dropout = gr.Slider(0.0, 0.5, 0.0, step=0.05, label="LoRA Dropout")
+                use_dora = gr.Checkbox(label="Use DoRA", value=False, info="Weight-Decomposed LoRA")
+            
+            # Regularisation (Prior Preservation) settings
+            with gr.Row():
+                use_regularisation = gr.Checkbox(
+                    label="Use Regularisation Images",
+                    value=False,
+                    info="Add class images to prevent overfitting"
+                )
+            with gr.Row(visible=False) as reg_settings_row:
+                regularisation_path = gr.Textbox(
+                    label="Regularisation Folder",
+                    placeholder="Path to folder with 200-300 class images",
+                    info="e.g., ~/datasets/generic_people for person LoRAs",
+                    scale=3,
+                )
+                regularisation_weight = gr.Slider(
+                    0.1, 2.0, 1.0, step=0.1,
+                    label="Reg Weight",
+                    info="1.0 = equal to subject",
+                    scale=1,
+                )
+            
+            # Show/hide regularisation settings based on checkbox
+            use_regularisation.change(
+                fn=lambda x: gr.update(visible=x),
+                inputs=[use_regularisation],
+                outputs=[reg_settings_row],
+            )
             
             available_adapters = get_available_adapters()
             with gr.Row():
@@ -1876,6 +1959,8 @@ def create_training_tab():
                 max_train_steps, learning_rate, batch_size, grad_accum,
                 lora_rank, lora_alpha, lr_scheduler, save_every, validate_every,
                 flip_horizontal, train_resolution, use_bucketing, use_adapter,
+                # New parameters
+                optimizer_dropdown, warmup_steps, lora_dropout, use_dora,
             ],
         )
         
@@ -1901,6 +1986,10 @@ def create_training_tab():
                 use_adapter, adapter_dropdown, adapter_weight,
                 grad_checkpointing,
                 validation_prompts,
+                # New parameters
+                optimizer_dropdown, warmup_steps, lora_dropout, use_dora,
+                # Regularisation parameters
+                use_regularisation, regularisation_path, regularisation_weight,
             ],
             outputs=[training_status],
         )
