@@ -50,10 +50,10 @@ DEFAULT_VAE_CONFIG = {
 
 DEFAULT_TEXT_ENCODER_CONFIG = {
     "hidden_size": 2560,
-    "intermediate_size": 13696,
-    "num_attention_heads": 20,
+    "intermediate_size": 9728,
+    "num_attention_heads": 32,
     "num_hidden_layers": 36,
-    "num_key_value_heads": 4,
+    "num_key_value_heads": 8,
     "rms_norm_eps": 1e-06,
     "vocab_size": 151936,
     "max_position_embeddings": 40960,

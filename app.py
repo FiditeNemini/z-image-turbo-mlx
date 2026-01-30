@@ -183,7 +183,7 @@ ZIMAGE_SIGNATURE_KEYS = {
         ("context_refiner", "diffusion_context_refiner"),
         ("noise_refiner", "diffusion_noise_refiner"),
     ],
-    # Text encoder signature (Qwen2.5-3B based)
+    # Text encoder signature (Qwen3-4B based)
     "text_encoder": [
         ("model.layers.0.self_attn", "text_encoders.qwen3_4b"),
     ],
@@ -243,16 +243,16 @@ DEFAULT_VAE_CONFIG = {
 
 DEFAULT_TEXT_ENCODER_CONFIG = {
     "hidden_size": 2560,
-    "intermediate_size": 13696,
-    "max_position_embeddings": 32768,
-    "num_attention_heads": 20,
-    "num_hidden_layers": 28,
-    "num_key_value_heads": 4,
-    "vocab_size": 152064,
-    "rms_norm_eps": 1e-5,
+    "intermediate_size": 9728,
+    "max_position_embeddings": 40960,
+    "num_attention_heads": 32,
+    "num_hidden_layers": 36,
+    "num_key_value_heads": 8,
+    "vocab_size": 151936,
+    "rms_norm_eps": 1e-6,
     "rope_theta": 1000000.0,
     "use_sliding_window": False,
-    "sliding_window": 32768,
+    "sliding_window": None,
     "tie_word_embeddings": True,
 }
 

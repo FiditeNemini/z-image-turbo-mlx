@@ -163,7 +163,7 @@ def estimate_memory_usage(
     vae_memory = 1.5  # GB, rough estimate
     
     # Text encoder memory
-    text_encoder_memory = 2.5  # GB for Qwen2.5-3B
+    text_encoder_memory = 2.5  # GB for Qwen3-4B
     
     total_memory = (
         model_memory +

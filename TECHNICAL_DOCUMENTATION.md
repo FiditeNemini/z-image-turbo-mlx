@@ -113,7 +113,7 @@ Z-Image (Base and Turbo) is a **Flow Matching** diffusion model with:
 |-----------|-------------|-------------|
 | **Transformer** | Custom DiT-style | 30 layers, 3840 hidden dim, 30 attention heads |
 | **VAE** | AutoencoderKL | 16 latent channels, scale factor 8 |
-| **Text Encoder** | Qwen2.5-3B based | 28 layers, 2560 hidden dim, GQA with 4 KV heads |
+| **Text Encoder** | Qwen3-4B based | 36 layers, 2560 hidden dim, GQA with 8 KV heads |
 | **Scheduler** | FlowMatchEulerDiscrete | 9 steps default, shift=3.0 |
 
 ### Key Architectural Details
@@ -168,7 +168,7 @@ z-image-turbo-mlx/
 ├── src/
 │   ├── z_image_mlx.py        # MLX Transformer implementation
 │   ├── vae.py                # MLX VAE implementation
-│   ├── text_encoder.py       # MLX Qwen2 Text Encoder implementation
+│   ├── text_encoder.py       # MLX Qwen3-4B Text Encoder implementation
 │   ├── lora.py               # LoRA loading and application
 │   ├── merge.py              # Model merging algorithms
 │   ├── generate_mlx.py       # Standalone MLX generation script
@@ -280,23 +280,23 @@ shift_factor: 0.1159
 
 **Purpose**: Encode text prompts into embeddings for conditioning.
 
-**Architecture**: Qwen2.5-3B based
+**Architecture**: Qwen3-4B based
 ```
 hidden_size: 2560
-intermediate_size: 13696
-num_hidden_layers: 28
-num_attention_heads: 20
-num_key_value_heads: 4  # GQA
-vocab_size: 152064
-max_position_embeddings: 32768
+intermediate_size: 9728
+num_hidden_layers: 36
+num_attention_heads: 32
+num_key_value_heads: 8  # GQA
+vocab_size: 151936
+max_position_embeddings: 40960
 ```
 
 **Key Classes**:
 - `TextEncoder`: Main class
-- `Qwen2Model`: Transformer backbone
-- `Qwen2Attention`: GQA attention with RoPE
-- `Qwen2MLP`: SwiGLU MLP
-- `Qwen2RMSNorm`: RMS normalization
+- `Qwen3Model`: Transformer backbone
+- `Qwen3Attention`: GQA attention with RoPE
+- `Qwen3MLP`: SwiGLU MLP
+- `Qwen3RMSNorm`: RMS normalization
 
 **CRITICAL**: Text encoder should **NOT be quantized** - FP8 quantization causes zero outputs.
 
@@ -1004,9 +1004,9 @@ LEMICA_SCHEDULES_9 = {
 
 # Base model schedules (28 steps)
 LEMICA_SCHEDULES_28 = {
-    "slow": [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 27],
-    "medium": [0, 1, 2, 4, 7, 10, 14, 18, 22, 25, 27],
-    "fast": [0, 1, 2, 5, 10, 15, 20, 27],
+    "slow": [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27],  # ~61% computed
+    "medium": [0, 1, 2, 4, 6, 9, 12, 15, 18, 21, 24, 27],                   # ~43% computed
+    "fast": [0, 1, 2, 5, 10, 15, 20, 27],                                    # ~29% computed
 }
 
 # Base model schedules (50 steps)
@@ -1321,16 +1321,16 @@ for k in ['layers.0.attention.to_q.weight', 'layers.0.attention.norm_q.weight']:
 ```json
 {
   "hidden_size": 2560,
-  "intermediate_size": 13696,
-  "max_position_embeddings": 32768,
-  "num_attention_heads": 20,
-  "num_hidden_layers": 28,
-  "num_key_value_heads": 4,
-  "vocab_size": 152064,
-  "rms_norm_eps": 1e-5,
+  "intermediate_size": 9728,
+  "max_position_embeddings": 40960,
+  "num_attention_heads": 32,
+  "num_hidden_layers": 36,
+  "num_key_value_heads": 8,
+  "vocab_size": 151936,
+  "rms_norm_eps": 1e-6,
   "rope_theta": 1000000.0,
   "use_sliding_window": false,
-  "sliding_window": 32768,
+  "sliding_window": null,
   "tie_word_embeddings": true
 }
 ```
@@ -1358,7 +1358,7 @@ for k in ['layers.0.attention.to_q.weight', 'layers.0.attention.norm_q.weight']:
 1. **Create MLX model implementations** in `src/`:
    - `z_image_mlx.py`: Transformer with MRoPE, SwiGLU, QK-norm
    - `vae.py`: AutoencoderKL with NHWC format
-   - `text_encoder.py`: Qwen2.5 architecture with GQA
+   - `text_encoder.py`: Qwen3 architecture with GQA
 
 2. **Create key mapping functions** in `app.py`:
    - `map_transformer_key()`: Handle all prefix/suffix variations

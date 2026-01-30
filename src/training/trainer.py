@@ -276,7 +276,7 @@ class LoRATrainer:
         # It breaks adapter application and causes dynamo autocast errors
     
     def _load_text_encoder(self):
-        """Load the text encoder (Qwen2.5-3B)."""
+        """Load the text encoder (Qwen3-4B based)."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
         
         # Text encoder path - inside the model directory
@@ -294,8 +294,8 @@ class LoRATrainer:
         if not use_local:
             # Fallback to HuggingFace (with warning)
             print("⚠️ Local text encoder or tokenizer not found, downloading from HuggingFace...")
-            encoder_path = "Qwen/Qwen2.5-3B"
-            tokenizer_path = "Qwen/Qwen2.5-3B"
+            encoder_path = "Qwen/Qwen3-4B"
+            tokenizer_path = "Qwen/Qwen3-4B"
         else:
             print(f"✓ Using local text encoder: {encoder_path}")
             print(f"✓ Using local tokenizer: {tokenizer_path}")
@@ -670,7 +670,7 @@ class LoRATrainer:
         
         This is CRITICAL for training speed. Without caching:
         - VAE encoding: ~0.5s per image
-        - Text encoding: ~1.5s per caption (Qwen2.5-3B is large!)
+        - Text encoding: ~1.5s per caption (Qwen3-4B is large!)
         - Per-step overhead: ~2s
         
         With caching: per-step overhead drops to ~0.01s
