@@ -280,21 +280,19 @@ class Attention(nn.Module):
         q = self.mrope.apply_rotary_emb(q, cos_emb, sin_emb)
         k = self.mrope.apply_rotary_emb(k, cos_emb, sin_emb)
         
-        # Attention
-        q = q.transpose(0, 2, 1, 3) # [B, H, L, D]
+        # Transpose to [B, H, L, D] for attention
+        q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
         
-        dots = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-        
+        # Use MLX's optimized scaled dot product attention (Metal-accelerated)
+        # This provides significant speedup on Apple Silicon, similar to MPS Flash Attention
         if mask is not None:
-            # mask: [B, L] or [B, 1, 1, L]
+            # Normalize mask shape for mx.fast.scaled_dot_product_attention
             if mask.ndim == 2:
                 mask = mask[:, None, None, :]
-            dots = dots + mask
-            
-        attn = mx.softmax(dots, axis=-1)
-        out = attn @ v
+        
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         
         out = out.transpose(0, 2, 1, 3).reshape(B, L, D)
         out = self.to_out(out)

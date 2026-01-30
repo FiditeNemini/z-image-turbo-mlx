@@ -102,13 +102,14 @@ class Attention(nn.Module):
         k = self.to_k(x)
         v = self.to_v(x)
         
+        # Reshape to [B, num_heads, seq_len, head_dim] for optimized attention
         q = q.reshape(B, H * W, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = k.reshape(B, H * W, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, H * W, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         
-        dots = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-        attn = mx.softmax(dots, axis=-1)
-        out = attn @ v
+        # Use MLX's optimized scaled dot product attention (Metal-accelerated)
+        # This provides significant speedup on Apple Silicon, similar to MPS Flash Attention
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
         
         out = out.transpose(0, 2, 1, 3).reshape(B, H, W, C)
         out = self.to_out(out)
