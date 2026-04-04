@@ -686,9 +686,11 @@ All key mappings are centralized in `app.py`:
 
 | Mode | Transformer | Text Encoder | VAE | File Size |
 |------|-------------|--------------|-----|-----------|
-| Original | float32 | float32 | float32 | ~30GB |
-| FP16 | float16 | float16 | float16 | ~15GB |
+| Original | float16 | float16 | float16 | ~19.5GB |
+| FP16 | float16 | float16 | float16 | ~19.5GB |
 | FP8 | quantized (8-bit) | float16 | float16 | ~8GB |
+
+> **Note**: `convert_to_mlx.py` always converts transformer and text encoder weights to **float16** during the initial conversion step. "Original" and "FP16" modes therefore produce identical output for freshly converted HuggingFace models. The distinction only matters if importing a pre-existing MLX model that was saved at a different precision.
 
 ### FP8 Quantization Details
 
@@ -930,7 +932,7 @@ mx.eval(wq, scales, biases)  # Force computation
 
 **Impact**: Prompt embeddings become zero vectors → No conditioning → Random noise output.
 
-**Solution**: Always keep text encoder at FP16, even in FP8 mode.
+**Solution**: Always keep text encoder at FP16, even in FP8 mode. The conversion pipeline (`convert_to_mlx.py`) consistently saves the text encoder as float16 to ensure this.  Pre-conversion, the HuggingFace Qwen3-4B weights are bfloat16; the pipeline converts them to float16 (not float32) reducing the text encoder file size from ~16GB to ~8GB.
 
 ### 4. VAE Uses NHWC Format
 
@@ -973,6 +975,19 @@ t_model = (1000.0 - t.item()) / 1000.0
 ```python
 self.norm = nn.GroupNorm(groups, channels, eps=1e-6, pytorch_compatible=True)
 ```
+
+### 8. Attention Uses mx.fast.scaled_dot_product_attention
+
+Both the transformer (`src/z_image_mlx.py`) and VAE (`src/vae.py`) use MLX's fused attention kernel for better performance:
+
+```python
+# Replaces manual (Q @ K.T / scale + mask).softmax() @ V
+out = mx.fast.scaled_dot_product_attention(
+    q, k, v, scale=scale, mask=mask
+)
+```
+
+This is a drop-in replacement that avoids materializing the full attention weight matrix, reducing memory usage and improving throughput on Apple Silicon. No correctness impact.
 
 ---
 

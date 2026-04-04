@@ -187,11 +187,13 @@ Most users should stick with **MLX**.
 
 | Mode | Quality | Speed | Memory |
 |------|---------|-------|--------|
-| **Original** | Highest | Slowest | Most |
-| **FP16** | Excellent | Fast | Less |
-| **FP8** | Very Good | Fastest | Least |
+| **Original** | Excellent | Fast | ~19.5GB |
+| **FP16** | Excellent | Fast | ~19.5GB |
+| **FP8** | Very Good | Fastest | ~8GB |
 
-**Recommendation**: Start with FP16 for the best balance. Use FP8 if you have memory constraints.
+**Note**: "Original" and "FP16" are identical for models converted from HuggingFace — the conversion pipeline already produces float16 weights. The distinction only matters when importing a pre-existing MLX model saved at a different precision.
+
+**Recommendation**: Use FP16 (or Original) for the best balance of quality and speed. Use FP8 if you have memory constraints.
 
 ### Using LoRAs (Style & Concept Customization)
 
