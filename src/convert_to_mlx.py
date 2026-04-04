@@ -378,7 +378,7 @@ def convert_weights(model_path, output_path, model_type=None):
             # if "proj" in new_key and "weight" in new_key and len(value.shape) == 2:
             #     value = value.t()
                 
-            mlx_te_weights[new_key] = mx.array(value.float().numpy())
+            mlx_te_weights[new_key] = mx.array(value.float().numpy().astype("float16"))
             
         mx.save_safetensors(str(output_dir / "text_encoder.safetensors"), mlx_te_weights)
         with open(str(output_dir / "text_encoder_config.json"), "w") as f:
